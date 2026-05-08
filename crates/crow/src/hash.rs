@@ -79,8 +79,8 @@ macro_rules! hash_newtype {
                 self.0.as_bytes()
             }
 
-            pub const fn inner(&self) -> Hash {
-                self.0
+            pub const fn inner(&self) -> &Hash {
+                &self.0
             }
         }
 
