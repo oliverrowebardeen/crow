@@ -23,6 +23,7 @@ pub mod crypto;
 pub mod erasure;
 pub mod error;
 pub mod hash;
+pub mod identity;
 pub mod manifest;
 
 pub use cap::{CAP_HRP, CAP_VERSION, Cap, Permission};
@@ -31,6 +32,7 @@ pub use crypto::{FileKey, ManifestKey};
 pub use erasure::{DEFAULT_CHUNK_SIZE, ErasureParams};
 pub use error::{Error, Result};
 pub use hash::{ChunkHash, Hash, ManifestHash};
+pub use identity::Identity;
 pub use manifest::{
     Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, Stripe,
 };
