@@ -17,6 +17,7 @@
 //! Networking, persistence, gossip discovery, the metadata CRDT, and live
 //! manifest signing are out of scope for this crate version.
 
+pub mod cap;
 pub mod chunk;
 pub mod crypto;
 pub mod erasure;
@@ -24,6 +25,7 @@ pub mod error;
 pub mod hash;
 pub mod manifest;
 
+pub use cap::{CAP_HRP, CAP_VERSION, Cap, Permission};
 pub use chunk::{ChunkStore, MemStore, Namespace};
 pub use crypto::{FileKey, ManifestKey};
 pub use erasure::{DEFAULT_CHUNK_SIZE, ErasureParams};
