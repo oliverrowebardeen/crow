@@ -18,5 +18,7 @@
 //! manifest signing are out of scope for this crate version.
 
 pub mod error;
+pub mod hash;
 
 pub use error::{Error, Result};
+pub use hash::{ChunkHash, Hash, ManifestHash};
