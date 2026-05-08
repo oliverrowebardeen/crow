@@ -18,9 +18,11 @@
 //! manifest signing are out of scope for this crate version.
 
 pub mod chunk;
+pub mod crypto;
 pub mod error;
 pub mod hash;
 
 pub use chunk::{ChunkStore, MemStore, Namespace};
+pub use crypto::{FileKey, ManifestKey};
 pub use error::{Error, Result};
 pub use hash::{ChunkHash, Hash, ManifestHash};
