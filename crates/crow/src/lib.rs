@@ -17,8 +17,10 @@
 //! Networking, persistence, gossip discovery, the metadata CRDT, and live
 //! manifest signing are out of scope for this crate version.
 
+pub mod chunk;
 pub mod error;
 pub mod hash;
 
+pub use chunk::{ChunkStore, MemStore, Namespace};
 pub use error::{Error, Result};
 pub use hash::{ChunkHash, Hash, ManifestHash};
