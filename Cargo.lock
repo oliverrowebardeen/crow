@@ -397,6 +397,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crow",
+ "crow-net",
+ "tokio",
 ]
 
 [[package]]

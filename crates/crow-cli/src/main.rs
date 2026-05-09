@@ -1,15 +1,17 @@
 use std::fs;
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use crow::{
-    Cap, ChunkStore, Crow, DEFAULT_CHUNK_SIZE, ErasureParams, FsStore, GcOptions, Manifest,
+    Cap, ChunkStore, Crow, DEFAULT_CHUNK_SIZE, ErasureParams, FsStore, GcOptions, Hash, Manifest,
     Namespace, PinIndex, PinRecord, compute_live_set,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
+use crow_net::{Client, ClusterToken, DEFAULT_BIND_ADDR, TokenStore};
 
 #[derive(Parser)]
 #[command(
@@ -29,7 +31,8 @@ use crow::{
                   crow info <4-char prefix>        # show metadata + pin status\n  \
                   crow get <prefix> restored.pdf   # retrieve\n  \
                   crow rm <prefix>                 # delete pin and chunks\n  \
-                  crow gc                          # sweep anything not pinned\n\
+                  crow gc                          # sweep anything not pinned\n  \
+                  crow serve                       # serve chunks over QUIC\n\
                   \n\
                   Most commands accept either a full crow1… capability or a hex prefix \
                   of the manifest hash; ambiguous prefixes get an explicit error.\n\
@@ -196,6 +199,57 @@ enum Command {
                       gc` (unreferenced manifests + chunks)."
     )]
     Stat,
+    /// Serve local manifests and chunks to trusted cluster devices.
+    #[command(
+        long_about = "Start a long-running QUIC server that serves encrypted manifests \
+                      and chunks by hash to clients with the shared cluster token.\n\
+                      \n\
+                      The server never sees cap keys or plaintext. Run `crow token init` \
+                      first, then copy the token to another trusted device with \
+                      `crow token set <TOKEN>`."
+    )]
+    Serve {
+        /// Address to listen on.
+        #[arg(long, default_value = DEFAULT_BIND_ADDR)]
+        bind: SocketAddr,
+    },
+    /// Fetch missing manifest/chunk shares from a known peer.
+    #[command(
+        long_about = "Connect to a trusted Crow peer, fetch the manifest and missing \
+                      shares for a cap, pin it locally, and verify local reconstruction.\n\
+                      \n\
+                      This is manual Phase 1 personal-cluster fetch: no mDNS, peer list, \
+                      automatic replication, or friend-scoped access yet."
+    )]
+    Fetch {
+        /// Peer address, e.g. 192.168.1.42:7070.
+        peer: SocketAddr,
+        /// Full bech32m capability (`crow1…`) or hex prefix of a pinned manifest.
+        cap_or_prefix: String,
+        /// Friendly name for the local pin.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Manage the shared personal-cluster token.
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Create a token if one does not exist.
+    Init {
+        /// Replace an existing token.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the local token.
+    Show,
+    /// Store a token copied from another trusted device.
+    Set {
+        /// 64-character hex cluster token.
+        token: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -214,28 +268,43 @@ type DynResult<T> = std::result::Result<T, DynError>;
 
 fn run(cli: Cli) -> DynResult<()> {
     let home = resolve_home(cli.home)?;
-    let store = FsStore::open(&home)?;
-    let pins = PinIndex::open(&home)?;
-    let crow = Crow::new(store);
-
     match cli.command {
-        Command::Put {
-            path,
-            mime,
-            name,
-            chunk_size,
-        } => cmd_put(&crow, &pins, &path, mime, name, chunk_size),
-        Command::Get { cap_or_prefix, out } => cmd_get(&crow, &pins, &cap_or_prefix, &out),
-        Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &cap_or_prefix),
-        Command::Ls { long } => cmd_ls(&crow, &pins, long),
-        Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
-        Command::Unpin { cap_or_prefix } => cmd_unpin(&pins, &cap_or_prefix),
-        Command::Rm {
-            cap_or_prefix,
-            dry_run,
-        } => cmd_rm(&crow, &pins, &cap_or_prefix, dry_run),
-        Command::Gc { dry_run } => cmd_gc(&crow, &pins, dry_run),
-        Command::Stat => cmd_stat(&crow, &pins),
+        Command::Token(command) => cmd_token(&home, command),
+        Command::Serve { bind } => {
+            let store = FsStore::open(&home)?;
+            cmd_serve(&home, store, bind)
+        }
+        command => {
+            let store = FsStore::open(&home)?;
+            let pins = PinIndex::open(&home)?;
+            let crow = Crow::new(store);
+
+            match command {
+                Command::Put {
+                    path,
+                    mime,
+                    name,
+                    chunk_size,
+                } => cmd_put(&crow, &pins, &path, mime, name, chunk_size),
+                Command::Get { cap_or_prefix, out } => cmd_get(&crow, &pins, &cap_or_prefix, &out),
+                Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &cap_or_prefix),
+                Command::Ls { long } => cmd_ls(&crow, &pins, long),
+                Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
+                Command::Unpin { cap_or_prefix } => cmd_unpin(&pins, &cap_or_prefix),
+                Command::Rm {
+                    cap_or_prefix,
+                    dry_run,
+                } => cmd_rm(&crow, &pins, &cap_or_prefix, dry_run),
+                Command::Gc { dry_run } => cmd_gc(&crow, &pins, dry_run),
+                Command::Stat => cmd_stat(&crow, &pins),
+                Command::Fetch {
+                    peer,
+                    cap_or_prefix,
+                    name,
+                } => cmd_fetch(&home, &crow, &pins, peer, &cap_or_prefix, name),
+                Command::Serve { .. } | Command::Token(_) => unreachable!("handled above"),
+            }
+        }
     }
 }
 
@@ -514,6 +583,194 @@ fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex) -> DynResult<()> {
         format_size_u64(unref_bytes),
     );
     Ok(())
+}
+
+fn cmd_serve(home: &Path, store: FsStore, bind: SocketAddr) -> DynResult<()> {
+    let token = load_token(home)?;
+    let root = store.root().display().to_string();
+    println!("serving {root} on {bind}");
+    println!("cluster token: configured");
+    runtime()?.block_on(crow_net::serve(store, token, bind))?;
+    Ok(())
+}
+
+fn cmd_fetch(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    peer: SocketAddr,
+    arg: &str,
+    name: Option<String>,
+) -> DynResult<()> {
+    let token = load_token(home)?;
+    let cap = resolve_cap(pins, arg)?;
+    let rt = runtime()?;
+    let client = rt.block_on(Client::connect(peer))?;
+    rt.block_on(client.hello(token))?;
+
+    let mut fetched = 0usize;
+    let mut already_local = 0usize;
+    let mut remote_missing = 0usize;
+    let mut fetched_bytes = 0u64;
+
+    let manifest_hash = *cap.manifest_hash.inner();
+    let manifest_state = if crow.store().has(Namespace::Manifests, &manifest_hash)? {
+        already_local += 1;
+        "local"
+    } else {
+        match rt.block_on(client.get(token, Namespace::Manifests, manifest_hash))? {
+            Some(bytes) => {
+                fetched_bytes += bytes.len() as u64;
+                crow.store()
+                    .put_unverified(Namespace::Manifests, manifest_hash, bytes)?;
+                fetched += 1;
+                "fetched"
+            }
+            None => {
+                remote_missing += 1;
+                "missing"
+            }
+        }
+    };
+
+    if manifest_state == "missing" {
+        println!("manifest      missing");
+        println!("shares        0 local / 0 fetched / 0 missing");
+        println!("stored        {}", format_size_u64(fetched_bytes));
+        println!("status        not reconstructable");
+        return Err("peer does not have the manifest".into());
+    }
+
+    let manifest = open_manifest(crow, &cap)?;
+    pins.add(cap.clone(), name, None)?;
+
+    let mut local_shares = 0usize;
+    let mut fetched_shares = 0usize;
+    let mut missing_shares = 0usize;
+    for hash in manifest
+        .stripes
+        .iter()
+        .flat_map(|s| s.data.iter().chain(s.parity.iter()))
+        .map(|h| *h.inner())
+    {
+        match fetch_object(
+            crow,
+            &rt,
+            &client,
+            token,
+            Namespace::Chunks,
+            hash,
+            &mut fetched_bytes,
+        )? {
+            FetchState::Local => {
+                already_local += 1;
+                local_shares += 1;
+            }
+            FetchState::Fetched => {
+                fetched += 1;
+                fetched_shares += 1;
+            }
+            FetchState::Missing => {
+                remote_missing += 1;
+                missing_shares += 1;
+            }
+        }
+    }
+
+    println!("manifest      {manifest_state}");
+    println!(
+        "shares        {local_shares} local / {fetched_shares} fetched / {missing_shares} missing"
+    );
+    println!("objects       {already_local} local / {fetched} fetched / {remote_missing} missing");
+    println!("stored        {}", format_size_u64(fetched_bytes));
+    println!(
+        "pinned        {} {}",
+        &cap.manifest_hash.to_string()[..8],
+        pins.get(cap.manifest_hash.inner())?
+            .and_then(|r| r.name)
+            .unwrap_or_else(|| "(unnamed)".into())
+    );
+
+    match crow.get_bytes(&cap) {
+        Ok(_) => {
+            println!("status        reconstructable");
+            Ok(())
+        }
+        Err(e) => {
+            println!("status        not reconstructable ({e})");
+            Err(format!("fetch incomplete: {e}").into())
+        }
+    }
+}
+
+fn cmd_token(home: &Path, command: TokenCommand) -> DynResult<()> {
+    let tokens = TokenStore::open(home);
+    match command {
+        TokenCommand::Init { force } => {
+            let existed = tokens.exists();
+            let token = tokens.init(force)?;
+            if existed && !force {
+                println!("{}", token.encode());
+                eprintln!("crow: existing token at {}", tokens.path().display());
+            } else {
+                println!("{}", token.encode());
+            }
+            Ok(())
+        }
+        TokenCommand::Show => {
+            println!("{}", tokens.load()?.encode());
+            Ok(())
+        }
+        TokenCommand::Set { token } => {
+            let token = ClusterToken::decode(&token)?;
+            tokens.save(token)?;
+            println!("token set at {}", tokens.path().display());
+            Ok(())
+        }
+    }
+}
+
+enum FetchState {
+    Local,
+    Fetched,
+    Missing,
+}
+
+fn fetch_object(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    token: ClusterToken,
+    namespace: Namespace,
+    hash: Hash,
+    fetched_bytes: &mut u64,
+) -> DynResult<FetchState> {
+    if crow.store().has(namespace, &hash)? {
+        return Ok(FetchState::Local);
+    }
+    match rt.block_on(client.get(token, namespace, hash))? {
+        Some(bytes) => {
+            *fetched_bytes += bytes.len() as u64;
+            crow.store().put_unverified(namespace, hash, bytes)?;
+            Ok(FetchState::Fetched)
+        }
+        None => Ok(FetchState::Missing),
+    }
+}
+
+fn load_token(home: &Path) -> DynResult<ClusterToken> {
+    TokenStore::open(home).load().map_err(|e| {
+        format!(
+            "{e}; run `crow token init` on one trusted device and `crow token set <token>` on the others"
+        )
+        .into()
+    })
+}
+
+fn runtime() -> DynResult<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?)
 }
 
 fn open_manifest(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<Manifest> {

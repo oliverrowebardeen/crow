@@ -411,6 +411,7 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(recv: &mut RecvStream) -> Resu
 }
 
 fn server_config() -> Result<ServerConfig> {
+    ensure_crypto_provider();
     let cert = rcgen::generate_simple_self_signed(vec!["crow.local".into()])
         .map_err(|e| NetError::Protocol(format!("generate cert: {e}")))?;
     let cert_der = cert.cert.der().clone();
@@ -426,6 +427,7 @@ fn server_config() -> Result<ServerConfig> {
 }
 
 fn client_config() -> Result<ClientConfig> {
+    ensure_crypto_provider();
     let verifier = Arc::new(SkipServerVerification);
     let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -436,6 +438,10 @@ fn client_config() -> Result<ClientConfig> {
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .map_err(|e| NetError::QuinnCrypto(e.to_string()))?,
     )))
+}
+
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 #[derive(Debug)]
