@@ -166,6 +166,50 @@ enum Command {
         #[arg(short, long)]
         parents: bool,
     },
+    /// Import a local directory tree into the catalog.
+    #[command(
+        long_about = "Recursively store regular files from a local directory and record \
+                      them under a local catalog directory. This is a bulk file import: \
+                      folders are local organization, not shareable Crow objects.\n\
+                      \n\
+                      Symlinks are rejected. Crow asks for y/N confirmation before \
+                      storing unless --yes is passed.\n\
+                      \n\
+                      Examples:\n  \
+                      crow put-dir ./Photos /photos\n  \
+                      crow put-dir ./Project /archive/ --yes"
+    )]
+    PutDir {
+        /// Local directory to import.
+        source: String,
+        /// Optional catalog destination directory. Defaults to /<source-basename>.
+        dest: Option<String>,
+        /// Skip confirmation.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Export a catalog directory tree to the local filesystem.
+    #[command(
+        long_about = "Recursively reconstruct files from a local catalog directory into \
+                      a regular filesystem directory. Existing files are never \
+                      overwritten.\n\
+                      \n\
+                      If OUT exists and is non-empty, Crow asks for y/N confirmation \
+                      unless --yes is passed.\n\
+                      \n\
+                      Examples:\n  \
+                      crow get-dir /photos ./RestoredPhotos\n  \
+                      crow get-dir /archive/project ./Project --yes"
+    )]
+    GetDir {
+        /// Catalog directory to export.
+        path: String,
+        /// Local output directory.
+        out: String,
+        /// Skip confirmation for non-empty output directories.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Pin a capability so its chunks survive `crow gc`.
     #[command(
         long_about = "Add a pin record for an externally-supplied capability — for \
@@ -360,6 +404,12 @@ fn run(cli: Cli) -> DynResult<()> {
                     pins: pins_only,
                 } => cmd_ls(&crow, &pins, &catalog, path.as_deref(), long, pins_only),
                 Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
+                Command::PutDir { source, dest, yes } => {
+                    cmd_put_dir(&crow, &catalog, &source, dest.as_deref(), yes)
+                }
+                Command::GetDir { path, out, yes } => {
+                    cmd_get_dir(&crow, &catalog, &path, &out, yes)
+                }
                 Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
                 Command::Unpin { cap_or_prefix } => cmd_unpin(&pins, &cap_or_prefix),
                 Command::Rm {
@@ -568,6 +618,134 @@ fn cmd_mkdir(catalog: &CatalogIndex, path: &str, parents: bool) -> DynResult<()>
     } else {
         println!("created {path}");
     }
+    Ok(())
+}
+
+fn cmd_put_dir(
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    source: &str,
+    dest: Option<&str>,
+    yes: bool,
+) -> DynResult<()> {
+    let source_path = Path::new(source);
+    if !source_path.is_dir() {
+        return Err(format!("not a directory: {}", source_path.display()).into());
+    }
+
+    let dest_path = resolve_put_dir_destination(catalog, source_path, dest)?;
+    let plan = scan_import_dir(source_path)?;
+    confirm(
+        &format!(
+            "Import {} file{} / {} director{} ({}) into {dest_path}? [y/N] ",
+            plan.files.len(),
+            if plan.files.len() == 1 { "" } else { "s" },
+            plan.dirs.len() + 1,
+            if plan.dirs.len() + 1 == 1 { "y" } else { "ies" },
+            format_size_u64(plan.bytes),
+        ),
+        yes,
+    )?;
+
+    catalog.mkdir(dest_path.as_str(), true)?;
+    for dir in &plan.dirs {
+        let path = join_catalog_relative(&dest_path, dir)?;
+        catalog.mkdir(path.as_str(), true)?;
+    }
+
+    for file in &plan.files {
+        let bytes = fs::read(&file.source)?;
+        let source_name = file
+            .source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string);
+        let catalog_path = join_catalog_relative(&dest_path, &file.relative)?;
+        let mime = guess_mime_path(&file.source).to_string();
+        let cap = crow.put_bytes_with(
+            &bytes,
+            &mime,
+            ErasureParams::default(),
+            auto_chunk_size(bytes.len()),
+        )?;
+        catalog.put_file(catalog_path.as_str(), cap, source_name)?;
+    }
+
+    println!(
+        "stored {} file{} under {dest_path}",
+        plan.files.len(),
+        if plan.files.len() == 1 { "" } else { "s" },
+    );
+    Ok(())
+}
+
+fn cmd_get_dir(
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    path: &str,
+    out: &str,
+    yes: bool,
+) -> DynResult<()> {
+    let path = CatalogPath::normalize(path)?;
+    let view = catalog.view()?;
+    let Some(entry) = view.get(&path) else {
+        return Err(format!("catalog path not found: {path}").into());
+    };
+    if !entry.is_dir() {
+        return Err(format!("{path} is a file; use `crow get`").into());
+    }
+
+    let out = Path::new(out);
+    if out.exists() {
+        if !out.is_dir() {
+            return Err(format!("output exists and is not a directory: {}", out.display()).into());
+        }
+        if out.read_dir()?.next().is_some() {
+            confirm(
+                &format!(
+                    "Output directory is non-empty: {}. Continue? [y/N] ",
+                    out.display()
+                ),
+                yes,
+            )?;
+        }
+    }
+
+    let entries = catalog_subtree_entries(&view, &path);
+    let mut restored_files = 0usize;
+    fs::create_dir_all(out)?;
+    for entry in entries.iter().filter(|entry| entry.is_dir()) {
+        let rel = relative_catalog_path(&path, &entry.path)?;
+        if !rel.as_os_str().is_empty() {
+            fs::create_dir_all(out.join(rel))?;
+        }
+    }
+
+    for entry in entries {
+        let EntryKind::File { cap, .. } = &entry.kind else {
+            continue;
+        };
+        let rel = relative_catalog_path(&path, &entry.path)?;
+        let target = out.join(rel);
+        if target.exists() {
+            return Err(
+                format!("refusing to overwrite existing file: {}", target.display()).into(),
+            );
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = crow.get_bytes(cap)?;
+        fs::write(&target, bytes)?;
+        restored_files += 1;
+    }
+
+    println!(
+        "restored {} file{} from {path} into {}",
+        restored_files,
+        if restored_files == 1 { "" } else { "s" },
+        out.display(),
+    );
     Ok(())
 }
 
@@ -1099,6 +1277,31 @@ fn resolve_put_destination(
     Ok(final_path)
 }
 
+fn resolve_put_dir_destination(
+    catalog: &CatalogIndex,
+    source: &Path,
+    dest: Option<&str>,
+) -> DynResult<CatalogPath> {
+    let source_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("source directory needs a UTF-8 basename; pass an explicit destination")?;
+
+    let Some(dest) = dest else {
+        return CatalogPath::normalize(&format!("/{source_name}")).map_err(Into::into);
+    };
+
+    let dest_path = CatalogPath::normalize(dest)?;
+    let view = catalog.view()?;
+    let dest_is_dir =
+        dest.trim_end().ends_with('/') || view.get(&dest_path).is_some_and(|entry| entry.is_dir());
+    if dest_is_dir {
+        join_catalog_path(&dest_path, source_name)
+    } else {
+        Ok(dest_path)
+    }
+}
+
 fn join_catalog_path(parent: &CatalogPath, name: &str) -> DynResult<CatalogPath> {
     let joined = if parent.as_str() == "/" {
         format!("/{name}")
@@ -1106,6 +1309,41 @@ fn join_catalog_path(parent: &CatalogPath, name: &str) -> DynResult<CatalogPath>
         format!("{}/{name}", parent.as_str().trim_end_matches('/'))
     };
     Ok(CatalogPath::normalize(&joined)?)
+}
+
+fn join_catalog_relative(base: &CatalogPath, relative: &Path) -> DynResult<CatalogPath> {
+    let mut path = base.clone();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or("catalog paths require UTF-8 file names")?;
+                path = join_catalog_path(&path, part)?;
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err("catalog relative path cannot contain prefixes, roots, or ..".into()),
+        }
+    }
+    Ok(path)
+}
+
+fn relative_catalog_path(base: &CatalogPath, child: &CatalogPath) -> DynResult<PathBuf> {
+    if base.as_str() == child.as_str() {
+        return Ok(PathBuf::new());
+    }
+    if !catalog_path_contains(base, child) {
+        return Err(format!("{child} is not under {base}").into());
+    }
+    let relative = if base.as_str() == "/" {
+        child.as_str().trim_start_matches('/')
+    } else {
+        child
+            .as_str()
+            .trim_start_matches(base.as_str())
+            .trim_start_matches('/')
+    };
+    Ok(PathBuf::from(relative))
 }
 
 fn catalog_caps_under(view: &CatalogView, path: &CatalogPath) -> Vec<Cap> {
@@ -1132,6 +1370,19 @@ fn catalog_path_contains(parent: &CatalogPath, child: &CatalogPath) -> bool {
         || child
             .as_str()
             .starts_with(&format!("{}/", parent.as_str().trim_end_matches('/')))
+}
+
+fn catalog_subtree_entries<'a>(view: &'a CatalogView, path: &CatalogPath) -> Vec<&'a CatalogEntry> {
+    let mut out = Vec::new();
+    let mut stack = view.list(path);
+    while let Some(entry) = stack.pop() {
+        if entry.is_dir() {
+            stack.extend(view.list(&entry.path));
+        }
+        out.push(entry);
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
 }
 
 fn print_catalog_listing(
@@ -1321,6 +1572,67 @@ fn format_iso_timestamp(unix_secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
+struct ImportPlan {
+    dirs: Vec<PathBuf>,
+    files: Vec<ImportFile>,
+    bytes: u64,
+}
+
+struct ImportFile {
+    source: PathBuf,
+    relative: PathBuf,
+}
+
+fn scan_import_dir(root: &Path) -> DynResult<ImportPlan> {
+    let mut plan = ImportPlan {
+        dirs: Vec::new(),
+        files: Vec::new(),
+        bytes: 0,
+    };
+    scan_import_dir_inner(root, Path::new(""), &mut plan)?;
+    Ok(plan)
+}
+
+fn scan_import_dir_inner(abs: &Path, relative: &Path, plan: &mut ImportPlan) -> DynResult<()> {
+    let mut entries = fs::read_dir(abs)?.collect::<std::result::Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let ty = entry.file_type()?;
+        if ty.is_symlink() {
+            return Err(format!("symlinks are not supported: {}", entry.path().display()).into());
+        }
+        let name = entry.file_name();
+        let rel = relative.join(name);
+        if ty.is_dir() {
+            plan.dirs.push(rel.clone());
+            scan_import_dir_inner(&entry.path(), &rel, plan)?;
+        } else if ty.is_file() {
+            let metadata = entry.metadata()?;
+            plan.bytes += metadata.len();
+            plan.files.push(ImportFile {
+                source: entry.path(),
+                relative: rel,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn confirm(prompt: &str, yes: bool) -> DynResult<()> {
+    if yes {
+        return Ok(());
+    }
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err("aborted".into()),
+    }
+}
+
 /// Howard Hinnant's `civil_from_days`: convert days-since-epoch to (Y, M, D),
 /// proleptic Gregorian.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -1361,7 +1673,11 @@ fn write_all(path: &str, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn guess_mime(path: &str) -> &'static str {
-    let ext = Path::new(path).extension().and_then(|e| e.to_str());
+    guess_mime_path(Path::new(path))
+}
+
+fn guess_mime_path(path: &Path) -> &'static str {
+    let ext = path.extension().and_then(|e| e.to_str());
     match ext {
         Some("txt") | Some("md") | Some("log") => "text/plain",
         Some("html") | Some("htm") => "text/html",
