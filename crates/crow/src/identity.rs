@@ -122,7 +122,12 @@ impl std::fmt::Debug for Identity {
 /// name; the full 64-char hex sits in the TXT record), by `crow peers` for
 /// display, and by `crow fetch <prefix>` for friendly addressing of known
 /// peers. Equality and ordering are byte-wise on the inner key.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Serialisation is format-aware: a human-readable format (JSON, YAML) emits
+/// the 64-char hex string; a binary format (postcard, bincode) emits the raw
+/// 32 bytes. This keeps `peers.json` greppable while staying compact on the
+/// wire.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId([u8; 32]);
 
 impl NodeId {
@@ -167,6 +172,63 @@ impl std::str::FromStr for NodeId {
                 s
             ))
         })
+    }
+}
+
+impl Serialize for NodeId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&hex(&self.0))
+        } else {
+            s.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = NodeId;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("64-character hex string or 32-byte array")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<NodeId, E> {
+                decode_hex32(v.trim())
+                    .map(NodeId)
+                    .ok_or_else(|| E::custom(format!("invalid hex node id: {v:?}")))
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> std::result::Result<NodeId, E> {
+                if v.len() != 32 {
+                    return Err(E::invalid_length(v.len(), &"32 bytes"));
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(v);
+                Ok(NodeId(out))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<NodeId, A::Error> {
+                let mut out = [0u8; 32];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &"32 bytes"))?;
+                }
+                Ok(NodeId(out))
+            }
+        }
+
+        if d.is_human_readable() {
+            d.deserialize_str(V)
+        } else {
+            d.deserialize_bytes(V)
+        }
     }
 }
 
@@ -312,6 +374,30 @@ mod tests {
         assert!(NodeId::from_str("abc").is_err());
         assert!(NodeId::from_str(&"z".repeat(64)).is_err());
         assert!(NodeId::from_str("").is_err());
+    }
+
+    #[test]
+    fn node_id_serializes_as_hex_in_json() {
+        let n = NodeId::from_bytes([0xABu8; 32]);
+        let s = serde_json::to_string(&n).unwrap();
+        // Quoted hex string of length 64 + 2 quotes.
+        assert_eq!(s.len(), 66);
+        assert_eq!(s, format!("\"{}\"", "ab".repeat(32)));
+        let back: NodeId = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, n);
+    }
+
+    #[test]
+    fn node_id_serializes_as_bytes_in_postcard() {
+        let n = NodeId::from_bytes([0xCDu8; 32]);
+        let bytes = postcard::to_allocvec(&n).unwrap();
+        // postcard encodes a byte sequence as length-prefixed-varint + 32 bytes;
+        // length 32 fits in a single varint byte (0x20).
+        assert_eq!(bytes.len(), 33);
+        assert_eq!(bytes[0], 32);
+        assert_eq!(&bytes[1..], &[0xCDu8; 32]);
+        let back: NodeId = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, n);
     }
 
     #[test]

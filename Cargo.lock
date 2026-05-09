@@ -398,6 +398,7 @@ dependencies = [
  "clap",
  "crow",
  "crow-net",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

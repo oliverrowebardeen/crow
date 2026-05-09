@@ -378,6 +378,26 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// List discovered LAN peers from the most recent `crow serve` snapshot.
+    #[command(
+        long_about = "Read <home>/peers.json — the snapshot a running `crow serve` \
+                      writes every five seconds — and print every node it has seen \
+                      via mDNS recently. Default columns: 16-char node id, friendly \
+                      name, address, last-seen age. Use --long for the full hex id \
+                      and ISO timestamps; --json for machine-readable output.\n\
+                      \n\
+                      If `crow serve` is not running, `crow peers` reports the absent \
+                      snapshot rather than scanning the LAN itself. Start a daemon to \
+                      populate the snapshot."
+    )]
+    Peers {
+        /// Show full hex node ids and ISO timestamps.
+        #[arg(short, long)]
+        long: bool,
+        /// Emit the snapshot as pretty JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the shared personal-cluster token.
     #[command(subcommand)]
     Token(TokenCommand),
@@ -422,6 +442,7 @@ fn run(cli: Cli) -> DynResult<()> {
             let store = FsStore::open(&home)?;
             cmd_serve(&home, store, bind, name)
         }
+        Command::Peers { long, json } => cmd_peers(&home, long, json),
         command => {
             let store = FsStore::open(&home)?;
             let pins = PinIndex::open(&home)?;
@@ -485,7 +506,9 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, peer, &cap_or_prefix, name),
-                Command::Serve { .. } | Command::Token(_) => unreachable!("handled above"),
+                Command::Serve { .. } | Command::Peers { .. } | Command::Token(_) => {
+                    unreachable!("handled above")
+                }
             }
         }
     }
@@ -1289,6 +1312,97 @@ fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex, catalog: &CatalogIndex) -> Dy
         format_size_u64(unref_bytes),
     );
     Ok(())
+}
+
+fn cmd_peers(home: &Path, long: bool, json: bool) -> DynResult<()> {
+    let path = peer_snapshot::snapshot_path(home);
+    let snap = match peer_snapshot::load(&path)? {
+        Some(s) => s,
+        None => {
+            println!("no peer snapshot found at {}", path.display());
+            println!("start `crow serve` to discover peers on the LAN");
+            return Ok(());
+        }
+    };
+
+    if json {
+        let pretty =
+            serde_json::to_string_pretty(&snap).map_err(|e| format!("encode snapshot: {e}"))?;
+        println!("{pretty}");
+        return Ok(());
+    }
+
+    if snap.peers.is_empty() {
+        println!("(no peers discovered yet)");
+    } else if long {
+        for (i, p) in snap.peers.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            println!("node       {}", p.node_id);
+            println!(
+                "name       {}",
+                p.friendly_name.as_deref().unwrap_or("(unnamed)")
+            );
+            for (j, addr) in p.addresses.iter().enumerate() {
+                let label = if j == 0 { "address    " } else { "           " };
+                println!("{label}{addr}");
+            }
+            println!(
+                "seen       {} ({})",
+                format_iso_timestamp(p.last_seen_unix),
+                humanize_age(p.last_seen_unix)
+            );
+        }
+    } else {
+        println!(
+            "{:<16}  {:<16}  {:<22}  LAST SEEN",
+            "NODE", "NAME", "ADDRESS"
+        );
+        for p in &snap.peers {
+            let node = p.node_id.short();
+            let name = truncate(p.friendly_name.as_deref().unwrap_or("(unnamed)"), 16);
+            let addr = p
+                .addresses
+                .first()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "?".into());
+            let age = humanize_age(p.last_seen_unix);
+            println!("{node:<16}  {name:<16}  {addr:<22}  {age}");
+        }
+    }
+
+    println!();
+    let snap_age = peer_snapshot::now_unix().saturating_sub(snap.snapshot_at);
+    let self_name = snap.self_info.friendly_name.as_deref().unwrap_or("unnamed");
+    let self_node = snap.self_info.node_id.short();
+    println!(
+        "self: {self_node} {self_name} on {} (snapshot {}s old)",
+        snap.self_info.address, snap_age
+    );
+
+    if snap_age > 30 {
+        println!();
+        println!("note: snapshot is {snap_age}s old — is `crow serve` running?");
+    }
+    Ok(())
+}
+
+fn humanize_age(unix: u64) -> String {
+    let now = peer_snapshot::now_unix();
+    if unix > now {
+        return "just now".into();
+    }
+    let secs = now - unix;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 fn cmd_serve(
