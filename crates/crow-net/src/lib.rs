@@ -200,10 +200,46 @@ pub enum Response {
     Error { message: String },
 }
 
-pub async fn serve(store: FsStore, token: ClusterToken, bind: SocketAddr) -> Result<()> {
-    let endpoint = Endpoint::server(server_config()?, bind)?;
-    let store = Arc::new(store);
+/// Long-lived QUIC chunk-fetch server.
+///
+/// Returned by [`serve`] once the endpoint has bound. Holds the actual
+/// `local_addr` (so callers using `--bind 0.0.0.0:0` can learn which port
+/// the OS gave them) and a join handle for the spawned accept loop.
+pub struct Server {
+    addr: SocketAddr,
+    handle: tokio::task::JoinHandle<Result<()>>,
+}
 
+impl Server {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Wait for the accept loop to exit. Returns whatever the loop returned
+    /// (currently `Ok(())` once the endpoint stops accepting).
+    pub async fn join(self) -> Result<()> {
+        match self.handle.await {
+            Ok(res) => res,
+            Err(e) => Err(NetError::Protocol(format!("server task panicked: {e}"))),
+        }
+    }
+}
+
+/// Bind a QUIC endpoint and start accepting connections in a background task.
+///
+/// Returns once the bind has succeeded but before any connections are
+/// accepted, so callers can read `Server::local_addr()` and start any
+/// dependent services (e.g. mDNS advertisement) without racing the first
+/// peer.
+pub async fn serve(store: FsStore, token: ClusterToken, bind: SocketAddr) -> Result<Server> {
+    let endpoint = Endpoint::server(server_config()?, bind)?;
+    let addr = endpoint.local_addr()?;
+    let store = Arc::new(store);
+    let handle = tokio::spawn(accept_loop(endpoint, store, token));
+    Ok(Server { addr, handle })
+}
+
+async fn accept_loop(endpoint: Endpoint, store: Arc<FsStore>, token: ClusterToken) -> Result<()> {
     while let Some(incoming) = endpoint.accept().await {
         let store = store.clone();
         tokio::spawn(async move {
