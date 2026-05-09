@@ -280,9 +280,9 @@ enum Command {
     /// Sweep every chunk and manifest not referenced by any pin.
     #[command(
         long_about = "Walk every chunk and manifest in the store; delete anything not \
-                      referenced by a current pin. The catch-all complement to `crow \
-                      rm` — cleans up after `crow unpin`, crashed puts, manually-\
-                      removed pins, etc.\n\
+                      referenced by a current pin or catalog path. The catch-all \
+                      complement to `crow rm` — cleans up after `crow unpin`, crashed \
+                      puts, manually-removed pins, etc.\n\
                       \n\
                       --dry-run reports what would be freed without touching disk; \
                       run it first if you're not sure."

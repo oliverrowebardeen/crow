@@ -14,8 +14,8 @@
 //!   wired into the pipeline).
 //! - [`pipeline`] — the [`pipeline::Crow`] facade tying everything together.
 //!
-//! Networking, persistence, gossip discovery, the metadata CRDT, and live
-//! manifest signing are out of scope for this crate version.
+//! Networking discovery, automatic replication, replicated metadata sync, and
+//! live manifest signing are out of scope for this crate version.
 
 pub mod cap;
 pub mod catalog;
