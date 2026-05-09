@@ -118,8 +118,13 @@ mod tests {
     use crate::pipeline::Crow;
 
     fn put(crow: &Crow<MemStore>, payload: &[u8]) -> Cap {
-        crow.put_bytes_with(payload, "application/octet-stream", ErasureParams::default(), 240)
-            .expect("put_bytes_with")
+        crow.put_bytes_with(
+            payload,
+            "application/octet-stream",
+            ErasureParams::default(),
+            240,
+        )
+        .expect("put_bytes_with")
     }
 
     #[test]

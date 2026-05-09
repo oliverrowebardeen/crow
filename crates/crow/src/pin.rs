@@ -208,7 +208,9 @@ mod tests {
         let cap = cap_with_hash_byte(1);
         let h = *cap.manifest_hash.inner();
 
-        let rec = pins.add(cap.clone(), Some("note.txt".into()), None).unwrap();
+        let rec = pins
+            .add(cap.clone(), Some("note.txt".into()), None)
+            .unwrap();
         assert_eq!(rec.name.as_deref(), Some("note.txt"));
 
         let got = pins.get(&h).unwrap().unwrap();
