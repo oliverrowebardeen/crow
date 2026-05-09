@@ -56,11 +56,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Store a file, auto-pin it, optionally attach it to a catalog path.
+    /// Store a file as a flat pin or at a catalog path.
     #[command(
-        long_about = "Encrypt, chunk, erasure-code, and store the bytes; record a pin \
-                      so chunks survive `crow gc`; optionally record a local catalog \
-                      path; print the resulting bech32m cap.\n\
+        long_about = "Encrypt, chunk, erasure-code, and store the bytes; record either \
+                      a flat pin or a local catalog path so chunks survive `crow gc`; \
+                      print the resulting bech32m cap.\n\
                       \n\
                       The default pin name is the basename of the input file, or \
                       `(unnamed)` for stdin. Use --name to override.\n\
@@ -197,22 +197,38 @@ enum Command {
         /// Full bech32m capability or hex prefix of a pinned manifest.
         cap_or_prefix: String,
     },
-    /// Remove a pin AND immediately delete its chunks.
+    /// Remove a pin or catalog path AND immediately delete unreferenced chunks.
     #[command(
-        long_about = "Remove the pin record AND delete this manifest's chunks (those \
-                      not also held by another pin). Targeted, immediate, not \
-                      deferred — the unix-style \"delete now.\"\n\
+        long_about = "Remove the pin record or catalog path AND delete this manifest's \
+                      chunks (those not also held by another pin or catalog path). \
+                      Targeted, immediate, not deferred — the unix-style \"delete now.\"\n\
                       \n\
                       Use --dry-run to see what would be deleted before committing.\n\
                       \n\
                       Use `crow unpin` instead if you might want to re-pin later."
     )]
     Rm {
-        /// Full bech32m capability or hex prefix of a pinned manifest.
+        /// Catalog path, full bech32m capability, or hex prefix of a pinned manifest.
         cap_or_prefix: String,
         /// Print what would be deleted without touching disk.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Move or rename a local catalog path.
+    #[command(
+        long_about = "Move or rename a local catalog file or directory. This only \
+                      changes catalog organization; file caps and encrypted chunks do \
+                      not change.\n\
+                      \n\
+                      Examples:\n  \
+                      crow mv /docs/report.pdf /docs/archive/report.pdf\n  \
+                      crow mv /docs/report.pdf /archive/"
+    )]
+    Mv {
+        /// Existing catalog path.
+        from: String,
+        /// Destination catalog path, or existing directory.
+        to: String,
     },
     /// Sweep every chunk and manifest not referenced by any pin.
     #[command(
@@ -349,7 +365,8 @@ fn run(cli: Cli) -> DynResult<()> {
                 Command::Rm {
                     cap_or_prefix,
                     dry_run,
-                } => cmd_rm(&crow, &pins, &cap_or_prefix, dry_run),
+                } => cmd_rm(&crow, &pins, &catalog, &cap_or_prefix, dry_run),
+                Command::Mv { from, to } => cmd_mv(&catalog, &from, &to),
                 Command::Gc { dry_run } => cmd_gc(&crow, &pins, &catalog, dry_run),
                 Command::Stat => cmd_stat(&crow, &pins, &catalog),
                 Command::Fetch {
@@ -381,17 +398,20 @@ fn cmd_put(
     name: Option<String>,
     chunk_size: Option<u32>,
 ) -> DynResult<()> {
+    let catalog_dest = dest
+        .map(|dest| resolve_put_destination(catalog, path, dest))
+        .transpose()?;
     let bytes = read_all(path)?;
     let mime_str = mime.unwrap_or_else(|| guess_mime(path).to_string());
     let chunk_size = chunk_size.unwrap_or_else(|| auto_chunk_size(bytes.len()));
 
     let cap = crow.put_bytes_with(&bytes, &mime_str, ErasureParams::default(), chunk_size)?;
     let pin_name = name.or_else(|| default_name(path));
-    pins.add(cap.clone(), pin_name.clone(), None)?;
-    if let Some(dest) = dest {
-        let catalog_path = resolve_put_destination(catalog, path, dest)?;
+    if let Some(catalog_path) = catalog_dest {
         catalog.put_file(catalog_path.as_str(), cap.clone(), pin_name)?;
         println!("path {}", catalog_path);
+    } else {
+        pins.add(cap.clone(), pin_name, None)?;
     }
     println!("{}", cap.encode());
     Ok(())
@@ -418,10 +438,11 @@ fn cmd_info(
     arg: &str,
 ) -> DynResult<()> {
     let target = resolve_file_ref(catalog, pins, arg)?;
+    let path = target.path;
     let cap = target.cap;
     let manifest = open_manifest(crow, &cap)?;
 
-    if let Some(path) = target.path {
+    if let Some(path) = &path {
         println!("path      {path}");
     }
     let stripes = manifest.stripes.len();
@@ -457,6 +478,9 @@ fn cmd_info(
         );
     } else {
         println!("pinned    no");
+    }
+    if path.is_some() {
+        println!("cataloged yes");
     }
     Ok(())
 }
@@ -561,18 +585,32 @@ fn cmd_unpin(pins: &PinIndex, arg: &str) -> DynResult<()> {
     Ok(())
 }
 
-fn cmd_rm(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str, dry_run: bool) -> DynResult<()> {
+fn cmd_rm(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: &str,
+    dry_run: bool,
+) -> DynResult<()> {
+    if let Ok(path) = CatalogPath::normalize(arg) {
+        let view = catalog.view()?;
+        if view.get(&path).is_some() {
+            return cmd_rm_catalog_path(crow, pins, catalog, &view, &path, dry_run);
+        }
+    }
+
     let target = resolve_pin(pins, arg)?;
     let target_cap = target.cap.clone();
 
     // Collect every other pinned cap so we don't delete chunks that are
-    // shared with other pinned manifests.
-    let remaining_caps: Vec<Cap> = pins
+    // shared with other pinned or cataloged manifests.
+    let mut remaining_caps: Vec<Cap> = pins
         .list()?
         .into_iter()
         .filter(|r| r.manifest_hash_hex != target.manifest_hash_hex)
         .map(|r| r.cap)
         .collect();
+    remaining_caps.extend(catalog.view()?.file_caps());
 
     if !dry_run {
         pins.remove(target_cap.manifest_hash.inner())?;
@@ -605,6 +643,91 @@ fn cmd_rm(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str, dry_run: bool) -> Dy
         if report.deleted_chunks == 1 { "" } else { "s" },
         format_size_u64(report.deleted_bytes),
     );
+    Ok(())
+}
+
+fn cmd_rm_catalog_path(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    view: &CatalogView,
+    path: &CatalogPath,
+    dry_run: bool,
+) -> DynResult<()> {
+    if path.as_str() == "/" {
+        return Err("refusing to remove catalog root".into());
+    }
+
+    let target_caps = catalog_caps_under(view, path);
+    let mut remaining_caps: Vec<Cap> = pins.list()?.into_iter().map(|r| r.cap).collect();
+    remaining_caps.extend(catalog_caps_not_under(view, path));
+
+    if !dry_run {
+        catalog.remove(path.as_str())?;
+    }
+
+    let report = targeted_remove(
+        crow.store(),
+        &target_caps,
+        &remaining_caps,
+        GcOptions { dry_run },
+    )?;
+
+    let action = if dry_run { "would remove" } else { "removed" };
+    println!("{action} catalog path {path}");
+    let action = if dry_run { "would delete" } else { "deleted" };
+    println!(
+        "{action} {} manifest{} / {} chunk{} ({})",
+        report.deleted_manifests,
+        if report.deleted_manifests == 1 {
+            ""
+        } else {
+            "s"
+        },
+        report.deleted_chunks,
+        if report.deleted_chunks == 1 { "" } else { "s" },
+        format_size_u64(report.deleted_bytes),
+    );
+    Ok(())
+}
+
+fn cmd_mv(catalog: &CatalogIndex, from: &str, to: &str) -> DynResult<()> {
+    let from = CatalogPath::normalize(from)?;
+    if from.as_str() == "/" {
+        return Err("refusing to move catalog root".into());
+    }
+
+    let view = catalog.view()?;
+    let Some(source) = view.get(&from) else {
+        return Err(format!("catalog path not found: {from}").into());
+    };
+
+    let raw_to = to.trim();
+    let mut to = CatalogPath::normalize(raw_to)?;
+    if raw_to.ends_with('/') || view.get(&to).is_some_and(|entry| entry.is_dir()) {
+        let name = source
+            .path
+            .file_name()
+            .ok_or("cannot infer destination name")?;
+        to = join_catalog_path(&to, name)?;
+    }
+
+    if catalog_path_contains(&from, &to) {
+        return Err(format!("cannot move {from} inside itself at {to}").into());
+    }
+    if view.get(&to).is_some() {
+        return Err(format!("destination already exists: {to}").into());
+    }
+    if let Some(parent) = to.parent() {
+        match view.get(&parent) {
+            Some(entry) if entry.is_dir() => {}
+            Some(_) => return Err(format!("destination parent is a file: {parent}").into()),
+            None => return Err(format!("destination parent does not exist: {parent}").into()),
+        }
+    }
+
+    catalog.move_path(from.as_str(), to.as_str())?;
+    println!("moved {from} -> {to}");
     Ok(())
 }
 
@@ -983,6 +1106,32 @@ fn join_catalog_path(parent: &CatalogPath, name: &str) -> DynResult<CatalogPath>
         format!("{}/{name}", parent.as_str().trim_end_matches('/'))
     };
     Ok(CatalogPath::normalize(&joined)?)
+}
+
+fn catalog_caps_under(view: &CatalogView, path: &CatalogPath) -> Vec<Cap> {
+    view.files()
+        .into_iter()
+        .filter(|entry| catalog_path_contains(path, &entry.path))
+        .filter_map(|entry| entry.cap().cloned())
+        .collect()
+}
+
+fn catalog_caps_not_under(view: &CatalogView, path: &CatalogPath) -> Vec<Cap> {
+    view.files()
+        .into_iter()
+        .filter(|entry| !catalog_path_contains(path, &entry.path))
+        .filter_map(|entry| entry.cap().cloned())
+        .collect()
+}
+
+fn catalog_path_contains(parent: &CatalogPath, child: &CatalogPath) -> bool {
+    if parent.as_str() == "/" {
+        return child.as_str() != "/";
+    }
+    child.as_str() == parent.as_str()
+        || child
+            .as_str()
+            .starts_with(&format!("{}/", parent.as_str().trim_end_matches('/')))
 }
 
 fn print_catalog_listing(
