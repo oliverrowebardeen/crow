@@ -642,7 +642,8 @@ fn cmd_fetch(
     }
 
     let manifest = open_manifest(crow, &cap)?;
-    pins.add(cap.clone(), name, None)?;
+    let (pin_name, pin_comment) = fetch_pin_metadata(pins, &cap, name)?;
+    pins.add(cap.clone(), pin_name, pin_comment)?;
 
     let mut local_shares = 0usize;
     let mut fetched_shares = 0usize;
@@ -701,6 +702,17 @@ fn cmd_fetch(
             Err(format!("fetch incomplete: {e}").into())
         }
     }
+}
+
+fn fetch_pin_metadata(
+    pins: &PinIndex,
+    cap: &Cap,
+    requested_name: Option<String>,
+) -> DynResult<(Option<String>, Option<String>)> {
+    let existing_pin = pins.get(cap.manifest_hash.inner())?;
+    let name = requested_name.or_else(|| existing_pin.as_ref().and_then(|r| r.name.clone()));
+    let comment = existing_pin.and_then(|r| r.comment);
+    Ok((name, comment))
 }
 
 fn cmd_token(home: &Path, command: TokenCommand) -> DynResult<()> {
@@ -958,5 +970,52 @@ fn format_size(bytes: usize) -> String {
         format!("{:.2} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crow::{ManifestHash, ManifestKey};
+
+    fn cap_with_hash_byte(b: u8) -> Cap {
+        Cap::new_read(
+            ManifestHash::from_bytes([b; 32]),
+            ManifestKey::from_bytes([b; 32]),
+        )
+    }
+
+    #[test]
+    fn fetch_without_name_preserves_existing_pin_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0xAB);
+        pins.add(
+            cap.clone(),
+            Some("report.pdf".into()),
+            Some("important".into()),
+        )
+        .unwrap();
+
+        let (name, comment) = fetch_pin_metadata(&pins, &cap, None).unwrap();
+        assert_eq!(name.as_deref(), Some("report.pdf"));
+        assert_eq!(comment.as_deref(), Some("important"));
+    }
+
+    #[test]
+    fn fetch_name_override_preserves_existing_comment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0xCD);
+        pins.add(
+            cap.clone(),
+            Some("old.pdf".into()),
+            Some("keep this".into()),
+        )
+        .unwrap();
+
+        let (name, comment) = fetch_pin_metadata(&pins, &cap, Some("new.pdf".into())).unwrap();
+        assert_eq!(name.as_deref(), Some("new.pdf"));
+        assert_eq!(comment.as_deref(), Some("keep this"));
     }
 }
