@@ -391,11 +391,13 @@ fn run(cli: Cli) -> DynResult<()> {
                     &crow,
                     &pins,
                     &catalog,
-                    &path,
-                    dest.as_deref(),
-                    mime,
-                    name,
-                    chunk_size,
+                    PutArgs {
+                        path: &path,
+                        dest: dest.as_deref(),
+                        mime,
+                        name,
+                        chunk_size,
+                    },
                 ),
                 Command::Get { cap_or_prefix, out } => {
                     cmd_get(&crow, &pins, &catalog, &cap_or_prefix, &out)
@@ -441,25 +443,34 @@ fn resolve_home(explicit: Option<PathBuf>) -> DynResult<PathBuf> {
     Ok(PathBuf::from(home).join(".crow"))
 }
 
+struct PutArgs<'a> {
+    path: &'a str,
+    dest: Option<&'a str>,
+    mime: Option<String>,
+    name: Option<String>,
+    chunk_size: Option<u32>,
+}
+
 fn cmd_put(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
     catalog: &CatalogIndex,
-    path: &str,
-    dest: Option<&str>,
-    mime: Option<String>,
-    name: Option<String>,
-    chunk_size: Option<u32>,
+    args: PutArgs<'_>,
 ) -> DynResult<()> {
-    let catalog_dest = dest
-        .map(|dest| resolve_put_destination(catalog, path, dest))
+    let catalog_dest = args
+        .dest
+        .map(|dest| resolve_put_destination(catalog, args.path, dest))
         .transpose()?;
-    let bytes = read_all(path)?;
-    let mime_str = mime.unwrap_or_else(|| guess_mime(path).to_string());
-    let chunk_size = chunk_size.unwrap_or_else(|| auto_chunk_size(bytes.len()));
+    let bytes = read_all(args.path)?;
+    let mime_str = args
+        .mime
+        .unwrap_or_else(|| guess_mime(args.path).to_string());
+    let chunk_size = args
+        .chunk_size
+        .unwrap_or_else(|| auto_chunk_size(bytes.len()));
 
     let cap = crow.put_bytes_with(&bytes, &mime_str, ErasureParams::default(), chunk_size)?;
-    let pin_name = name.or_else(|| default_name(path));
+    let pin_name = args.name.or_else(|| default_name(args.path));
     if let Some(catalog_path) = catalog_dest {
         catalog.put_file(catalog_path.as_str(), cap.clone(), pin_name)?;
         println!("path {}", catalog_path);
