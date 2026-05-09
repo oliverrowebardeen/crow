@@ -8,9 +8,9 @@ A file in Crow is encrypted, chunked, hashed, erasure-coded, and stored as a set
 
 ## Status
 
-This crate ships the **data model** and a **daily-driver CLI** on a single machine: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, and a small set of subcommands (`put`, `get`, `info`, `ls`, `pin`, `unpin`, `rm`, `gc`, `stat`). The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
+This crate ships the **data model**, a **daily-driver CLI**, and the first **manual LAN fetch** pass: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, and a small set of subcommands (`put`, `get`, `info`, `ls`, `pin`, `unpin`, `rm`, `gc`, `stat`, `token`, `serve`, `fetch`). The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
 
-Networking, gossip discovery, replication policy, the metadata CRDT, and live identity-based manifest signing are deferred. See [Roadmap](#roadmap).
+mDNS discovery, automatic replication policy, the metadata CRDT, friend-scoped sharing, and live identity-based manifest signing are deferred. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -32,6 +32,7 @@ plaintext  →  encrypt  →  chunk  →  Reed–Solomon  →  store as content-
 | Capability  | Bech32m `crow1…` string carrying (version, permission, manifest hash, manifest key)               | `crow::cap`                         |
 | Pin index   | Per-pin JSON files at `<home>/pins/<hash>.json`, atomic writes, prefix lookup                     | `crow::pin`                         |
 | GC          | Mark-and-sweep over the chunk store; owner-pinning model                                          | `crow::gc`                          |
+| Network     | QUIC chunk-fetch protocol with shared-token personal-cluster auth                                 | `crow-net`                          |
 | Pipeline    | `Crow<S>::put_bytes` / `get_bytes` orchestration                                                  | `crow::pipeline`                    |
 
 ### Data flow
@@ -72,6 +73,9 @@ crow unpin <cap-or-prefix>
 crow rm   <cap-or-prefix> [--dry-run]
 crow gc   [--dry-run]
 crow stat
+crow token init|show|set
+crow serve [--bind ADDR]
+crow fetch <peer-addr> <cap-or-prefix> [--name NAME]
 ```
 
 `<file>` and `<out>` accept `-` for stdin / stdout. Storage lives at `$CROW_HOME` (default `~/.crow`); override per-invocation with `--home PATH`.
@@ -118,7 +122,7 @@ pins          0
 unreferenced  0 manifests / 0 chunks (0 B)
 ```
 
-Each `crow put` generates fresh keys, so the same bytes produce a different capability each time. Content addressing happens at the *share* level, not the cap.
+Each `crow put` generates fresh keys, so the same bytes produce a different capability and different encrypted shares each time. Content addressing happens at the *encrypted share* level, not the plaintext or the cap.
 
 ### Pinning and garbage collection
 
@@ -133,6 +137,38 @@ crow gc    [--dry-run]         # sweep every chunk and manifest not referenced b
 
 The split between `unpin` and `rm` is deliberate: `unpin` is reversible (re-pinning the same cap brings it back, since the chunks are still on disk), while `rm` is the unix-style "delete now." Use `--dry-run` on `rm` and `gc` to see what would happen before committing.
 
+### Personal-cluster fetch
+
+Phase 1 networking is for trusted devices you own on the same LAN. It is not friend-scoped sharing yet: every device with the shared cluster token can ask a serving peer for encrypted chunks by hash. The peer never sees cap keys or plaintext.
+
+One-time setup:
+
+```sh
+# On the source device:
+crow token init
+crow token show
+
+# On the receiving device:
+crow token set <64-hex-token>
+```
+
+Serve chunks from the source device:
+
+```sh
+crow serve
+# serving /Users/you/.crow on 0.0.0.0:7070
+# cluster token: configured
+```
+
+Fetch a cap from another device by LAN address:
+
+```sh
+crow fetch 192.168.1.42:7070 crow1qyq...m0r --name report.pdf
+crow get <prefix> report.pdf
+```
+
+`fetch` pulls the encrypted manifest and missing shares, verifies every object by BLAKE3 hash before storing it, pins the cap locally, and exits successfully only when local reconstruction works. mDNS discovery, peer lists, and automatic replication are later Phase 1 steps.
+
 ### Sharing
 
 The cap is the only thing a holder needs. It's ASCII, ~117 chars, paste-friendly:
@@ -146,7 +182,7 @@ $ crow pin "$CAP" --name report-from-friend.pdf
 $ crow get  "$CAP" report.pdf
 ```
 
-Networked share fetching is not yet implemented (Phase 1, Step 2). For now both machines must share the same `~/.crow/chunks/` directory or sync it some other way.
+For personal devices on the same LAN, use `crow serve` + `crow fetch` as shown above. Specific file sharing with friends is deferred to Phase 2 so it can use scoped access instead of the personal-cluster token.
 
 ### Pipelines
 
@@ -168,10 +204,11 @@ crow get "$(cat note.cap)" -
 ~/.crow/
 ├── chunks/        # data and parity shares, file name = hex BLAKE3
 ├── manifests/     # AES-GCM-sealed postcard manifests, file name = hex BLAKE3
-└── pins/          # one JSON file per pin, file name = <hex_manifest_hash>.json
+├── pins/          # one JSON file per pin, file name = <hex_manifest_hash>.json
+└── cluster-token  # shared personal-cluster token for QUIC fetch
 ```
 
-Each chunk file is exactly `chunk_size + 16` bytes (the AEAD tag). Writes are content-addressed, so identical bytes always land in the same hex filename — re-`put`ting the same file is a no-op. Writes are atomic via temp-file + rename, so partial writes never leak.
+Each chunk file is exactly `chunk_size + 16` bytes (the AEAD tag). Writes are content-addressed at the encrypted-byte level, and writes are atomic via temp-file + rename, so partial writes never leak.
 
 ### Configuration
 
@@ -239,6 +276,9 @@ crow/
 │   │   ├── src/                    # hash · chunk · crypto · erasure · manifest · cap · identity · pipeline · fs_store · pin · gc
 │   │   ├── examples/roundtrip.rs   # 5 MiB end-to-end demo
 │   │   └── tests/integration.rs    # cross-module + Phase 1 step 1 tests
+│   ├── crow-net/                   # QUIC chunk-fetch protocol + token store
+│   │   ├── src/
+│   │   └── tests/
 │   └── crow-cli/                   # `crow` binary
 │       └── src/main.rs
 ├── .github/workflows/ci.yml        # fmt + clippy + test
@@ -273,7 +313,7 @@ BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed–
 Several devices owned by one user, on the same network, syncing files between them.
 
 1. **Storage hardening — shipped.** Pinning, garbage collection, and the daily-driver CLI (`ls`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a cap.
-2. **Daemon + chunk-fetch.** A long-running `crow serve` process that listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. Two daemons can pull chunks from each other once they know each other's address.
+2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted manifests and shares from a known peer after shared-token authorization.
 3. **mDNS discovery.** Daemons announce themselves on the local network the same way AirPrint and Chromecast do; other Crows on the same Wi-Fi automatically add them to a peer list. No central server, no DHT.
 4. **Replication policy.** Each device watches its pinned manifests and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
 5. **Metadata CRDT.** A small replicated catalog of names → manifest hashes, ACLs, version history, and holder hints. Conflict-free merging across devices that go offline and come back.
