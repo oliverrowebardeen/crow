@@ -1,3 +1,7 @@
+pub mod discovery;
+
+pub use discovery::{Discovery, LocalAdvert, PeerInfo, SERVICE_TYPE};
+
 use std::fmt;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
