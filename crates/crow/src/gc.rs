@@ -3,11 +3,12 @@
 //! GC is mark-and-sweep with no daemon: a sweep runs only when something
 //! invokes [`sweep`] (full sweep, used by `crow gc`) or [`targeted_remove`]
 //! (single-pin sweep, used by `crow rm`). Both routines are owner-pinning:
-//! a chunk lives if and only if some pinned manifest references it.
+//! a chunk lives if and only if some pinned or cataloged manifest references it.
 
 use std::collections::HashSet;
 
 use crate::cap::Cap;
+use crate::catalog::CatalogView;
 use crate::chunk::{ChunkStore, Namespace};
 use crate::error::Result;
 use crate::hash::Hash;
@@ -54,9 +55,33 @@ pub fn compute_live_set<S: ChunkStore>(store: &S, caps: &[Cap]) -> Result<LiveSe
     Ok(live)
 }
 
+/// Compute live chunks referenced by the current catalog view.
+pub fn compute_live_set_from_catalog<S: ChunkStore>(
+    store: &S,
+    catalog: &CatalogView,
+) -> Result<LiveSet> {
+    compute_live_set(store, &catalog.file_caps())
+}
+
+/// Compute live chunks referenced by both flat caps and catalog paths.
+///
+/// This is the normal full-GC root set: legacy pins and path-based catalog
+/// entries both keep content alive.
+pub fn compute_live_set_from_roots<S: ChunkStore>(
+    store: &S,
+    caps: &[Cap],
+    catalog: &CatalogView,
+) -> Result<LiveSet> {
+    let catalog_caps = catalog.file_caps();
+    let mut all_caps = Vec::with_capacity(caps.len() + catalog_caps.len());
+    all_caps.extend_from_slice(caps);
+    all_caps.extend(catalog_caps);
+    compute_live_set(store, &all_caps)
+}
+
 /// Full-store sweep: delete every `(Namespace, Hash)` not present in `live`.
 ///
-/// `live` is typically produced by `compute_live_set(store, &all_pinned_caps)`.
+/// `live` is typically produced by `compute_live_set_from_roots`.
 /// The two-call shape lets the caller reuse a live set across operations
 /// (e.g. compute it once, sweep, then immediately use it again).
 pub fn sweep<S: ChunkStore>(store: &S, live: &LiveSet, opts: GcOptions) -> Result<GcReport> {
@@ -113,9 +138,11 @@ pub fn targeted_remove<S: ChunkStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::CatalogIndex;
     use crate::chunk::MemStore;
     use crate::erasure::ErasureParams;
     use crate::pipeline::Crow;
+    use tempfile::TempDir;
 
     fn put(crow: &Crow<MemStore>, payload: &[u8]) -> Cap {
         crow.put_bytes_with(
@@ -257,5 +284,53 @@ mod tests {
         // compute_live_set should not error; it just produces an empty set.
         let live = compute_live_set(crow.store(), std::slice::from_ref(&cap)).unwrap();
         assert!(live.is_empty());
+    }
+
+    #[test]
+    fn catalog_live_set_keeps_cataloged_file() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs", false).unwrap();
+
+        let crow = Crow::new(MemStore::new());
+        let cap = put(&crow, b"path-rooted");
+        catalog
+            .put_file("/docs/report.txt", cap.clone(), Some("report.txt".into()))
+            .unwrap();
+
+        let view = catalog.view().unwrap();
+        let live = compute_live_set_from_catalog(crow.store(), &view).unwrap();
+        let report = sweep(crow.store(), &live, GcOptions::default()).unwrap();
+
+        assert_eq!(report.deleted_chunks, 0);
+        assert_eq!(report.deleted_manifests, 0);
+        assert_eq!(crow.get_bytes(&cap).unwrap(), b"path-rooted");
+    }
+
+    #[test]
+    fn root_live_set_combines_pins_and_catalog() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+
+        let crow = Crow::new(MemStore::new());
+        let pinned = put(&crow, b"flat pin");
+        let cataloged = put(&crow, b"catalog path");
+        catalog
+            .put_file(
+                "/cataloged.txt",
+                cataloged.clone(),
+                Some("cataloged.txt".into()),
+            )
+            .unwrap();
+
+        let view = catalog.view().unwrap();
+        let live = compute_live_set_from_roots(crow.store(), std::slice::from_ref(&pinned), &view)
+            .unwrap();
+        let report = sweep(crow.store(), &live, GcOptions::default()).unwrap();
+
+        assert_eq!(report.deleted_chunks, 0);
+        assert_eq!(report.deleted_manifests, 0);
+        assert_eq!(crow.get_bytes(&pinned).unwrap(), b"flat pin");
+        assert_eq!(crow.get_bytes(&cataloged).unwrap(), b"catalog path");
     }
 }

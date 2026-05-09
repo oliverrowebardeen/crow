@@ -38,7 +38,10 @@ pub use crypto::{FileKey, ManifestKey};
 pub use erasure::{DEFAULT_CHUNK_SIZE, ErasureParams};
 pub use error::{Error, Result};
 pub use fs_store::FsStore;
-pub use gc::{GcOptions, GcReport, LiveSet, compute_live_set, sweep, targeted_remove};
+pub use gc::{
+    GcOptions, GcReport, LiveSet, compute_live_set, compute_live_set_from_catalog,
+    compute_live_set_from_roots, sweep, targeted_remove,
+};
 pub use hash::{ChunkHash, Hash, ManifestHash};
 pub use identity::Identity;
 pub use manifest::{
