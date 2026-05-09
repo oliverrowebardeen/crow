@@ -1,8 +1,12 @@
 use bytes::Bytes;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use tempfile::TempDir;
 
-use crow::{Cap, ChunkStore, Crow, ErasureParams, Error, Manifest, MemStore, Namespace};
+use crow::{
+    Cap, ChunkStore, Crow, ErasureParams, Error, FsStore, GcOptions, Manifest, ManifestHash,
+    ManifestKey, MemStore, Namespace, PinIndex, compute_live_set, sweep, targeted_remove,
+};
 
 /// Test-friendly chunk size: 65 520 bytes (= 64 KiB − 16). Picked so that
 /// (chunk_size + AEAD tag) is exactly 64 KiB and aligns to the RS shard
@@ -248,4 +252,178 @@ fn cap_string_is_paste_friendly() {
     assert!(encoded.chars().all(|c| c.is_ascii() && !c.is_whitespace()));
     let parsed = Cap::decode(&encoded).unwrap();
     assert_eq!(parsed.manifest_hash, cap.manifest_hash);
+}
+
+// ----------------------------------------------------------------------
+// Phase 1 — Step 1: pin / GC / daily-driver flows
+// ----------------------------------------------------------------------
+
+fn put_fs(crow: &Crow<FsStore>, plaintext: &[u8]) -> Cap {
+    crow.put_bytes_with(
+        plaintext,
+        "application/octet-stream",
+        ErasureParams::default(),
+        TEST_CHUNK_SIZE,
+    )
+    .expect("put_bytes_with succeeds")
+}
+
+#[test]
+fn pin_persists_across_handles_and_resolves_by_prefix() {
+    let tmp = TempDir::new().unwrap();
+    let payload = b"hello, persistent world";
+
+    let cap = {
+        let store = FsStore::open(tmp.path()).unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(store);
+        let cap = put_fs(&crow, payload);
+        pins.add(cap.clone(), Some("hello.txt".into()), None)
+            .unwrap();
+        cap
+    };
+
+    // Reopen at the same path and look up by 4-char prefix.
+    let store = FsStore::open(tmp.path()).unwrap();
+    let pins = PinIndex::open(tmp.path()).unwrap();
+    let crow = Crow::new(store);
+
+    let recs = pins.list().unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].name.as_deref(), Some("hello.txt"));
+
+    let prefix = &cap.manifest_hash.to_string()[..4];
+    let matches = pins.find_by_prefix(prefix).unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(crow.get_bytes(&matches[0].cap).unwrap(), payload);
+}
+
+#[test]
+fn rm_deletes_target_chunks_but_preserves_other_pins() {
+    let tmp = TempDir::new().unwrap();
+    let store = FsStore::open(tmp.path()).unwrap();
+    let crow = Crow::new(store);
+
+    let alice = put_fs(&crow, b"alice");
+    let bob = put_fs(&crow, b"bob");
+
+    // Simulate `crow rm alice`: target = [alice], remaining = [bob].
+    let report = targeted_remove(
+        crow.store(),
+        std::slice::from_ref(&alice),
+        std::slice::from_ref(&bob),
+        GcOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.deleted_chunks > 0);
+    assert!(report.deleted_manifests > 0);
+    assert!(crow.get_bytes(&alice).is_err());
+    assert_eq!(crow.get_bytes(&bob).unwrap(), b"bob");
+}
+
+#[test]
+fn gc_full_sweep_reclaims_unpinned() {
+    let tmp = TempDir::new().unwrap();
+    let store = FsStore::open(tmp.path()).unwrap();
+    let pins = PinIndex::open(tmp.path()).unwrap();
+    let crow = Crow::new(store);
+
+    let pinned = put_fs(&crow, b"keep me");
+    let unpinned = put_fs(&crow, b"throw me away");
+
+    pins.add(pinned.clone(), Some("keep".into()), None).unwrap();
+
+    let pin_caps: Vec<Cap> = pins.list().unwrap().into_iter().map(|r| r.cap).collect();
+    let live = compute_live_set(crow.store(), &pin_caps).unwrap();
+    let report = sweep(crow.store(), &live, GcOptions::default()).unwrap();
+
+    assert!(report.deleted_chunks > 0);
+    assert!(report.deleted_manifests > 0);
+    assert_eq!(crow.get_bytes(&pinned).unwrap(), b"keep me");
+    assert!(crow.get_bytes(&unpinned).is_err());
+}
+
+#[test]
+fn gc_dry_run_does_not_touch_disk() {
+    let tmp = TempDir::new().unwrap();
+    let store = FsStore::open(tmp.path()).unwrap();
+    let crow = Crow::new(store);
+
+    let cap = put_fs(&crow, b"phantom");
+    let live = compute_live_set(crow.store(), &[]).unwrap();
+
+    let report = sweep(crow.store(), &live, GcOptions { dry_run: true }).unwrap();
+    assert!(report.deleted_chunks > 0);
+    assert!(report.deleted_manifests > 0);
+
+    // Nothing actually deleted: bytes still recoverable.
+    assert_eq!(crow.get_bytes(&cap).unwrap(), b"phantom");
+}
+
+#[test]
+fn rm_preserves_chunks_when_listed_in_remaining() {
+    // Models the "shared chunk between two pins" case: even if target_caps
+    // points at a manifest, listing it in remaining_caps must keep its
+    // chunks alive.
+    let tmp = TempDir::new().unwrap();
+    let store = FsStore::open(tmp.path()).unwrap();
+    let crow = Crow::new(store);
+
+    let cap = put_fs(&crow, b"shared truth");
+
+    let report = targeted_remove(
+        crow.store(),
+        std::slice::from_ref(&cap),
+        std::slice::from_ref(&cap),
+        GcOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(report.deleted_chunks, 0);
+    assert_eq!(report.deleted_manifests, 0);
+    assert_eq!(crow.get_bytes(&cap).unwrap(), b"shared truth");
+}
+
+#[test]
+fn pin_prefix_collisions_are_detectable() {
+    let tmp = TempDir::new().unwrap();
+    let pins = PinIndex::open(tmp.path()).unwrap();
+
+    // Two synthetic caps with distinct hex prefixes. Real-world hashes
+    // rarely collide on more than a few characters; we just verify the
+    // matching arithmetic.
+    let cap_ab = Cap::new_read(
+        ManifestHash::from_bytes([0xAB; 32]),
+        ManifestKey::from_bytes([1; 32]),
+    );
+    let cap_cd = Cap::new_read(
+        ManifestHash::from_bytes([0xCD; 32]),
+        ManifestKey::from_bytes([2; 32]),
+    );
+    pins.add(cap_ab, None, None).unwrap();
+    pins.add(cap_cd, None, None).unwrap();
+
+    assert_eq!(pins.find_by_prefix("ab").unwrap().len(), 1);
+    assert_eq!(pins.find_by_prefix("cd").unwrap().len(), 1);
+    assert_eq!(pins.find_by_prefix("").unwrap().len(), 2);
+    assert!(pins.find_by_prefix("ff").unwrap().is_empty());
+}
+
+#[test]
+fn pinning_does_not_leak_into_chunk_store() {
+    // Sanity check: PinIndex writes go to <home>/pins, not the chunk store
+    // namespaces, so list and stat still reflect only chunks/manifests.
+    let tmp = TempDir::new().unwrap();
+    let store = FsStore::open(tmp.path()).unwrap();
+    let pins = PinIndex::open(tmp.path()).unwrap();
+    let crow = Crow::new(store);
+
+    let cap = put_fs(&crow, b"x");
+    pins.add(cap.clone(), Some("x".into()), None).unwrap();
+
+    let chunks_count = crow.store().list(Namespace::Chunks).unwrap().len();
+    let manifests_count = crow.store().list(Namespace::Manifests).unwrap().len();
+    assert_eq!(manifests_count, 1);
+    assert!(chunks_count >= 1);
+    assert_eq!(pins.list().unwrap().len(), 1);
 }
