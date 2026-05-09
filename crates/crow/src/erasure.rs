@@ -63,10 +63,7 @@ pub fn validate_chunk_size(chunk_size: u32) -> Result<()> {
 
 /// RS-encode K data shards into N - K parity shards. All shards are the same
 /// length, which must be a multiple of RS_ALIGN.
-pub fn encode_parity(
-    params: ErasureParams,
-    data_shards: &[Vec<u8>],
-) -> Result<Vec<Vec<u8>>> {
+pub fn encode_parity(params: ErasureParams, data_shards: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     params.validate()?;
     if data_shards.len() != params.k as usize {
         return Err(Error::Erasure(format!(
@@ -152,8 +149,8 @@ pub fn decode_data(
         )));
     }
 
-    let have = data.iter().filter(|s| s.is_some()).count()
-        + parity.iter().filter(|s| s.is_some()).count();
+    let have =
+        data.iter().filter(|s| s.is_some()).count() + parity.iter().filter(|s| s.is_some()).count();
     let need = params.k as usize;
     if have < need {
         return Err(Error::NotEnoughShares {
@@ -197,9 +194,12 @@ pub fn decode_data(
     for (i, shard) in data.into_iter().enumerate() {
         match shard {
             Some(s) => out.push(s),
-            None => out.push(restored.get(&i).cloned().ok_or_else(|| {
-                Error::Erasure(format!("RS did not restore data shard {i}"))
-            })?),
+            None => out.push(
+                restored
+                    .get(&i)
+                    .cloned()
+                    .ok_or_else(|| Error::Erasure(format!("RS did not restore data shard {i}")))?,
+            ),
         }
     }
     Ok(out)
@@ -210,9 +210,7 @@ mod tests {
     use super::*;
 
     fn shards(k: u8, size: usize) -> Vec<Vec<u8>> {
-        (0..k)
-            .map(|i| vec![i; size])
-            .collect()
+        (0..k).map(|i| vec![i; size]).collect()
     }
 
     #[test]
@@ -271,12 +269,8 @@ mod tests {
         let mut data_opt: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
         data_opt[1] = None;
 
-        let restored = decode_data(
-            params,
-            data_opt,
-            parity.iter().cloned().map(Some).collect(),
-        )
-        .unwrap();
+        let restored =
+            decode_data(params, data_opt, parity.iter().cloned().map(Some).collect()).unwrap();
         assert_eq!(restored, data);
     }
 
@@ -287,8 +281,7 @@ mod tests {
         let data = shards(params.k, 64);
         let parity = encode_parity(params, &data).unwrap();
 
-        let data_opt: Vec<Option<Vec<u8>>> =
-            vec![Some(data[0].clone()), None, None];
+        let data_opt: Vec<Option<Vec<u8>>> = vec![Some(data[0].clone()), None, None];
         let parity_opt: Vec<Option<Vec<u8>>> = parity.iter().cloned().map(Some).collect();
 
         let restored = decode_data(params, data_opt, parity_opt).unwrap();
@@ -299,11 +292,7 @@ mod tests {
     fn rejects_too_few_shares() {
         let params = ErasureParams::default();
         // Only 2 shares total in a 3-of-5 setup → cannot reconstruct.
-        let data: Vec<Option<Vec<u8>>> = vec![
-            Some(vec![0u8; 64]),
-            Some(vec![1u8; 64]),
-            None,
-        ];
+        let data: Vec<Option<Vec<u8>>> = vec![Some(vec![0u8; 64]), Some(vec![1u8; 64]), None];
         let parity: Vec<Option<Vec<u8>>> = vec![None, None];
         let err = decode_data(params, data, parity).unwrap_err();
         match err {

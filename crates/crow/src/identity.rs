@@ -19,7 +19,7 @@ impl Identity {
     pub fn random() -> Self {
         Self {
             signing: SigningKey::generate(&mut OsRng),
-            kx: StaticSecret::random_from_rng(&mut OsRng),
+            kx: StaticSecret::random_from_rng(OsRng),
         }
     }
 
@@ -66,7 +66,7 @@ mod tests {
     fn pubkey_sizes_match_curve_definitions() {
         let id = Identity::random();
         assert_eq!(id.signing_pubkey().len(), 32); // Ed25519
-        assert_eq!(id.kx_pubkey().len(), 32);      // X25519
+        assert_eq!(id.kx_pubkey().len(), 32); // X25519
     }
 
     #[test]

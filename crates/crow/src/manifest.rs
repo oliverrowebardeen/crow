@@ -90,8 +90,7 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        postcard::to_allocvec(self)
-            .map_err(|e| Error::Manifest(format!("postcard serialize: {e}")))
+        postcard::to_allocvec(self).map_err(|e| Error::Manifest(format!("postcard serialize: {e}")))
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {

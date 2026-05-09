@@ -177,10 +177,7 @@ mod tests {
         let h = s.put(Namespace::Chunks, b(b"shared")).unwrap();
         s.put_unverified(Namespace::Manifests, h, b(b"manifest-bytes"))
             .unwrap();
-        assert_eq!(
-            s.get(Namespace::Chunks, &h).unwrap(),
-            Some(b(b"shared"))
-        );
+        assert_eq!(s.get(Namespace::Chunks, &h).unwrap(), Some(b(b"shared")));
         assert_eq!(
             s.get(Namespace::Manifests, &h).unwrap(),
             Some(b(b"manifest-bytes"))
@@ -223,7 +220,8 @@ mod tests {
     fn ref_blanket_impl_works() {
         let s = MemStore::new();
         fn use_store<S: ChunkStore>(s: S) -> Hash {
-            s.put(Namespace::Chunks, Bytes::from_static(b"ref")).unwrap()
+            s.put(Namespace::Chunks, Bytes::from_static(b"ref"))
+                .unwrap()
         }
         let h = use_store(&s);
         assert_eq!(s.get(Namespace::Chunks, &h).unwrap(), Some(b(b"ref")));

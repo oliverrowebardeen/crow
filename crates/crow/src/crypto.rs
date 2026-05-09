@@ -74,8 +74,7 @@ fn derive_chunk_nonce(file_key: &FileKey, stripe_idx: u64, data_idx: u32) -> [u8
 const CHUNK_NONCE_INFO_LEN: usize = CHUNK_NONCE_INFO.len() + 8 + 4;
 
 fn derive_manifest_nonce(manifest_key: &ManifestKey) -> [u8; 12] {
-    let hk = Hkdf::<Sha256>::from_prk(manifest_key.as_bytes())
-        .expect("ManifestKey is 32 bytes");
+    let hk = Hkdf::<Sha256>::from_prk(manifest_key.as_bytes()).expect("ManifestKey is 32 bytes");
     let mut nonce = [0u8; 12];
     hk.expand(MANIFEST_NONCE_INFO, &mut nonce)
         .expect("12 bytes within limits");
@@ -192,10 +191,7 @@ mod tests {
     fn chunk_nonce_distinguishes_keys() {
         let k1 = FileKey::from_bytes([1u8; 32]);
         let k2 = FileKey::from_bytes([2u8; 32]);
-        assert_ne!(
-            derive_chunk_nonce(&k1, 0, 0),
-            derive_chunk_nonce(&k2, 0, 0)
-        );
+        assert_ne!(derive_chunk_nonce(&k1, 0, 0), derive_chunk_nonce(&k2, 0, 0));
     }
 
     #[test]

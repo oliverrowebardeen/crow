@@ -27,12 +27,7 @@ impl<S: ChunkStore> Crow<S> {
 
     /// Encrypt, erasure-code, and store the bytes; return a read capability.
     /// Uses [`DEFAULT_CHUNK_SIZE`] for chunking.
-    pub fn put_bytes(
-        &self,
-        plaintext: &[u8],
-        mime: &str,
-        params: ErasureParams,
-    ) -> Result<Cap> {
+    pub fn put_bytes(&self, plaintext: &[u8], mime: &str, params: ErasureParams) -> Result<Cap> {
         self.put_bytes_with(plaintext, mime, params, DEFAULT_CHUNK_SIZE)
     }
 
@@ -93,22 +88,16 @@ impl<S: ChunkStore> Crow<S> {
             let mut data_hashes = Vec::with_capacity(k);
             for ct in &data_ciphertexts {
                 let h = Hash::of(ct);
-                self.store.put_unverified(
-                    Namespace::Chunks,
-                    h,
-                    Bytes::copy_from_slice(ct),
-                )?;
+                self.store
+                    .put_unverified(Namespace::Chunks, h, Bytes::copy_from_slice(ct))?;
                 data_hashes.push(ChunkHash(h));
             }
 
             let mut parity_hashes = Vec::with_capacity(parity_ciphertexts.len());
             for pc in &parity_ciphertexts {
                 let h = Hash::of(pc);
-                self.store.put_unverified(
-                    Namespace::Chunks,
-                    h,
-                    Bytes::copy_from_slice(pc),
-                )?;
+                self.store
+                    .put_unverified(Namespace::Chunks, h, Bytes::copy_from_slice(pc))?;
                 parity_hashes.push(ChunkHash(h));
             }
 
@@ -153,9 +142,7 @@ impl<S: ChunkStore> Crow<S> {
         let encrypted_manifest = self
             .store
             .get(Namespace::Manifests, cap.manifest_hash.inner())?
-            .ok_or_else(|| {
-                Error::MissingChunk(format!("manifest {}", cap.manifest_hash))
-            })?;
+            .ok_or_else(|| Error::MissingChunk(format!("manifest {}", cap.manifest_hash)))?;
 
         let manifest = Manifest::open(&encrypted_manifest, &cap.manifest_key)?;
 
@@ -202,25 +189,19 @@ impl<S: ChunkStore> Crow<S> {
                     // Wrap the placeholder stripe-0 NotEnoughShares with the
                     // actual stripe index.
                     match e {
-                        Error::NotEnoughShares { have, need, .. } => {
-                            Error::NotEnoughShares {
-                                stripe: stripe_idx,
-                                have,
-                                need,
-                            }
-                        }
+                        Error::NotEnoughShares { have, need, .. } => Error::NotEnoughShares {
+                            stripe: stripe_idx,
+                            have,
+                            need,
+                        },
                         other => other,
                     }
                 })?
             };
 
             for (data_idx, ct) in data_ciphertexts.iter().enumerate() {
-                let plain = crypto::open_chunk(
-                    &manifest.file_key,
-                    stripe_idx as u64,
-                    data_idx as u32,
-                    ct,
-                )?;
+                let plain =
+                    crypto::open_chunk(&manifest.file_key, stripe_idx as u64, data_idx as u32, ct)?;
                 plaintext.extend_from_slice(&plain);
             }
         }
