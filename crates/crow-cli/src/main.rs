@@ -32,7 +32,10 @@ use crow_net::{Client, ClusterToken, DEFAULT_BIND_ADDR, TokenStore};
                   crow ls /docs                    # list catalog entries\n  \
                   crow info /docs/report.pdf       # show metadata + pin status\n  \
                   crow get /docs/report.pdf out.pdf # retrieve\n  \
-                  crow rm <prefix>                 # delete pin and chunks\n  \
+                  crow put-dir ./Photos /photos    # import a folder tree\n  \
+                  crow get-dir /photos ./Photos    # export a folder tree\n  \
+                  crow mv /docs/report.pdf /docs/q2.pdf\n  \
+                  crow rm /docs/q2.pdf             # delete path and chunks\n  \
                   crow gc                          # sweep anything not pinned\n  \
                   crow serve                       # serve chunks over QUIC\n\
                   \n\

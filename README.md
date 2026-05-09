@@ -8,9 +8,9 @@ A file in Crow is encrypted, chunked, hashed, erasure-coded, and stored as a set
 
 ## Status
 
-This crate ships the **data model**, a **daily-driver CLI**, and the first **manual LAN fetch** pass: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, and a small set of subcommands (`put`, `get`, `info`, `ls`, `pin`, `unpin`, `rm`, `gc`, `stat`, `token`, `serve`, `fetch`). The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
+This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, and the first **manual LAN fetch** pass: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, and subcommands such as `put`, `get`, `mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `rm`, `gc`, `serve`, and `fetch`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
 
-mDNS discovery, automatic replication policy, the metadata CRDT, friend-scoped sharing, and live identity-based manifest signing are deferred. See [Roadmap](#roadmap).
+mDNS discovery, automatic replication policy, replicated metadata sync, friend-scoped sharing, and live identity-based manifest signing are deferred. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -31,7 +31,8 @@ plaintext  →  encrypt  →  chunk  →  Reed–Solomon  →  store as content-
 | Manifest    | Postcard-serialized, AES-256-GCM-sealed; declares its algorithm tuple; reserved signature fields  | `crow::manifest`                    |
 | Capability  | Bech32m `crow1…` string carrying (version, permission, manifest hash, manifest key)               | `crow::cap`                         |
 | Pin index   | Per-pin JSON files at `<home>/pins/<hash>.json`, atomic writes, prefix lookup                     | `crow::pin`                         |
-| GC          | Mark-and-sweep over the chunk store; owner-pinning model                                          | `crow::gc`                          |
+| Catalog     | CRDT-shaped append-only path event log at `<home>/catalog/events.jsonl`                           | `crow::catalog`                     |
+| GC          | Mark-and-sweep over the chunk store; flat pins and catalog paths are retention roots               | `crow::gc`                          |
 | Network     | QUIC chunk-fetch protocol with shared-token personal-cluster auth                                 | `crow-net`                          |
 | Pipeline    | `Crow<S>::put_bytes` / `get_bytes` orchestration                                                  | `crow::pipeline`                    |
 
@@ -64,13 +65,17 @@ cargo run -q -p crow-cli -- <args…>
 ## CLI
 
 ```
-crow put <file>         [--name NAME] [--mime MIME] [--chunk-size N]
-crow get <cap-or-prefix> <out>
-crow info <cap-or-prefix>
-crow ls   [--long]
+crow put <file> [catalog-path] [--name NAME] [--mime MIME] [--chunk-size N]
+crow get <path-or-cap-or-prefix> <out>
+crow info <path-or-cap-or-prefix>
+crow mkdir [-p] <catalog-path>
+crow ls [catalog-path] [--long] [--pins]
+crow mv <from-path> <to-path>
+crow put-dir <local-dir> [catalog-dir] [--yes]
+crow get-dir <catalog-dir> <local-dir> [--yes]
 crow pin  <cap> [--name NAME]
 crow unpin <cap-or-prefix>
-crow rm   <cap-or-prefix> [--dry-run]
+crow rm   <path-or-cap-or-prefix> [--dry-run]
 crow gc   [--dry-run]
 crow stat
 crow token init|show|set
@@ -80,7 +85,9 @@ crow fetch <peer-addr> <cap-or-prefix> [--name NAME]
 
 `<file>` and `<out>` accept `-` for stdin / stdout. Storage lives at `$CROW_HOME` (default `~/.crow`); override per-invocation with `--home PATH`.
 
-`<cap-or-prefix>` accepts either a full bech32m `crow1…` string or a hex prefix of the manifest hash. Prefix resolution goes through the pin index — caps that aren't pinned still work, but only via their full string. Ambiguous prefixes get an explicit error listing the candidates.
+`<path-or-cap-or-prefix>` accepts a local catalog path (`/docs/report.pdf`), a full bech32m `crow1…` string, or a hex prefix of a pinned manifest hash. Prefix resolution goes through the flat pin index — caps that aren't pinned still work, but only via their full string or catalog path. Ambiguous prefixes get an explicit error listing the candidates.
+
+Catalog folders are local organization only. Files remain the shareable unit: send someone the file's `crow1…` capability, not a folder path. Shareable directory manifests are intentionally deferred.
 
 ### Walkthrough
 
@@ -124,15 +131,39 @@ unreferenced  0 manifests / 0 chunks (0 B)
 
 Each `crow put` generates fresh keys, so the same bytes produce a different capability and different encrypted shares each time. Content addressing happens at the *encrypted share* level, not the plaintext or the cap.
 
-### Pinning and garbage collection
+### Catalog workflow
 
-Every `crow put` automatically pins the result with a default name (the input filename, or `(unnamed)` for stdin). Pins are the only thing keeping chunks alive; everything else is eligible for cleanup.
+If you pass a catalog destination to `put`, Crow stores the file under that path instead of creating a flat pin:
 
 ```sh
-crow pin <cap> [--name NAME]   # add a pin (e.g. for a cap shared by someone else)
-crow unpin <cap-or-prefix>     # drop the pin record; chunks linger until `crow gc`
-crow rm    <cap-or-prefix>     # drop the pin AND immediately delete its chunks (those not held by another pin)
-crow gc    [--dry-run]         # sweep every chunk and manifest not referenced by a current pin
+crow mkdir -p /docs/projects
+crow put report.pdf /docs/projects/
+crow ls /docs/projects
+crow info /docs/projects/report.pdf
+crow get /docs/projects/report.pdf restored.pdf
+crow mv /docs/projects/report.pdf /docs/projects/q2-report.pdf
+crow rm /docs/projects/q2-report.pdf --dry-run
+```
+
+Bulk folder import/export is explicit and asks for confirmation:
+
+```sh
+crow put-dir ./Photos /photos          # prompts y/N before storing
+crow put-dir ./Photos /photos --yes
+crow get-dir /photos ./RestoredPhotos
+```
+
+`put-dir` recursively stores regular files and records directory entries in the local catalog. Symlinks are rejected. `get-dir` reconstructs a catalog subtree into a normal filesystem directory and refuses to overwrite existing files.
+
+### Pinning and garbage collection
+
+`crow put <file>` without a catalog destination creates a flat pin with a default name (the input filename, or `(unnamed)` for stdin). `crow put <file> /path` and `crow put-dir` create catalog entries instead. Both flat pins and catalog file paths keep chunks alive; everything else is eligible for cleanup.
+
+```sh
+crow pin <cap> [--name NAME]          # add a flat pin (e.g. for a cap shared by someone else)
+crow unpin <cap-or-prefix>            # drop the flat pin; chunks linger until `crow gc`
+crow rm    <path-or-cap-or-prefix>    # drop the pin/path AND delete chunks not held elsewhere
+crow gc    [--dry-run]                # sweep chunks/manifests not referenced by any pin or catalog path
 ```
 
 The split between `unpin` and `rm` is deliberate: `unpin` is reversible (re-pinning the same cap brings it back, since the chunks are still on disk), while `rm` is the unix-style "delete now." Use `--dry-run` on `rm` and `gc` to see what would happen before committing.
@@ -205,6 +236,7 @@ crow get "$(cat note.cap)" -
 ├── chunks/        # data and parity shares, file name = hex BLAKE3
 ├── manifests/     # AES-GCM-sealed postcard manifests, file name = hex BLAKE3
 ├── pins/          # one JSON file per pin, file name = <hex_manifest_hash>.json
+├── catalog/       # CRDT-shaped local path event log + device id
 └── cluster-token  # shared personal-cluster token for QUIC fetch
 ```
 
@@ -216,7 +248,7 @@ Each chunk file is exactly `chunk_size + 16` bytes (the AEAD tag). Writes are co
 | -------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Storage dir    | `--home PATH`, `$CROW_HOME`                  | `$HOME/.crow`                                                                                            |
 | MIME type      | `--mime …` on `put`                          | inferred from extension, else `application/octet-stream`                                                 |
-| Pin name       | `--name …` on `put` or `pin`                 | basename of input file on `put`; absent for stdin or external `pin`                                      |
+| Pin/name       | `--name …` on `put` or `pin`                 | basename of input file for flat pins and catalog file entries; absent for stdin or external `pin`        |
 | Chunk size     | `--chunk-size N` on `put`                    | auto-tuned to ≈ `file_size / K`, capped at 1 MiB − 16; minimum 240; aligned so `(N + 16) % 64 == 0`      |
 | Erasure params | (not yet exposed at the CLI)                 | 3-of-5                                                                                                   |
 
@@ -242,18 +274,22 @@ For a persistent store, swap in `FsStore`. To pin and garbage-collect:
 
 ```rust
 use crow::{
-    Crow, ErasureParams, FsStore, GcOptions, PinIndex, compute_live_set, sweep,
+    CatalogIndex, Crow, ErasureParams, FsStore, GcOptions, PinIndex,
+    compute_live_set_from_roots, sweep,
 };
 
 let store = FsStore::open("/tmp/crow-data")?;
 let pins  = PinIndex::open("/tmp/crow-data")?;
+let catalog = CatalogIndex::open("/tmp/crow-data")?;
 let crow  = Crow::new(store);
 
 let cap = crow.put_bytes(b"hi", "text/plain", ErasureParams::default())?;
 pins.add(cap.clone(), Some("note".into()), None)?;
 
-// later, sweep anything not pinned
-let live = compute_live_set(crow.store(), &pins.list()?.into_iter().map(|r| r.cap).collect::<Vec<_>>())?;
+// later, sweep anything not pinned or cataloged
+let pin_caps = pins.list()?.into_iter().map(|r| r.cap).collect::<Vec<_>>();
+let view = catalog.view()?;
+let live = compute_live_set_from_roots(crow.store(), &pin_caps, &view)?;
 let report = sweep(crow.store(), &live, GcOptions::default())?;
 println!("freed {} chunks ({} bytes)", report.deleted_chunks, report.deleted_bytes);
 ```
@@ -273,7 +309,7 @@ crow/
 ├── Cargo.toml                      # workspace
 ├── crates/
 │   ├── crow/                       # library
-│   │   ├── src/                    # hash · chunk · crypto · erasure · manifest · cap · identity · pipeline · fs_store · pin · gc
+│   │   ├── src/                    # hash · chunk · crypto · erasure · manifest · cap · identity · pipeline · fs_store · pin · catalog · gc
 │   │   ├── examples/roundtrip.rs   # 5 MiB end-to-end demo
 │   │   └── tests/integration.rs    # cross-module + Phase 1 step 1 tests
 │   ├── crow-net/                   # QUIC chunk-fetch protocol + token store
@@ -312,11 +348,11 @@ BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed–
 
 Several devices owned by one user, on the same network, syncing files between them.
 
-1. **Storage hardening — shipped.** Pinning, garbage collection, and the daily-driver CLI (`ls`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a cap.
+1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, owner-pinning mark-and-sweep, and hash-prefix resolution for every command that takes a flat pin.
 2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted manifests and shares from a known peer after shared-token authorization.
 3. **mDNS discovery.** Daemons announce themselves on the local network the same way AirPrint and Chromecast do; other Crows on the same Wi-Fi automatically add them to a peer list. No central server, no DHT.
 4. **Replication policy.** Each device watches its pinned manifests and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
-5. **Metadata CRDT.** A small replicated catalog of names → manifest hashes, ACLs, version history, and holder hints. Conflict-free merging across devices that go offline and come back.
+5. **Replicated metadata sync.** Merge the local catalog event logs across devices, then add ACLs, version history, and holder hints. The on-disk catalog is already operation-log-shaped so this is a sync/merge step rather than a catalog rewrite.
 6. **Identity wiring.** Sign manifests with the Ed25519 key Crow already generates; verify the signature before pinning so a foreign device on the same Wi-Fi can't inject pins into your fleet.
 
 ### Phase 2 — cross-person sharing
@@ -336,8 +372,8 @@ A stripped-down BLE-direct integration may move earlier (after Phase 1) if in-pe
 - Write capabilities — only `Read` exists today.
 - Convergent encryption for cross-file dedup.
 - Content-defined chunking (FastCDC) for similar-file dedup.
-- Folders / nested manifests — flat namespace per pin only.
-- Renaming after the fact — pins are immutable; create a new pin with the right name and remove the old one.
+- Shareable directory manifests — folders are local catalog organization today; file caps are still the shareable unit.
+- `--rm-local` / destructive local-file lifecycle management — unsafe until multi-device replication can prove data is durable elsewhere.
 
 ## License
 
