@@ -19,9 +19,10 @@ Not yet wired up: persistence, networking, gossip discovery, owner-pinning GC, t
 ## Layout
 
 ```
-crates/crow/        # library: chunk, manifest, capability, pipeline
-examples/           # runnable demos
-tests/              # end-to-end integration tests
+crates/crow/
+├── src/            # library: chunk, manifest, capability, pipeline
+├── examples/       # runnable demos (`cargo run -p crow --example roundtrip`)
+└── tests/          # end-to-end integration tests
 ```
 
 ## Quick taste
