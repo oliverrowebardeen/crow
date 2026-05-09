@@ -84,6 +84,32 @@ impl ChunkStore for FsStore {
             Err(e) => Err(Error::Io(e)),
         }
     }
+
+    fn list(&self, ns: Namespace) -> Result<Vec<Hash>> {
+        let dir = self.ns_dir(ns);
+        let mut out = Vec::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        for entry in entries {
+            let entry = entry?;
+            // Skip anything that isn't a 64-char hex hash file: in particular
+            // <hash>.<pid>.tmp partial-write siblings.
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if name.len() != 64 {
+                continue;
+            }
+            if let Ok(h) = name.parse::<Hash>() {
+                out.push(h);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +184,50 @@ mod tests {
             store.get(Namespace::Chunks, &h1).unwrap(),
             Some(b(b"twice"))
         );
+    }
+
+    #[test]
+    fn list_returns_stored_hashes_per_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let store = FsStore::open(tmp.path()).unwrap();
+
+        let a = store.put(Namespace::Chunks, b(b"a")).unwrap();
+        let b1 = store.put(Namespace::Chunks, b(b"b")).unwrap();
+        let m = store.put(Namespace::Manifests, b(b"manifest")).unwrap();
+
+        let mut chunks = store.list(Namespace::Chunks).unwrap();
+        chunks.sort();
+        let mut want_chunks = vec![a, b1];
+        want_chunks.sort();
+        assert_eq!(chunks, want_chunks);
+
+        assert_eq!(store.list(Namespace::Manifests).unwrap(), vec![m]);
+    }
+
+    #[test]
+    fn list_skips_partial_write_tmp_files() {
+        // A crashed put could leave <hash>.<pid>.tmp on disk. list must skip it.
+        let tmp = TempDir::new().unwrap();
+        let store = FsStore::open(tmp.path()).unwrap();
+        let h = store.put(Namespace::Chunks, b(b"good")).unwrap();
+
+        // Drop a fake leftover next to it.
+        let leftover = tmp.path().join("chunks").join("dead.99999.tmp");
+        fs::write(&leftover, b"junk").unwrap();
+
+        // Also a hex-named-but-not-64-char file (defensive).
+        let weird = tmp.path().join("chunks").join("deadbeef");
+        fs::write(&weird, b"junk").unwrap();
+
+        let listed = store.list(Namespace::Chunks).unwrap();
+        assert_eq!(listed, vec![h]);
+    }
+
+    #[test]
+    fn list_empty_dir_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = FsStore::open(tmp.path()).unwrap();
+        assert!(store.list(Namespace::Chunks).unwrap().is_empty());
+        assert!(store.list(Namespace::Manifests).unwrap().is_empty());
     }
 }

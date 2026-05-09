@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// 32-byte BLAKE3 content address.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Hash([u8; 32]);
 
 impl Hash {
@@ -63,7 +63,7 @@ impl FromStr for Hash {
 macro_rules! hash_newtype {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         pub struct $name(pub Hash);
 
         impl $name {

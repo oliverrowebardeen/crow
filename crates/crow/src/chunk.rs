@@ -34,6 +34,10 @@ pub trait ChunkStore: Send + Sync {
 
     /// Remove a chunk. Returns whether anything was removed.
     fn delete(&self, ns: Namespace, hash: &Hash) -> Result<bool>;
+
+    /// Enumerate every hash currently stored in `ns`. Used by garbage
+    /// collection and `crow stat`. Order is unspecified.
+    fn list(&self, ns: Namespace) -> Result<Vec<Hash>>;
 }
 
 #[derive(Default)]
@@ -98,6 +102,16 @@ impl ChunkStore for MemStore {
             .remove(&(ns, *hash))
             .is_some())
     }
+
+    fn list(&self, ns: Namespace) -> Result<Vec<Hash>> {
+        Ok(self
+            .inner
+            .read()
+            .expect("memstore poisoned")
+            .keys()
+            .filter_map(|(n, h)| (*n == ns).then_some(*h))
+            .collect())
+    }
 }
 
 impl<T: ChunkStore + ?Sized> ChunkStore for &T {
@@ -116,6 +130,9 @@ impl<T: ChunkStore + ?Sized> ChunkStore for &T {
     fn delete(&self, ns: Namespace, hash: &Hash) -> Result<bool> {
         (**self).delete(ns, hash)
     }
+    fn list(&self, ns: Namespace) -> Result<Vec<Hash>> {
+        (**self).list(ns)
+    }
 }
 
 impl<T: ChunkStore + ?Sized> ChunkStore for Arc<T> {
@@ -133,6 +150,9 @@ impl<T: ChunkStore + ?Sized> ChunkStore for Arc<T> {
     }
     fn delete(&self, ns: Namespace, hash: &Hash) -> Result<bool> {
         (**self).delete(ns, hash)
+    }
+    fn list(&self, ns: Namespace) -> Result<Vec<Hash>> {
+        (**self).list(ns)
     }
 }
 
@@ -225,5 +245,28 @@ mod tests {
         }
         let h = use_store(&s);
         assert_eq!(s.get(Namespace::Chunks, &h).unwrap(), Some(b(b"ref")));
+    }
+
+    #[test]
+    fn list_returns_per_namespace_hashes() {
+        let s = MemStore::new();
+        let a = s.put(Namespace::Chunks, b(b"a")).unwrap();
+        let b1 = s.put(Namespace::Chunks, b(b"b")).unwrap();
+        let m = s.put(Namespace::Manifests, b(b"manifest")).unwrap();
+
+        let mut chunks = s.list(Namespace::Chunks).unwrap();
+        chunks.sort();
+        let mut want_chunks = vec![a, b1];
+        want_chunks.sort();
+        assert_eq!(chunks, want_chunks);
+
+        assert_eq!(s.list(Namespace::Manifests).unwrap(), vec![m]);
+    }
+
+    #[test]
+    fn list_empty_namespace_is_empty() {
+        let s = MemStore::new();
+        assert!(s.list(Namespace::Chunks).unwrap().is_empty());
+        assert!(s.list(Namespace::Manifests).unwrap().is_empty());
     }
 }
