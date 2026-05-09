@@ -26,3 +26,4 @@ subtle = "2"
 
 [dev-dependencies]
 rand = "0.8"
+tempfile = "3"

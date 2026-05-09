@@ -22,6 +22,7 @@ pub mod chunk;
 pub mod crypto;
 pub mod erasure;
 pub mod error;
+pub mod fs_store;
 pub mod hash;
 pub mod identity;
 pub mod manifest;
@@ -32,6 +33,7 @@ pub use chunk::{ChunkStore, MemStore, Namespace};
 pub use crypto::{FileKey, ManifestKey};
 pub use erasure::{DEFAULT_CHUNK_SIZE, ErasureParams};
 pub use error::{Error, Result};
+pub use fs_store::FsStore;
 pub use hash::{ChunkHash, Hash, ManifestHash};
 pub use identity::Identity;
 pub use manifest::{
