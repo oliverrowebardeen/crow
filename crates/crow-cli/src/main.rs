@@ -9,12 +9,15 @@ use clap::{Parser, Subcommand};
 use crow::{
     Cap, CatalogEntry, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
-    ErasureParams, FsStore, GcOptions, Hash, Manifest, ManifestKind, Namespace, PinIndex,
-    PinRecord, compute_live_set_from_roots,
+    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, NodeId,
+    PinIndex, PinRecord, compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
-use crow_net::{Client, ClusterToken, DEFAULT_BIND_ADDR, TokenStore};
+use crow_net::{
+    Client, ClusterToken, DEFAULT_BIND_ADDR, Discovery, LocalAdvert, PeerSnapshot, SelfInfo,
+    TokenStore, default_friendly_name, peer_snapshot,
+};
 
 #[derive(Parser)]
 #[command(
@@ -353,6 +356,10 @@ enum Command {
         /// Address to listen on.
         #[arg(long, default_value = DEFAULT_BIND_ADDR)]
         bind: SocketAddr,
+        /// Friendly name advertised to other Crows on the LAN. Defaults to the
+        /// OS hostname.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Fetch missing manifest/chunk shares from a known peer.
     #[command(
@@ -411,9 +418,9 @@ fn run(cli: Cli) -> DynResult<()> {
     let home = resolve_home(cli.home)?;
     match cli.command {
         Command::Token(command) => cmd_token(&home, command),
-        Command::Serve { bind } => {
+        Command::Serve { bind, name } => {
             let store = FsStore::open(&home)?;
-            cmd_serve(&home, store, bind)
+            cmd_serve(&home, store, bind, name)
         }
         command => {
             let store = FsStore::open(&home)?;
@@ -1284,12 +1291,97 @@ fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex, catalog: &CatalogIndex) -> Dy
     Ok(())
 }
 
-fn cmd_serve(home: &Path, store: FsStore, bind: SocketAddr) -> DynResult<()> {
+fn cmd_serve(
+    home: &Path,
+    store: FsStore,
+    bind: SocketAddr,
+    name_override: Option<String>,
+) -> DynResult<()> {
     let token = load_token(home)?;
+    let identity = Identity::load_or_create(home)?;
+    let node_id = identity.node_id();
+    let friendly_name = name_override.or_else(default_friendly_name);
     let root = store.root().display().to_string();
-    println!("serving {root} on {bind}");
+    let snapshot_path = peer_snapshot::snapshot_path(home);
+
+    let rt = runtime()?;
+    rt.block_on(serve_loop(
+        store,
+        token,
+        bind,
+        node_id,
+        friendly_name,
+        root,
+        snapshot_path,
+    ))
+}
+
+async fn serve_loop(
+    store: FsStore,
+    token: ClusterToken,
+    bind: SocketAddr,
+    node_id: NodeId,
+    friendly_name: Option<String>,
+    root: String,
+    snapshot_path: PathBuf,
+) -> DynResult<()> {
+    let server = crow_net::serve(store, token, bind).await?;
+    let actual_addr = server.local_addr();
+
+    let advert = LocalAdvert {
+        node_id,
+        port: actual_addr.port(),
+        friendly_name: friendly_name.clone(),
+    };
+    let discovery = Discovery::start(Some(advert))?;
+
+    println!("serving {root} on {actual_addr}");
+    println!(
+        "node {} ({})",
+        node_id.short(),
+        friendly_name.as_deref().unwrap_or("unnamed")
+    );
     println!("cluster token: configured");
-    runtime()?.block_on(crow_net::serve(store, token, bind))?;
+    println!("mDNS service: _crow._udp.local.");
+
+    let self_info = SelfInfo {
+        node_id,
+        friendly_name: friendly_name.clone(),
+        address: actual_addr,
+    };
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut ctrl_c => {
+                println!();
+                let _ = write_peer_snapshot(&snapshot_path, &self_info, &discovery);
+                break;
+            }
+            _ = interval.tick() => {
+                if let Err(e) = write_peer_snapshot(&snapshot_path, &self_info, &discovery) {
+                    eprintln!("crow: failed to write peer snapshot: {e}");
+                }
+            }
+        }
+    }
+
+    let _ = discovery.shutdown();
+    drop(server);
+    Ok(())
+}
+
+fn write_peer_snapshot(path: &Path, self_info: &SelfInfo, discovery: &Discovery) -> DynResult<()> {
+    let snap = PeerSnapshot {
+        snapshot_at: peer_snapshot::now_unix(),
+        self_info: self_info.clone(),
+        peers: discovery.peers(),
+    };
+    peer_snapshot::save(path, &snap)?;
     Ok(())
 }
 

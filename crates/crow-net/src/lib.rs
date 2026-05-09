@@ -1,6 +1,8 @@
 pub mod discovery;
+pub mod peer_snapshot;
 
-pub use discovery::{Discovery, LocalAdvert, PeerInfo, SERVICE_TYPE};
+pub use discovery::{Discovery, LocalAdvert, PeerInfo, SERVICE_TYPE, default_friendly_name};
+pub use peer_snapshot::{PEER_SNAPSHOT_FILE, PeerSnapshot, SelfInfo, snapshot_path};
 
 use std::fmt;
 use std::fs;

@@ -25,6 +25,11 @@ pub const SERVICE_TYPE: &str = "_crow._udp.local.";
 /// changes land so old peers can be filtered out.
 pub const ADVERT_VERSION: &str = "1";
 
+/// Best-effort friendly-name default: the OS hostname, if available.
+pub fn default_friendly_name() -> Option<String> {
+    hostname::get().ok().and_then(|h| h.into_string().ok())
+}
+
 /// What this node should advertise on the LAN.
 #[derive(Clone, Debug)]
 pub struct LocalAdvert {
@@ -233,11 +238,7 @@ mod tests {
     }
 
     /// Wait up to `total` for `pred` to return true. Polls every `step`.
-    async fn wait_for<F: Fn() -> bool>(
-        total: Duration,
-        step: Duration,
-        pred: F,
-    ) -> bool {
+    async fn wait_for<F: Fn() -> bool>(total: Duration, step: Duration, pred: F) -> bool {
         let deadline = std::time::Instant::now() + total;
         loop {
             if pred() {
@@ -291,21 +292,19 @@ mod tests {
         let a_id = id_a.node_id();
         let b_id = id_b.node_id();
 
-        let listener_sees_advertiser = wait_for(
-            Duration::from_secs(8),
-            Duration::from_millis(200),
-            || listener.peers().iter().any(|p| p.node_id == a_id),
-        )
-        .await;
+        let listener_sees_advertiser =
+            wait_for(Duration::from_secs(8), Duration::from_millis(200), || {
+                listener.peers().iter().any(|p| p.node_id == a_id)
+            })
+            .await;
         assert!(listener_sees_advertiser, "listener never saw advertiser");
 
         // The listener has no advert, so the advertiser can't learn about it.
-        let advertiser_does_not_see_listener = wait_for(
-            Duration::from_secs(2),
-            Duration::from_millis(200),
-            || advertiser.peers().iter().any(|p| p.node_id == b_id),
-        )
-        .await;
+        let advertiser_does_not_see_listener =
+            wait_for(Duration::from_secs(2), Duration::from_millis(200), || {
+                advertiser.peers().iter().any(|p| p.node_id == b_id)
+            })
+            .await;
         assert!(
             !advertiser_does_not_see_listener,
             "advertiser somehow saw the listener"
