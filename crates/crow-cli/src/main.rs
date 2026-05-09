@@ -923,7 +923,7 @@ fn restore_catalog_dir(
     let mut restored_files = 0usize;
     fs::create_dir_all(out)?;
     for entry in entries.iter().filter(|entry| entry.is_dir()) {
-        let rel = relative_catalog_path(&path, &entry.path)?;
+        let rel = relative_catalog_path(path, &entry.path)?;
         if !rel.as_os_str().is_empty() {
             fs::create_dir_all(out.join(rel))?;
         }
@@ -933,7 +933,7 @@ fn restore_catalog_dir(
         let EntryKind::File { cap, .. } = &entry.kind else {
             continue;
         };
-        let rel = relative_catalog_path(&path, &entry.path)?;
+        let rel = relative_catalog_path(path, &entry.path)?;
         let target = out.join(rel);
         if target.exists() {
             return Err(
