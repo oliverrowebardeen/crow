@@ -72,7 +72,9 @@ crow mkdir [-p] <catalog-path>
 crow ls [catalog-path] [--long] [--pins]
 crow mv <from-path> <to-path>
 crow put-dir <local-dir> [catalog-dir] [--yes]
-crow get-dir <catalog-dir> <local-dir> [--yes]
+crow cap-dir <catalog-dir> [--name NAME]
+crow get-dir <catalog-dir-or-dir-cap> <local-dir> [--yes]
+crow add-dir <dir-cap-or-prefix> <catalog-dir>
 crow pin  <cap> [--name NAME]
 crow unpin [-r] <path-or-cap-or-prefix>
 crow rm   <path-or-cap-or-prefix> [--dry-run]
@@ -87,7 +89,7 @@ crow fetch <peer-addr> <cap-or-prefix> [--name NAME]
 
 `<path-or-cap-or-prefix>` accepts a local catalog path (`/docs/report.pdf`), a full bech32m `crow1…` string, or a hex prefix of a pinned manifest hash. Prefix resolution goes through the flat pin index — caps that aren't pinned still work, but only via their full string or catalog path. Ambiguous prefixes get an explicit error listing the candidates.
 
-Catalog folders are local organization only. Files remain the shareable unit: send someone the file's `crow1…` capability, not a folder path. Shareable directory manifests are intentionally deferred.
+Catalog folders are mutable local organization. To share a folder, freeze it into an immutable directory snapshot cap with `crow cap-dir /path`; later catalog edits do not change that cap.
 
 ### Walkthrough
 
@@ -152,14 +154,17 @@ Bulk folder import/export is explicit and asks for confirmation:
 ```sh
 crow put-dir ./Photos /photos          # prompts y/N before storing
 crow put-dir ./Photos /photos --yes
+DIR_CAP=$(crow cap-dir /photos)        # immutable shareable snapshot
 crow get-dir /photos ./RestoredPhotos
+crow get-dir "$DIR_CAP" ./SharedPhotos
+crow add-dir "$DIR_CAP" /imports/photos
 ```
 
-`put-dir` recursively stores regular files and records directory entries in the local catalog. Symlinks are rejected. `get-dir` creates the output directory if it does not exist, reconstructs the catalog subtree into it, and refuses to overwrite existing files.
+`put-dir` recursively stores regular files and records directory entries in the local catalog. Symlinks are rejected. `cap-dir` stores and pins an encrypted directory manifest containing relative paths plus child file caps. `get-dir` creates the output directory if it does not exist, reconstructs a catalog subtree or directory cap into it, and refuses to overwrite existing files. `add-dir` attaches a directory snapshot cap back into the local catalog; it does not create a live shared folder.
 
 ### Pinning and garbage collection
 
-`crow put <file>` without a catalog destination creates a flat pin with a default name (the input filename, or `(unnamed)` for stdin). `crow put <file> /path` and `crow put-dir` create catalog entries instead. Both flat pins and catalog file paths keep chunks alive; everything else is eligible for cleanup.
+`crow put <file>` without a catalog destination creates a flat pin with a default name (the input filename, or `(unnamed)` for stdin). `crow put <file> /path` and `crow put-dir` create catalog entries instead. `crow cap-dir /path` creates a pinned directory snapshot cap. Flat pins, catalog file paths, and pinned directory caps keep chunks alive; everything else is eligible for cleanup.
 
 ```sh
 crow pin <cap> [--name NAME]          # add a flat pin (e.g. for a cap shared by someone else)
@@ -350,8 +355,8 @@ BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed–
 
 Several devices owned by one user, on the same network, syncing files between them.
 
-1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
-2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted manifests and shares from a known peer after shared-token authorization.
+1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
+2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted file manifests, directory manifests, and shares from a known peer after shared-token authorization.
 3. **mDNS discovery — next.** Daemons announce themselves on the local network the same way AirPrint and Chromecast do; other Crows on the same Wi-Fi automatically add them to a peer list. Implementation should add a local peer registry, advertise the existing QUIC bind address plus device id, and let `crow fetch` accept a discovered device alias instead of only a raw socket address. No central server, no DHT.
 4. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
 5. **Replicated metadata sync.** Merge the local catalog event logs across devices, then add ACLs, version history, and holder hints. The on-disk catalog is already operation-log-shaped so this is a sync/merge step rather than a catalog rewrite.
@@ -374,7 +379,7 @@ A stripped-down BLE-direct integration may move earlier (after Phase 1) if in-pe
 - Write capabilities — only `Read` exists today.
 - Convergent encryption for cross-file dedup.
 - Content-defined chunking (FastCDC) for similar-file dedup.
-- Shareable directory manifests — folders are local catalog organization today; file caps are still the shareable unit.
+- Live shared folders — directory caps are immutable snapshots today, not mutable sync relationships.
 - `--rm-local` / destructive local-file lifecycle management — unsafe until multi-device replication can prove data is durable elsewhere.
 
 ## License
