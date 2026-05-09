@@ -6,8 +6,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use crow::{
-    Cap, ChunkStore, Crow, DEFAULT_CHUNK_SIZE, ErasureParams, FsStore, GcOptions, Hash, Manifest,
-    Namespace, PinIndex, PinRecord, compute_live_set,
+    Cap, CatalogEntry, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
+    DEFAULT_CHUNK_SIZE, EntryKind, ErasureParams, FsStore, GcOptions, Hash, Manifest, Namespace,
+    PinIndex, PinRecord, compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
@@ -26,16 +27,19 @@ use crow_net::{Client, ClusterToken, DEFAULT_BIND_ADDR, TokenStore};
                   \n\
                   Quick start:\n\
                   \n  \
-                  crow put report.pdf              # store, auto-pin, print cap\n  \
-                  crow ls                          # list pinned files\n  \
-                  crow info <4-char prefix>        # show metadata + pin status\n  \
-                  crow get <prefix> restored.pdf   # retrieve\n  \
+                  crow mkdir /docs                 # create a local catalog folder\n  \
+                  crow put report.pdf /docs/       # store, pin, catalog by path\n  \
+                  crow ls /docs                    # list catalog entries\n  \
+                  crow info /docs/report.pdf       # show metadata + pin status\n  \
+                  crow get /docs/report.pdf out.pdf # retrieve\n  \
                   crow rm <prefix>                 # delete pin and chunks\n  \
                   crow gc                          # sweep anything not pinned\n  \
                   crow serve                       # serve chunks over QUIC\n\
                   \n\
-                  Most commands accept either a full crow1… capability or a hex prefix \
-                  of the manifest hash; ambiguous prefixes get an explicit error.\n\
+                  File commands accept catalog paths, full crow1… capabilities, or \
+                  hex prefixes of pinned manifest hashes; ambiguous prefixes get an \
+                  explicit error. Folders are local organization; file caps are still \
+                  the shareable unit.\n\
                   \n\
                   Storage lives at $CROW_HOME, defaulting to $HOME/.crow.\n\
                   \n\
@@ -52,13 +56,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Store a file, auto-pin it, print its capability on stdout.
+    /// Store a file, auto-pin it, optionally attach it to a catalog path.
     #[command(
         long_about = "Encrypt, chunk, erasure-code, and store the bytes; record a pin \
-                      so chunks survive `crow gc`; print the resulting bech32m cap.\n\
+                      so chunks survive `crow gc`; optionally record a local catalog \
+                      path; print the resulting bech32m cap.\n\
                       \n\
                       The default pin name is the basename of the input file, or \
                       `(unnamed)` for stdin. Use --name to override.\n\
+                      \n\
+                      If DEST is supplied, it must be a catalog path. When DEST names \
+                      an existing catalog directory or ends in '/', Crow writes the \
+                      file under that directory using the input basename.\n\
                       \n\
                       Each `crow put` generates fresh keys, so the same input bytes \
                       produce a different cap each time. Content addressing happens at \
@@ -66,12 +75,17 @@ enum Command {
                       \n\
                       Examples:\n  \
                       crow put report.pdf\n  \
+                      crow mkdir /docs\n  \
+                      crow put report.pdf /docs/\n  \
+                      crow put report.pdf /docs/q2-report.pdf\n  \
                       crow put image.png --name screenshot.png\n  \
                       tar cf - ~/Documents | crow put -"
     )]
     Put {
         /// File to store. "-" reads from stdin.
         path: String,
+        /// Optional catalog destination path, e.g. /docs/report.pdf or /docs/.
+        dest: Option<String>,
         /// Override MIME type. Default: inferred from extension.
         #[arg(long)]
         mime: Option<String>,
@@ -82,7 +96,7 @@ enum Command {
         #[arg(long)]
         chunk_size: Option<u32>,
     },
-    /// Retrieve a file by capability or hash prefix.
+    /// Retrieve a file by catalog path, capability, or hash prefix.
     #[command(
         long_about = "Resolve a full crow1… capability or a hex prefix of the manifest \
                       hash, fetch the encrypted manifest, decrypt it, reconstruct the \
@@ -97,12 +111,12 @@ enum Command {
                       crow get <prefix> - | tar xf -"
     )]
     Get {
-        /// Full bech32m capability (`crow1…`) or hex prefix of the manifest hash.
+        /// Catalog path, full bech32m capability (`crow1…`), or hex prefix.
         cap_or_prefix: String,
         /// Output path. "-" writes to stdout.
         out: String,
     },
-    /// Print metadata for a capability or hash prefix.
+    /// Print metadata for a catalog path, capability, or hash prefix.
     #[command(
         long_about = "Decrypt and inspect the manifest behind a capability. Shows the \
                       manifest hash, file size, MIME type, erasure params, stripe and \
@@ -114,20 +128,43 @@ enum Command {
                       full string."
     )]
     Info {
-        /// Full bech32m capability (`crow1…`) or hex prefix of a pinned manifest.
+        /// Catalog path, full bech32m capability (`crow1…`), or hex prefix.
         cap_or_prefix: String,
     },
-    /// List every pinned manifest.
+    /// List catalog entries, or flat pins with --pins.
     #[command(
-        long_about = "List every pinned manifest, sorted by pin time (newest first). \
-                      Default columns: 8-char hash prefix, file size, MIME type, \
-                      pinned date (YYYY-MM-DD), name. --long shows the full hash, full \
-                      MIME, and an ISO-8601 timestamp."
+        long_about = "List a catalog directory. With no PATH, lists the catalog root \
+                      when it has entries; otherwise falls back to the legacy flat pin \
+                      list. Use --pins to force the flat pin list.\n\
+                      \n\
+                      Catalog folders are local-only organization. Files remain \
+                      shareable via their crow1… capabilities."
     )]
     Ls {
+        /// Optional catalog directory or file path.
+        path: Option<String>,
         /// Show full hashes, full mime types, and ISO timestamps.
         #[arg(short, long)]
         long: bool,
+        /// Show legacy flat pins instead of catalog entries.
+        #[arg(long)]
+        pins: bool,
+    },
+    /// Create a local catalog directory.
+    #[command(
+        long_about = "Create a local catalog directory. Directories organize file caps \
+                      on this device; they are not yet shareable Crow objects.\n\
+                      \n\
+                      Examples:\n  \
+                      crow mkdir /docs\n  \
+                      crow mkdir -p /docs/projects/crow"
+    )]
+    Mkdir {
+        /// Catalog directory path.
+        path: String,
+        /// Create missing parent directories.
+        #[arg(short, long)]
+        parents: bool,
     },
     /// Pin a capability so its chunks survive `crow gc`.
     #[command(
@@ -277,26 +314,44 @@ fn run(cli: Cli) -> DynResult<()> {
         command => {
             let store = FsStore::open(&home)?;
             let pins = PinIndex::open(&home)?;
+            let catalog = CatalogIndex::open(&home)?;
             let crow = Crow::new(store);
 
             match command {
                 Command::Put {
                     path,
+                    dest,
                     mime,
                     name,
                     chunk_size,
-                } => cmd_put(&crow, &pins, &path, mime, name, chunk_size),
-                Command::Get { cap_or_prefix, out } => cmd_get(&crow, &pins, &cap_or_prefix, &out),
-                Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &cap_or_prefix),
-                Command::Ls { long } => cmd_ls(&crow, &pins, long),
+                } => cmd_put(
+                    &crow,
+                    &pins,
+                    &catalog,
+                    &path,
+                    dest.as_deref(),
+                    mime,
+                    name,
+                    chunk_size,
+                ),
+                Command::Get { cap_or_prefix, out } => {
+                    cmd_get(&crow, &pins, &catalog, &cap_or_prefix, &out)
+                }
+                Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &catalog, &cap_or_prefix),
+                Command::Ls {
+                    path,
+                    long,
+                    pins: pins_only,
+                } => cmd_ls(&crow, &pins, &catalog, path.as_deref(), long, pins_only),
+                Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
                 Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
                 Command::Unpin { cap_or_prefix } => cmd_unpin(&pins, &cap_or_prefix),
                 Command::Rm {
                     cap_or_prefix,
                     dry_run,
                 } => cmd_rm(&crow, &pins, &cap_or_prefix, dry_run),
-                Command::Gc { dry_run } => cmd_gc(&crow, &pins, dry_run),
-                Command::Stat => cmd_stat(&crow, &pins),
+                Command::Gc { dry_run } => cmd_gc(&crow, &pins, &catalog, dry_run),
+                Command::Stat => cmd_stat(&crow, &pins, &catalog),
                 Command::Fetch {
                     peer,
                     cap_or_prefix,
@@ -319,7 +374,9 @@ fn resolve_home(explicit: Option<PathBuf>) -> DynResult<PathBuf> {
 fn cmd_put(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
+    catalog: &CatalogIndex,
     path: &str,
+    dest: Option<&str>,
     mime: Option<String>,
     name: Option<String>,
     chunk_size: Option<u32>,
@@ -330,22 +387,43 @@ fn cmd_put(
 
     let cap = crow.put_bytes_with(&bytes, &mime_str, ErasureParams::default(), chunk_size)?;
     let pin_name = name.or_else(|| default_name(path));
-    pins.add(cap.clone(), pin_name, None)?;
+    pins.add(cap.clone(), pin_name.clone(), None)?;
+    if let Some(dest) = dest {
+        let catalog_path = resolve_put_destination(catalog, path, dest)?;
+        catalog.put_file(catalog_path.as_str(), cap.clone(), pin_name)?;
+        println!("path {}", catalog_path);
+    }
     println!("{}", cap.encode());
     Ok(())
 }
 
-fn cmd_get(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str, out: &str) -> DynResult<()> {
-    let cap = resolve_cap(pins, arg)?;
+fn cmd_get(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: &str,
+    out: &str,
+) -> DynResult<()> {
+    let target = resolve_file_ref(catalog, pins, arg)?;
+    let cap = target.cap;
     let bytes = crow.get_bytes(&cap)?;
     write_all(out, &bytes)?;
     Ok(())
 }
 
-fn cmd_info(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str) -> DynResult<()> {
-    let cap = resolve_cap(pins, arg)?;
+fn cmd_info(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: &str,
+) -> DynResult<()> {
+    let target = resolve_file_ref(catalog, pins, arg)?;
+    let cap = target.cap;
     let manifest = open_manifest(crow, &cap)?;
 
+    if let Some(path) = target.path {
+        println!("path      {path}");
+    }
     let stripes = manifest.stripes.len();
     let shares: usize = manifest
         .stripes
@@ -383,7 +461,33 @@ fn cmd_info(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str) -> DynResult<()> {
     Ok(())
 }
 
-fn cmd_ls(crow: &Crow<FsStore>, pins: &PinIndex, long: bool) -> DynResult<()> {
+fn cmd_ls(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    path: Option<&str>,
+    long: bool,
+    pins_only: bool,
+) -> DynResult<()> {
+    if pins_only {
+        return cmd_ls_pins(crow, pins, long);
+    }
+
+    let view = catalog.view()?;
+    let root = CatalogPath::root();
+    if let Some(path) = path {
+        let path = CatalogPath::normalize(path)?;
+        return print_catalog_listing(crow, &view, &path, long);
+    }
+
+    if !view.list(&root).is_empty() {
+        print_catalog_listing(crow, &view, &root, long)
+    } else {
+        cmd_ls_pins(crow, pins, long)
+    }
+}
+
+fn cmd_ls_pins(crow: &Crow<FsStore>, pins: &PinIndex, long: bool) -> DynResult<()> {
     let mut records = pins.list()?;
     records.sort_by(|a, b| {
         b.pinned_at
@@ -428,6 +532,17 @@ fn cmd_ls(crow: &Crow<FsStore>, pins: &PinIndex, long: bool) -> DynResult<()> {
             let name = r.name.as_deref().unwrap_or("(unnamed)");
             println!("{hash_short}  {size:>10}  {mime:<18}  {pinned:<10}  {name}");
         }
+    }
+    Ok(())
+}
+
+fn cmd_mkdir(catalog: &CatalogIndex, path: &str, parents: bool) -> DynResult<()> {
+    let path = CatalogPath::normalize(path)?;
+    let events = catalog.mkdir(path.as_str(), parents)?;
+    if events.is_empty() {
+        println!("exists {path}");
+    } else {
+        println!("created {path}");
     }
     Ok(())
 }
@@ -493,9 +608,15 @@ fn cmd_rm(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str, dry_run: bool) -> Dy
     Ok(())
 }
 
-fn cmd_gc(crow: &Crow<FsStore>, pins: &PinIndex, dry_run: bool) -> DynResult<()> {
+fn cmd_gc(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    dry_run: bool,
+) -> DynResult<()> {
     let pin_caps: Vec<Cap> = pins.list()?.into_iter().map(|r| r.cap).collect();
-    let live = compute_live_set(crow.store(), &pin_caps)?;
+    let view = catalog.view()?;
+    let live = compute_live_set_from_roots(crow.store(), &pin_caps, &view)?;
     let report = sweep(crow.store(), &live, GcOptions { dry_run })?;
     let action = if dry_run { "would delete" } else { "deleted" };
     if report.deleted_manifests + report.deleted_chunks == 0 {
@@ -524,7 +645,7 @@ fn cmd_gc(crow: &Crow<FsStore>, pins: &PinIndex, dry_run: bool) -> DynResult<()>
     Ok(())
 }
 
-fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex) -> DynResult<()> {
+fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex, catalog: &CatalogIndex) -> DynResult<()> {
     let manifests = crow.store().list(Namespace::Manifests)?;
     let chunks = crow.store().list(Namespace::Chunks)?;
     let manifest_bytes: u64 = manifests
@@ -538,7 +659,9 @@ fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex) -> DynResult<()> {
 
     let pin_records = pins.list()?;
     let pin_caps: Vec<Cap> = pin_records.iter().map(|r| r.cap.clone()).collect();
-    let live = compute_live_set(crow.store(), &pin_caps)?;
+    let catalog_view = catalog.view()?;
+    let catalog_files = catalog_view.files().len();
+    let live = compute_live_set_from_roots(crow.store(), &pin_caps, &catalog_view)?;
 
     let mut unref_manifests = 0u64;
     let mut unref_chunks = 0u64;
@@ -578,6 +701,7 @@ fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex) -> DynResult<()> {
         format_size_u64(chunk_bytes)
     );
     println!("pins          {}", pin_records.len());
+    println!("catalog files {}", catalog_files);
     println!(
         "unreferenced  {unref_manifests} manifests / {unref_chunks} chunks ({})",
         format_size_u64(unref_bytes),
@@ -791,6 +915,183 @@ fn open_manifest(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<Manifest> {
         .get(Namespace::Manifests, cap.manifest_hash.inner())?
         .ok_or("manifest not found in local store")?;
     Ok(Manifest::open(&encrypted, &cap.manifest_key)?)
+}
+
+struct ResolvedFile {
+    cap: Cap,
+    path: Option<CatalogPath>,
+}
+
+fn resolve_file_ref(catalog: &CatalogIndex, pins: &PinIndex, arg: &str) -> DynResult<ResolvedFile> {
+    let arg = arg.trim();
+    if !arg.starts_with("crow1") {
+        if let Ok(path) = CatalogPath::normalize(arg) {
+            let view = catalog.view()?;
+            if let Some(entry) = view.get(&path) {
+                return match &entry.kind {
+                    EntryKind::File { cap, .. } => Ok(ResolvedFile {
+                        cap: cap.clone(),
+                        path: Some(path),
+                    }),
+                    EntryKind::Dir => Err(format!("{path} is a directory").into()),
+                };
+            }
+        }
+    }
+    Ok(ResolvedFile {
+        cap: resolve_cap(pins, arg)?,
+        path: None,
+    })
+}
+
+fn resolve_put_destination(
+    catalog: &CatalogIndex,
+    source: &str,
+    dest: &str,
+) -> DynResult<CatalogPath> {
+    let dest_path = CatalogPath::normalize(dest)?;
+    let view = catalog.view()?;
+    let dest_is_dir =
+        dest.trim_end().ends_with('/') || view.get(&dest_path).is_some_and(|entry| entry.is_dir());
+    let final_path = if dest_is_dir {
+        let name = default_name(source)
+            .ok_or("destination is a directory; stdin puts need a full destination path")?;
+        join_catalog_path(&dest_path, &name)?
+    } else {
+        dest_path
+    };
+
+    if let Some(parent) = final_path.parent() {
+        match view.get(&parent) {
+            Some(entry) if entry.is_dir() => {}
+            Some(_) => return Err(format!("catalog parent is a file: {parent}").into()),
+            None => {
+                return Err(format!(
+                    "catalog parent does not exist: {parent}; run `crow mkdir -p {parent}`"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(final_path)
+}
+
+fn join_catalog_path(parent: &CatalogPath, name: &str) -> DynResult<CatalogPath> {
+    let joined = if parent.as_str() == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", parent.as_str().trim_end_matches('/'))
+    };
+    Ok(CatalogPath::normalize(&joined)?)
+}
+
+fn print_catalog_listing(
+    crow: &Crow<FsStore>,
+    view: &CatalogView,
+    path: &CatalogPath,
+    long: bool,
+) -> DynResult<()> {
+    let Some(entry) = view.get(path) else {
+        return Err(format!("catalog path not found: {path}").into());
+    };
+
+    if matches!(&entry.kind, EntryKind::File { .. }) {
+        print_catalog_header(long);
+        print_catalog_entry(crow, entry, long);
+        return Ok(());
+    }
+
+    let entries = view.list(path);
+    if entries.is_empty() {
+        println!("(empty)");
+        return Ok(());
+    }
+
+    print_catalog_header(long);
+    for entry in entries {
+        print_catalog_entry(crow, entry, long);
+    }
+    Ok(())
+}
+
+fn print_catalog_header(long: bool) {
+    if long {
+        println!(
+            "{:<5}  {:>10}  {:<22}  {:<64}  PATH",
+            "TYPE", "SIZE", "MIME", "HASH"
+        );
+    } else {
+        println!(
+            "{:<5}  {:>10}  {:<18}  {:<8}  NAME",
+            "TYPE", "SIZE", "MIME", "HASH"
+        );
+    }
+}
+
+fn print_catalog_entry(crow: &Crow<FsStore>, entry: &CatalogEntry, long: bool) {
+    match &entry.kind {
+        EntryKind::Dir => {
+            let name = catalog_display_name(entry, long);
+            if long {
+                println!(
+                    "{:<5}  {:>10}  {:<22}  {:<64}  {}",
+                    "dir", "-", "-", "-", name
+                );
+            } else {
+                println!(
+                    "{:<5}  {:>10}  {:<18}  {:<8}  {}",
+                    "dir", "-", "-", "-", name
+                );
+            }
+        }
+        EntryKind::File { cap, .. } => {
+            let hash = cap.manifest_hash.to_string();
+            let hash_display = if long {
+                hash.clone()
+            } else {
+                hash[..8].to_string()
+            };
+            let (size, mime) = match open_manifest(crow, cap) {
+                Ok(manifest) => (
+                    format_size(manifest.file_size as usize),
+                    manifest.mime_type.to_string(),
+                ),
+                Err(_) => ("missing".into(), "missing".into()),
+            };
+            let name = catalog_display_name(entry, long);
+            if long {
+                println!(
+                    "{:<5}  {:>10}  {:<22}  {:<64}  {}",
+                    "file",
+                    size,
+                    truncate(&mime, 22),
+                    hash_display,
+                    name
+                );
+            } else {
+                println!(
+                    "{:<5}  {:>10}  {:<18}  {:<8}  {}",
+                    "file",
+                    size,
+                    truncate(&mime, 18),
+                    hash_display,
+                    name
+                );
+            }
+        }
+    }
+}
+
+fn catalog_display_name(entry: &CatalogEntry, long: bool) -> String {
+    if long {
+        entry.path.as_str().to_string()
+    } else {
+        entry
+            .path
+            .file_name()
+            .map(str::to_string)
+            .unwrap_or_else(|| entry.path.as_str().to_string())
+    }
 }
 
 fn resolve_cap(pins: &PinIndex, arg: &str) -> DynResult<Cap> {
