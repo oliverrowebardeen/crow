@@ -5,9 +5,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use crow::{
-    Cap, ChunkStore, Crow, DEFAULT_CHUNK_SIZE, ErasureParams, FsStore, Manifest, Namespace,
-    PinIndex, PinRecord, compute_live_set,
+    Cap, ChunkStore, Crow, DEFAULT_CHUNK_SIZE, ErasureParams, FsStore, GcOptions, Manifest,
+    Namespace, PinIndex, PinRecord, compute_live_set,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
+    targeted_remove,
 };
 
 #[derive(Parser)]
@@ -60,6 +61,14 @@ enum Command {
     },
     /// Remove a pin record. Chunks linger until `crow gc` runs.
     Unpin { cap_or_prefix: String },
+    /// Remove a pin and immediately delete its chunks (those not held by
+    /// another pin).
+    Rm {
+        cap_or_prefix: String,
+        /// Print what would be deleted without touching disk.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show storage stats.
     Stat,
 }
@@ -95,6 +104,10 @@ fn run(cli: Cli) -> DynResult<()> {
         Command::Ls { long } => cmd_ls(&crow, &pins, long),
         Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
         Command::Unpin { cap_or_prefix } => cmd_unpin(&pins, &cap_or_prefix),
+        Command::Rm {
+            cap_or_prefix,
+            dry_run,
+        } => cmd_rm(&crow, &pins, &cap_or_prefix, dry_run),
         Command::Stat => cmd_stat(&crow, &pins),
     }
 }
@@ -223,6 +236,53 @@ fn cmd_unpin(pins: &PinIndex, arg: &str) -> DynResult<()> {
     let rec = resolve_pin(pins, arg)?;
     pins.remove(rec.cap.manifest_hash.inner())?;
     println!("unpinned {}", &rec.manifest_hash_hex[..16]);
+    Ok(())
+}
+
+fn cmd_rm(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str, dry_run: bool) -> DynResult<()> {
+    let target = resolve_pin(pins, arg)?;
+    let target_cap = target.cap.clone();
+
+    // Collect every other pinned cap so we don't delete chunks that are
+    // shared with other pinned manifests.
+    let remaining_caps: Vec<Cap> = pins
+        .list()?
+        .into_iter()
+        .filter(|r| r.manifest_hash_hex != target.manifest_hash_hex)
+        .map(|r| r.cap)
+        .collect();
+
+    if !dry_run {
+        pins.remove(target_cap.manifest_hash.inner())?;
+    }
+
+    let report = targeted_remove(
+        crow.store(),
+        std::slice::from_ref(&target_cap),
+        &remaining_caps,
+        GcOptions { dry_run },
+    )?;
+
+    let action = if dry_run { "would remove" } else { "removed" };
+    let name = target.name.as_deref().unwrap_or("(unnamed)");
+    println!(
+        "{action} pin {} ({})",
+        &target.manifest_hash_hex[..16],
+        name
+    );
+    let action = if dry_run { "would delete" } else { "deleted" };
+    println!(
+        "{action} {} manifest{} / {} chunk{} ({})",
+        report.deleted_manifests,
+        if report.deleted_manifests == 1 {
+            ""
+        } else {
+            "s"
+        },
+        report.deleted_chunks,
+        if report.deleted_chunks == 1 { "" } else { "s" },
+        format_size_u64(report.deleted_bytes),
+    );
     Ok(())
 }
 
