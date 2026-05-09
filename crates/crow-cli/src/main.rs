@@ -1307,82 +1307,54 @@ fn cmd_fetch(
     let client = rt.block_on(Client::connect(peer))?;
     rt.block_on(client.hello(token))?;
 
-    let mut fetched = 0usize;
-    let mut already_local = 0usize;
-    let mut remote_missing = 0usize;
-    let mut fetched_bytes = 0u64;
-
-    let manifest_hash = *cap.manifest_hash.inner();
-    let manifest_state = if crow.store().has(Namespace::Manifests, &manifest_hash)? {
-        already_local += 1;
-        "local"
-    } else {
-        match rt.block_on(client.get(token, Namespace::Manifests, manifest_hash))? {
-            Some(bytes) => {
-                fetched_bytes += bytes.len() as u64;
-                crow.store()
-                    .put_unverified(Namespace::Manifests, manifest_hash, bytes)?;
-                fetched += 1;
-                "fetched"
-            }
-            None => {
-                remote_missing += 1;
-                "missing"
-            }
-        }
-    };
-
-    if manifest_state == "missing" {
+    let mut counters = FetchCounters::default();
+    let manifest_state = fetch_manifest_object(crow, &rt, &client, token, &cap, &mut counters)?;
+    if matches!(manifest_state, FetchState::Missing) {
         println!("manifest      missing");
         println!("shares        0 local / 0 fetched / 0 missing");
-        println!("stored        {}", format_size_u64(fetched_bytes));
+        println!("stored        {}", format_size_u64(counters.fetched_bytes));
         println!("status        not reconstructable");
         return Err("peer does not have the manifest".into());
     }
 
-    let manifest = open_manifest(crow, &cap)?;
+    let manifest_kind = crow.open_manifest_kind(&cap)?;
     let (pin_name, pin_comment) = fetch_pin_metadata(pins, &cap, name)?;
     pins.add(cap.clone(), pin_name, pin_comment)?;
 
-    let mut local_shares = 0usize;
-    let mut fetched_shares = 0usize;
-    let mut missing_shares = 0usize;
-    for hash in manifest
-        .stripes
-        .iter()
-        .flat_map(|s| s.data.iter().chain(s.parity.iter()))
-        .map(|h| *h.inner())
-    {
-        match fetch_object(
-            crow,
-            &rt,
-            &client,
-            token,
-            Namespace::Chunks,
-            hash,
-            &mut fetched_bytes,
-        )? {
-            FetchState::Local => {
-                already_local += 1;
-                local_shares += 1;
-            }
-            FetchState::Fetched => {
-                fetched += 1;
-                fetched_shares += 1;
-            }
-            FetchState::Missing => {
-                remote_missing += 1;
-                missing_shares += 1;
-            }
-        }
-    }
+    let mut visited = HashSet::from([*cap.manifest_hash.inner()]);
+    fetch_manifest_dependencies(
+        crow,
+        &rt,
+        &client,
+        token,
+        &manifest_kind,
+        &mut counters,
+        &mut visited,
+    )?;
 
-    println!("manifest      {manifest_state}");
+    println!("manifest      {}", manifest_state.as_str());
+    if let ManifestKind::Directory(directory) = &manifest_kind {
+        println!(
+            "directory     {} file{} / {} director{}",
+            directory.file_count(),
+            if directory.file_count() == 1 { "" } else { "s" },
+            directory.dir_count(),
+            if directory.dir_count() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+        );
+    }
     println!(
-        "shares        {local_shares} local / {fetched_shares} fetched / {missing_shares} missing"
+        "shares        {} local / {} fetched / {} missing",
+        counters.local_shares, counters.fetched_shares, counters.missing_shares
     );
-    println!("objects       {already_local} local / {fetched} fetched / {remote_missing} missing");
-    println!("stored        {}", format_size_u64(fetched_bytes));
+    println!(
+        "objects       {} local / {} fetched / {} missing",
+        counters.already_local, counters.fetched, counters.remote_missing
+    );
+    println!("stored        {}", format_size_u64(counters.fetched_bytes));
     println!(
         "pinned        {} {}",
         &cap.manifest_hash.to_string()[..8],
@@ -1391,7 +1363,7 @@ fn cmd_fetch(
             .unwrap_or_else(|| "(unnamed)".into())
     );
 
-    match crow.get_bytes(&cap) {
+    match verify_cap_reconstructable(crow, &cap) {
         Ok(_) => {
             println!("status        reconstructable");
             Ok(())
@@ -1445,6 +1417,165 @@ enum FetchState {
     Local,
     Fetched,
     Missing,
+}
+
+impl FetchState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            FetchState::Local => "local",
+            FetchState::Fetched => "fetched",
+            FetchState::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Default)]
+struct FetchCounters {
+    fetched: usize,
+    already_local: usize,
+    remote_missing: usize,
+    fetched_bytes: u64,
+    local_shares: usize,
+    fetched_shares: usize,
+    missing_shares: usize,
+}
+
+impl FetchCounters {
+    fn count_object(&mut self, state: &FetchState) {
+        match state {
+            FetchState::Local => self.already_local += 1,
+            FetchState::Fetched => self.fetched += 1,
+            FetchState::Missing => self.remote_missing += 1,
+        }
+    }
+
+    fn count_share(&mut self, state: &FetchState) {
+        match state {
+            FetchState::Local => self.local_shares += 1,
+            FetchState::Fetched => self.fetched_shares += 1,
+            FetchState::Missing => self.missing_shares += 1,
+        }
+    }
+}
+
+fn fetch_manifest_object(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    token: ClusterToken,
+    cap: &Cap,
+    counters: &mut FetchCounters,
+) -> DynResult<FetchState> {
+    let state = fetch_object(
+        crow,
+        rt,
+        client,
+        token,
+        Namespace::Manifests,
+        *cap.manifest_hash.inner(),
+        &mut counters.fetched_bytes,
+    )?;
+    counters.count_object(&state);
+    Ok(state)
+}
+
+fn fetch_share_object(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    token: ClusterToken,
+    hash: Hash,
+    counters: &mut FetchCounters,
+) -> DynResult<()> {
+    let state = fetch_object(
+        crow,
+        rt,
+        client,
+        token,
+        Namespace::Chunks,
+        hash,
+        &mut counters.fetched_bytes,
+    )?;
+    counters.count_object(&state);
+    counters.count_share(&state);
+    Ok(())
+}
+
+fn fetch_manifest_dependencies(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    token: ClusterToken,
+    kind: &ManifestKind,
+    counters: &mut FetchCounters,
+    visited: &mut HashSet<Hash>,
+) -> DynResult<()> {
+    match kind {
+        ManifestKind::File(manifest) => {
+            for hash in manifest
+                .stripes
+                .iter()
+                .flat_map(|s| s.data.iter().chain(s.parity.iter()))
+                .map(|h| *h.inner())
+            {
+                fetch_share_object(crow, rt, client, token, hash, counters)?;
+            }
+        }
+        ManifestKind::Directory(manifest) => {
+            for child_cap in manifest.file_caps()? {
+                fetch_cap_recursive(crow, rt, client, token, &child_cap, counters, visited)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fetch_cap_recursive(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    token: ClusterToken,
+    cap: &Cap,
+    counters: &mut FetchCounters,
+    visited: &mut HashSet<Hash>,
+) -> DynResult<()> {
+    if !visited.insert(*cap.manifest_hash.inner()) {
+        return Ok(());
+    }
+    if matches!(
+        fetch_manifest_object(crow, rt, client, token, cap, counters)?,
+        FetchState::Missing
+    ) {
+        return Ok(());
+    }
+    let kind = crow.open_manifest_kind(cap)?;
+    fetch_manifest_dependencies(crow, rt, client, token, &kind, counters, visited)
+}
+
+fn verify_cap_reconstructable(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<()> {
+    let mut visited = HashSet::new();
+    verify_cap_reconstructable_inner(crow, cap, &mut visited)
+}
+
+fn verify_cap_reconstructable_inner(
+    crow: &Crow<FsStore>,
+    cap: &Cap,
+    visited: &mut HashSet<Hash>,
+) -> DynResult<()> {
+    if !visited.insert(*cap.manifest_hash.inner()) {
+        return Ok(());
+    }
+    match crow.open_manifest_kind(cap)? {
+        ManifestKind::File(_) => {
+            crow.get_bytes(cap)?;
+        }
+        ManifestKind::Directory(manifest) => {
+            for child_cap in manifest.file_caps()? {
+                verify_cap_reconstructable_inner(crow, &child_cap, visited)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn fetch_object(

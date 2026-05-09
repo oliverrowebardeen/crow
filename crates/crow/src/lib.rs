@@ -48,7 +48,7 @@ pub use gc::{
     compute_live_set_from_roots, sweep, targeted_remove,
 };
 pub use hash::{ChunkHash, Hash, ManifestHash};
-pub use identity::Identity;
+pub use identity::{Identity, NodeId};
 pub use manifest::{
     Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, Stripe,
 };

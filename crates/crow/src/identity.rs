@@ -47,6 +47,13 @@ impl Identity {
         PublicKey::from(&self.kx).to_bytes()
     }
 
+    /// The stable per-node identifier — the Ed25519 verifying-key bytes,
+    /// wrapped in a typed [`NodeId`] for use by discovery, peer lists, and
+    /// (eventually) signed manifests.
+    pub fn node_id(&self) -> NodeId {
+        NodeId(self.signing_pubkey())
+    }
+
     /// Load the identity from `<home>/identity.json`, generating and persisting
     /// a fresh one if the file does not exist. Idempotent: a second call at
     /// the same `home` returns the same identity bytes.
@@ -106,6 +113,60 @@ impl std::fmt::Debug for Identity {
             .field("signing_pubkey", &hex(&self.signing_pubkey()))
             .field("kx_pubkey", &hex(&self.kx_pubkey()))
             .finish()
+    }
+}
+
+/// Stable per-node identifier — the Ed25519 verifying-key bytes.
+///
+/// Used by mDNS discovery (the first 16 hex chars become the service instance
+/// name; the full 64-char hex sits in the TXT record), by `crow peers` for
+/// display, and by `crow fetch <prefix>` for friendly addressing of known
+/// peers. Equality and ordering are byte-wise on the inner key.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NodeId([u8; 32]);
+
+impl NodeId {
+    pub const SIZE: usize = 32;
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// 16-hex-character prefix — short enough for `crow peers` columns and
+    /// mDNS instance names, long enough that LAN-scale collisions are very
+    /// unlikely.
+    pub fn short(&self) -> String {
+        hex(&self.0[..8])
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex(&self.0))
+    }
+}
+
+impl std::fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NodeId({})", self.short())
+    }
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        decode_hex32(s).map(Self).ok_or_else(|| {
+            Error::Identity(format!(
+                "NodeId expects 64 hex characters, got {} ({:?})",
+                s.len(),
+                s
+            ))
+        })
     }
 }
 
@@ -219,6 +280,46 @@ mod tests {
             Identity::load_or_create(tmp.path()),
             Err(Error::Identity(_))
         ));
+    }
+
+    #[test]
+    fn node_id_matches_signing_pubkey() {
+        let id = Identity::random();
+        assert_eq!(id.node_id().as_bytes(), &id.signing_pubkey());
+    }
+
+    #[test]
+    fn node_id_hex_roundtrip() {
+        use std::str::FromStr;
+        let id = Identity::random();
+        let n = id.node_id();
+        let s = n.to_string();
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(NodeId::from_str(&s).unwrap(), n);
+    }
+
+    #[test]
+    fn node_id_short_is_16_chars() {
+        let n = Identity::random().node_id();
+        assert_eq!(n.short().len(), 16);
+        assert!(n.short().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn node_id_rejects_bad_input() {
+        use std::str::FromStr;
+        assert!(NodeId::from_str("abc").is_err());
+        assert!(NodeId::from_str(&"z".repeat(64)).is_err());
+        assert!(NodeId::from_str("").is_err());
+    }
+
+    #[test]
+    fn node_id_debug_uses_short_form() {
+        let n = Identity::random().node_id();
+        let dbg = format!("{n:?}");
+        assert!(dbg.starts_with("NodeId("));
+        assert!(dbg.contains(&n.short()));
     }
 
     #[test]
