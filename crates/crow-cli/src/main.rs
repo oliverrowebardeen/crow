@@ -15,8 +15,8 @@ use crow::{
     sweep, targeted_remove,
 };
 use crow_net::{
-    Client, ClusterToken, DEFAULT_BIND_ADDR, Discovery, LocalAdvert, PeerSnapshot, SelfInfo,
-    TokenStore, default_friendly_name, peer_snapshot,
+    Client, ClusterToken, DEFAULT_BIND_ADDR, Discovery, LocalAdvert, PeerInfo, PeerSnapshot,
+    SelfInfo, TokenStore, default_friendly_name, peer_snapshot,
 };
 
 #[derive(Parser)]
@@ -366,12 +366,20 @@ enum Command {
         long_about = "Connect to a trusted Crow peer, fetch the manifest and missing \
                       shares for a cap, pin it locally, and verify local reconstruction.\n\
                       \n\
-                      This is manual Phase 1 personal-cluster fetch: no mDNS, peer list, \
-                      automatic replication, or friend-scoped access yet."
+                      The <PEER> argument accepts three forms, resolved in order:\n  \
+                      1. An IP:port (e.g. 192.168.1.42:7070).\n  \
+                      2. A hex prefix of a peer's node id (e.g. abc1) — looked up in \
+                         the snapshot at <home>/peers.json.\n  \
+                      3. A peer's exact friendly name (e.g. laptop) — also looked up \
+                         in the snapshot.\n\
+                      \n\
+                      Forms 2 and 3 require `crow serve` to be running somewhere on \
+                      the LAN (so a fresh peer snapshot exists). Ambiguous prefixes \
+                      and unknown names get explicit errors with the candidate list."
     )]
     Fetch {
-        /// Peer address, e.g. 192.168.1.42:7070.
-        peer: SocketAddr,
+        /// Peer: IP:port, node-id hex prefix, or friendly name.
+        peer: String,
         /// Full bech32m capability (`crow1…`) or hex prefix of a pinned manifest.
         cap_or_prefix: String,
         /// Friendly name for the local pin.
@@ -505,7 +513,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     peer,
                     cap_or_prefix,
                     name,
-                } => cmd_fetch(&home, &crow, &pins, peer, &cap_or_prefix, name),
+                } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
                 Command::Serve { .. } | Command::Peers { .. } | Command::Token(_) => {
                     unreachable!("handled above")
                 }
@@ -1388,6 +1396,71 @@ fn cmd_peers(home: &Path, long: bool, json: bool) -> DynResult<()> {
     Ok(())
 }
 
+/// Resolve a `<peer>` CLI argument to a SocketAddr. Three forms in order:
+/// 1. Parse as SocketAddr.
+/// 2. Hex prefix of a node id from the snapshot.
+/// 3. Exact friendly name from the snapshot.
+fn resolve_peer(home: &Path, arg: &str) -> DynResult<SocketAddr> {
+    let arg = arg.trim();
+
+    if let Ok(addr) = arg.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let snapshot_path = peer_snapshot::snapshot_path(home);
+    let snap = peer_snapshot::load(&snapshot_path)?.ok_or_else(|| -> DynError {
+        format!(
+            "'{arg}' is not an IP:port and no peer snapshot exists at {} \
+             (run `crow serve` somewhere on the LAN to populate it)",
+            snapshot_path.display()
+        )
+        .into()
+    })?;
+
+    let lower = arg.to_ascii_lowercase();
+    let id_matches: Vec<&PeerInfo> = snap
+        .peers
+        .iter()
+        .filter(|p| p.node_id.to_string().starts_with(&lower))
+        .collect();
+
+    let candidates: Vec<&PeerInfo> = if !id_matches.is_empty() {
+        id_matches
+    } else {
+        snap.peers
+            .iter()
+            .filter(|p| p.friendly_name.as_deref() == Some(arg))
+            .collect()
+    };
+
+    match candidates.len() {
+        0 => Err(format!(
+            "no peer in {} matches '{arg}' (tried IP:port, node-id prefix, friendly name)",
+            snapshot_path.display()
+        )
+        .into()),
+        1 => candidates[0]
+            .addresses
+            .first()
+            .copied()
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "peer {} has no known address",
+                    candidates[0].node_id.short()
+                )
+                .into()
+            }),
+        n => {
+            let mut msg = format!("ambiguous peer '{arg}' ({n} matches):");
+            for p in &candidates {
+                let name = p.friendly_name.as_deref().unwrap_or("(unnamed)");
+                msg.push_str(&format!("\n  {} {name}", p.node_id.short()));
+            }
+            Err(msg.into())
+        }
+    }
+}
+
 fn humanize_age(unix: u64) -> String {
     let now = peer_snapshot::now_unix();
     if unix > now {
@@ -1503,14 +1576,15 @@ fn cmd_fetch(
     home: &Path,
     crow: &Crow<FsStore>,
     pins: &PinIndex,
-    peer: SocketAddr,
+    peer: &str,
     arg: &str,
     name: Option<String>,
 ) -> DynResult<()> {
     let token = load_token(home)?;
+    let socket_addr = resolve_peer(home, peer)?;
     let cap = resolve_cap(pins, arg)?;
     let rt = runtime()?;
-    let client = rt.block_on(Client::connect(peer))?;
+    let client = rt.block_on(Client::connect(socket_addr))?;
     rt.block_on(client.hello(token))?;
 
     let mut counters = FetchCounters::default();
