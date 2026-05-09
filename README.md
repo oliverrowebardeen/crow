@@ -8,9 +8,9 @@ A file in Crow is encrypted, chunked, hashed, erasure-coded, and stored as a set
 
 ## Status
 
-This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, and the first **manual LAN fetch** pass: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, and subcommands such as `put`, `get`, `mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `rm`, `gc`, `serve`, and `fetch`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
+This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, **manual LAN fetch over QUIC**, and **mDNS LAN peer discovery**: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, automatic peer discovery on the local network, and subcommands such as `put`, `get`, `mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `rm`, `gc`, `serve`, `peers`, and `fetch`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
 
-mDNS discovery, automatic replication policy, replicated metadata sync, friend-scoped sharing, and live identity-based manifest signing are deferred. See [Roadmap](#roadmap).
+Automatic replication policy, replicated metadata sync, friend-scoped sharing, and live identity-based manifest signing are deferred. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -81,8 +81,9 @@ crow rm   <path-or-cap-or-prefix> [--dry-run]
 crow gc   [--dry-run]
 crow stat
 crow token init|show|set
-crow serve [--bind ADDR]
-crow fetch <peer-addr> <cap-or-prefix> [--name NAME]
+crow serve [--bind ADDR] [--name NAME]
+crow peers [--long] [--json]
+crow fetch <peer> <cap-or-prefix> [--name NAME]
 ```
 
 `<file>` and `<out>` accept `-` for stdin / stdout. Storage lives at `$CROW_HOME` (default `~/.crow`); override per-invocation with `--home PATH`.
@@ -193,19 +194,37 @@ crow token set <64-hex-token>
 Serve chunks from the source device:
 
 ```sh
-crow serve
+crow serve --name laptop
 # serving /Users/you/.crow on 0.0.0.0:7070
+# node 8dad17fbe7b1f81c (laptop)
 # cluster token: configured
+# mDNS service: _crow._udp.local.
 ```
 
-Fetch a cap from another device by LAN address:
+`crow serve` now also advertises the device on mDNS — the same mechanism behind AirPrint and Chromecast — so other Crow daemons on the same Wi-Fi see it without configuration. The daemon writes a snapshot of every peer it has seen to `<home>/peers.json` every five seconds.
+
+List the snapshot:
 
 ```sh
+$ crow peers
+NODE              NAME              ADDRESS                 LAST SEEN
+abcdef0123456789  laptop            192.168.1.10:7070       3s ago
+
+self: 8dad17fbe7b1f81c phone on 192.168.1.20:7070 (snapshot 4s old)
+```
+
+Fetch a cap from another device — by IP:port, by node-id hex prefix, or by friendly name (the latter two resolve through the snapshot):
+
+```sh
+# Any of these work, given a peer snapshot:
 crow fetch 192.168.1.42:7070 crow1qyq...m0r --name report.pdf
+crow fetch abcd                crow1qyq...m0r --name report.pdf
+crow fetch laptop              crow1qyq...m0r --name report.pdf
+
 crow get <prefix> report.pdf
 ```
 
-`fetch` pulls the encrypted manifest and missing shares, verifies every object by BLAKE3 hash before storing it, pins the cap locally, and exits successfully only when local reconstruction works. mDNS discovery, peer lists, and automatic replication are later Phase 1 steps.
+`fetch` pulls the encrypted manifest and missing shares, verifies every object by BLAKE3 hash before storing it, pins the cap locally, and exits successfully only when local reconstruction works. Automatic replication, replicated metadata sync, and friend-scoped access are later Phase 1 steps.
 
 ### Sharing
 
@@ -357,7 +376,7 @@ Several devices owned by one user, on the same network, syncing files between th
 
 1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
 2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted file manifests, directory manifests, and shares from a known peer after shared-token authorization.
-3. **mDNS discovery — next.** Daemons announce themselves on the local network the same way AirPrint and Chromecast do; other Crows on the same Wi-Fi automatically add them to a peer list. Implementation should add a local peer registry, advertise the existing QUIC bind address plus device id, and let `crow fetch` accept a discovered device alias instead of only a raw socket address. No central server, no DHT.
+3. **mDNS discovery — shipped.** `crow serve` advertises `_crow._udp.local.` with the daemon's `NodeId` (Ed25519 pubkey, persistent across restarts at `<home>/identity.json`), bound port, and friendly name. Other Crows on the same Wi-Fi auto-discover; the daemon writes `<home>/peers.json` every five seconds. `crow peers` reads the snapshot; `crow fetch <peer>` accepts a node-id hex prefix or friendly name in addition to `IP:port`. Discovery is unauthenticated by design — the existing shared `ClusterToken` still gates real chunk fetches.
 4. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
 5. **Replicated metadata sync.** Merge the local catalog event logs across devices, then add ACLs, version history, and holder hints. The on-disk catalog is already operation-log-shaped so this is a sync/merge step rather than a catalog rewrite.
 6. **Identity wiring.** Sign manifests with the Ed25519 key Crow already generates; verify the signature before pinning so a foreign device on the same Wi-Fi can't inject pins or catalog entries into your fleet.
