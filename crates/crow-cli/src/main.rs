@@ -7,8 +7,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use crow::{
     Cap, CatalogEntry, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
-    DEFAULT_CHUNK_SIZE, EntryKind, ErasureParams, FsStore, GcOptions, Hash, Manifest, Namespace,
-    PinIndex, PinRecord, compute_live_set_from_roots,
+    DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
+    ErasureParams, FsStore, GcOptions, Hash, Manifest, ManifestKind, Namespace, PinIndex,
+    PinRecord, compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
@@ -212,6 +213,40 @@ enum Command {
         /// Skip confirmation for non-empty output directories.
         #[arg(short, long)]
         yes: bool,
+    },
+    /// Freeze a local catalog directory into a shareable directory cap.
+    #[command(
+        long_about = "Build an immutable snapshot manifest for a local catalog directory, \
+                      store it, pin it, and print its crow1… capability. Directory caps \
+                      are snapshots: later catalog edits do not change the cap.\n\
+                      \n\
+                      Examples:\n  \
+                      crow cap-dir /photos\n  \
+                      crow cap-dir /docs --name docs-snapshot"
+    )]
+    CapDir {
+        /// Local catalog directory to snapshot.
+        path: String,
+        /// Friendly name for the pinned directory cap.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Attach a directory snapshot cap into the local catalog.
+    #[command(
+        long_about = "Import an immutable directory snapshot cap into the local catalog. \
+                      The destination path must not already exist. Child file caps are \
+                      recorded as normal catalog file entries; this does not create a \
+                      live shared folder.\n\
+                      \n\
+                      Examples:\n  \
+                      crow add-dir crow1qyq... /shared/photos\n  \
+                      crow add-dir <prefix> /imports/docs"
+    )]
+    AddDir {
+        /// Full directory cap or hash prefix of a pinned directory cap.
+        cap_or_prefix: String,
+        /// Catalog destination path to create.
+        dest: String,
     },
     /// Pin a capability so its chunks survive `crow gc`.
     #[command(
@@ -418,8 +453,13 @@ fn run(cli: Cli) -> DynResult<()> {
                     cmd_put_dir(&crow, &catalog, &source, dest.as_deref(), yes)
                 }
                 Command::GetDir { path, out, yes } => {
-                    cmd_get_dir(&crow, &catalog, &path, &out, yes)
+                    cmd_get_dir(&crow, &pins, &catalog, &path, &out, yes)
                 }
+                Command::CapDir { path, name } => cmd_cap_dir(&crow, &pins, &catalog, &path, name),
+                Command::AddDir {
+                    cap_or_prefix,
+                    dest,
+                } => cmd_add_dir(&crow, &pins, &catalog, &cap_or_prefix, &dest),
                 Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
                 Command::Unpin {
                     cap_or_prefix,
@@ -512,34 +552,48 @@ fn cmd_info(
     let target = resolve_file_ref(catalog, pins, arg)?;
     let path = target.path;
     let cap = target.cap;
-    let manifest = open_manifest(crow, &cap)?;
 
     if let Some(path) = &path {
         println!("path      {path}");
     }
-    let stripes = manifest.stripes.len();
-    let shares: usize = manifest
-        .stripes
-        .iter()
-        .map(|s| s.data.len() + s.parity.len())
-        .sum();
-
     println!("hash      {}", cap.manifest_hash);
-    println!("size      {}", format_size(manifest.file_size as usize));
-    println!("mime      {}", manifest.mime_type);
-    println!("erasure   {}-of-{}", manifest.erasure.k, manifest.erasure.n);
-    println!("stripes   {stripes}");
-    println!("shares    {shares}");
-    println!(
-        "chunk     {} ({})",
-        manifest.chunk_size,
-        format_size(manifest.chunk_size as usize)
-    );
-    println!("created   {}", format_iso_timestamp(manifest.created_at));
-    println!(
-        "algo      {:?} / {:?} / {:?}",
-        manifest.algorithm.aead, manifest.algorithm.kdf, manifest.algorithm.erasure_code
-    );
+    match crow.open_manifest_kind(&cap)? {
+        ManifestKind::File(manifest) => {
+            let stripes = manifest.stripes.len();
+            let shares: usize = manifest
+                .stripes
+                .iter()
+                .map(|s| s.data.len() + s.parity.len())
+                .sum();
+
+            println!("type      file");
+            println!("size      {}", format_size(manifest.file_size as usize));
+            println!("mime      {}", manifest.mime_type);
+            println!("erasure   {}-of-{}", manifest.erasure.k, manifest.erasure.n);
+            println!("stripes   {stripes}");
+            println!("shares    {shares}");
+            println!(
+                "chunk     {} ({})",
+                manifest.chunk_size,
+                format_size(manifest.chunk_size as usize)
+            );
+            println!("created   {}", format_iso_timestamp(manifest.created_at));
+            println!(
+                "algo      {:?} / {:?} / {:?}",
+                manifest.algorithm.aead, manifest.algorithm.kdf, manifest.algorithm.erasure_code
+            );
+        }
+        ManifestKind::Directory(manifest) => {
+            println!("type      directory snapshot");
+            println!("files     {}", manifest.file_count());
+            println!("dirs      {}", manifest.dir_count());
+            match directory_logical_size(crow, &manifest)? {
+                Some(bytes) => println!("size      {}", format_size_u64(bytes)),
+                None => println!("size      unknown (missing child manifests)"),
+            }
+            println!("created   {}", format_iso_timestamp(manifest.created_at));
+        }
+    }
 
     if let Some(rec) = pins.get(cap.manifest_hash.inner())? {
         let name = rec.name.as_deref().unwrap_or("(unnamed)");
@@ -601,15 +655,14 @@ fn cmd_ls_pins(crow: &Crow<FsStore>, pins: &PinIndex, long: bool) -> DynResult<(
             "HASH", "SIZE", "MIME", "PINNED"
         );
         for r in &records {
-            let manifest = open_manifest(crow, &r.cap)?;
-            let size = format_size(manifest.file_size as usize);
+            let (size, mime) = pin_listing_metadata(crow, &r.cap, true)?;
             let pinned = format_iso_timestamp(r.pinned_at);
             let name = r.name.as_deref().unwrap_or("(unnamed)");
             println!(
                 "{}  {:>10}  {:<22}  {:<20}  {}",
                 r.manifest_hash_hex,
                 size,
-                truncate(&manifest.mime_type, 22),
+                truncate(&mime, 22),
                 pinned,
                 name,
             );
@@ -620,16 +673,36 @@ fn cmd_ls_pins(crow: &Crow<FsStore>, pins: &PinIndex, long: bool) -> DynResult<(
             "HASH", "SIZE", "MIME", "PINNED"
         );
         for r in &records {
-            let manifest = open_manifest(crow, &r.cap)?;
             let hash_short = &r.manifest_hash_hex[..8];
-            let size = format_size(manifest.file_size as usize);
-            let mime = truncate(&manifest.mime_type, 18);
+            let (size, mime) = pin_listing_metadata(crow, &r.cap, false)?;
+            let mime = truncate(&mime, 18);
             let pinned = format_short_date(r.pinned_at);
             let name = r.name.as_deref().unwrap_or("(unnamed)");
             println!("{hash_short}  {size:>10}  {mime:<18}  {pinned:<10}  {name}");
         }
     }
     Ok(())
+}
+
+fn pin_listing_metadata(
+    crow: &Crow<FsStore>,
+    cap: &Cap,
+    long: bool,
+) -> DynResult<(String, String)> {
+    match crow.open_manifest_kind(cap)? {
+        ManifestKind::File(manifest) => Ok((
+            format_size(manifest.file_size as usize),
+            manifest.mime_type.to_string(),
+        )),
+        ManifestKind::Directory(manifest) => {
+            let size = match directory_logical_size(crow, &manifest)? {
+                Some(bytes) => format_size_u64(bytes),
+                None if long => "unknown".into(),
+                None => "?".into(),
+            };
+            Ok((size, "directory".into()))
+        }
+    }
 }
 
 fn cmd_mkdir(catalog: &CatalogIndex, path: &str, parents: bool) -> DynResult<()> {
@@ -701,12 +774,12 @@ fn cmd_put_dir(
     Ok(())
 }
 
-fn cmd_get_dir(
+fn cmd_cap_dir(
     crow: &Crow<FsStore>,
+    pins: &PinIndex,
     catalog: &CatalogIndex,
     path: &str,
-    out: &str,
-    yes: bool,
+    name: Option<String>,
 ) -> DynResult<()> {
     let path = CatalogPath::normalize(path)?;
     let view = catalog.view()?;
@@ -714,26 +787,138 @@ fn cmd_get_dir(
         return Err(format!("catalog path not found: {path}").into());
     };
     if !entry.is_dir() {
-        return Err(format!("{path} is a file; use `crow get`").into());
+        return Err(format!("{path} is a file; directory caps require a directory").into());
     }
 
+    let manifest = directory_manifest_from_catalog(&view, &path)?;
+    let cap = crow.put_directory_manifest(&manifest)?;
+    let pin_name = name.or_else(|| directory_snapshot_name(&path));
+    pins.add(cap.clone(), pin_name, None)?;
+    println!("{}", cap.encode());
+    Ok(())
+}
+
+fn cmd_add_dir(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: &str,
+    dest: &str,
+) -> DynResult<()> {
+    let cap = resolve_cap(pins, arg)?;
+    let manifest = crow.open_directory_manifest(&cap)?;
+    let dest = CatalogPath::normalize(dest)?;
+    if dest.as_str() == "/" {
+        return Err("refusing to add a directory snapshot at catalog root".into());
+    }
+
+    let view = catalog.view()?;
+    if view.get(&dest).is_some() {
+        return Err(format!("destination already exists: {dest}").into());
+    }
+
+    catalog.mkdir(dest.as_str(), true)?;
+    for entry in &manifest.entries {
+        match &entry.kind {
+            DirectoryEntryKind::Dir => {
+                let path = join_catalog_relative(&dest, Path::new(&entry.path))?;
+                catalog.mkdir(path.as_str(), true)?;
+            }
+            DirectoryEntryKind::File { cap, name } => {
+                let path = join_catalog_relative(&dest, Path::new(&entry.path))?;
+                if let Some(parent) = path.parent() {
+                    catalog.mkdir(parent.as_str(), true)?;
+                }
+                catalog.put_file(path.as_str(), Cap::decode(cap)?, name.clone())?;
+            }
+        }
+    }
+
+    println!(
+        "added directory snapshot at {dest} ({} file{} / {} director{})",
+        manifest.file_count(),
+        if manifest.file_count() == 1 { "" } else { "s" },
+        manifest.dir_count(),
+        if manifest.dir_count() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+    );
+    Ok(())
+}
+
+fn cmd_get_dir(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    path: &str,
+    out: &str,
+    yes: bool,
+) -> DynResult<()> {
+    let raw_source = path.trim();
     let out = Path::new(out);
-    if out.exists() {
-        if !out.is_dir() {
-            return Err(format!("output exists and is not a directory: {}", out.display()).into());
+    prepare_get_dir_output(out, yes)?;
+
+    let view = catalog.view()?;
+    if let Ok(path) = CatalogPath::normalize(raw_source) {
+        if let Some(entry) = view.get(&path) {
+            if !entry.is_dir() {
+                return Err(format!("{path} is a file; use `crow get`").into());
+            }
+            let restored_files = restore_catalog_dir(crow, &view, &path, out)?;
+            println!(
+                "restored {} file{} from {path} into {}",
+                restored_files,
+                if restored_files == 1 { "" } else { "s" },
+                out.display(),
+            );
+            return Ok(());
         }
-        if out.read_dir()?.next().is_some() {
-            confirm(
-                &format!(
-                    "Output directory is non-empty: {}. Continue? [y/N] ",
-                    out.display()
-                ),
-                yes,
-            )?;
+        if raw_source.starts_with('/') {
+            return Err(format!("catalog path not found: {path}").into());
         }
     }
 
-    let entries = catalog_subtree_entries(&view, &path);
+    let cap = resolve_cap(pins, raw_source)
+        .map_err(|_| "directory source must be a catalog path or directory cap/prefix")?;
+    let manifest = crow.open_directory_manifest(&cap)?;
+    let restored_files = restore_directory_manifest(crow, &manifest, out)?;
+    println!(
+        "restored {} file{} from directory cap into {}",
+        restored_files,
+        if restored_files == 1 { "" } else { "s" },
+        out.display(),
+    );
+    Ok(())
+}
+
+fn prepare_get_dir_output(out: &Path, yes: bool) -> DynResult<()> {
+    if !out.exists() {
+        return Ok(());
+    }
+    if !out.is_dir() {
+        return Err(format!("output exists and is not a directory: {}", out.display()).into());
+    }
+    if out.read_dir()?.next().is_some() {
+        confirm(
+            &format!(
+                "Output directory is non-empty: {}. Continue? [y/N] ",
+                out.display()
+            ),
+            yes,
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_catalog_dir(
+    crow: &Crow<FsStore>,
+    view: &CatalogView,
+    path: &CatalogPath,
+    out: &Path,
+) -> DynResult<usize> {
+    let entries = catalog_subtree_entries(view, path);
     let mut restored_files = 0usize;
     fs::create_dir_all(out)?;
     for entry in entries.iter().filter(|entry| entry.is_dir()) {
@@ -761,14 +946,45 @@ fn cmd_get_dir(
         fs::write(&target, bytes)?;
         restored_files += 1;
     }
+    Ok(restored_files)
+}
 
-    println!(
-        "restored {} file{} from {path} into {}",
-        restored_files,
-        if restored_files == 1 { "" } else { "s" },
-        out.display(),
-    );
-    Ok(())
+fn restore_directory_manifest(
+    crow: &Crow<FsStore>,
+    manifest: &DirectoryManifest,
+    out: &Path,
+) -> DynResult<usize> {
+    let mut restored_files = 0usize;
+    fs::create_dir_all(out)?;
+
+    for entry in manifest
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, DirectoryEntryKind::Dir))
+    {
+        fs::create_dir_all(out.join(&entry.path))?;
+    }
+
+    for entry in &manifest.entries {
+        let DirectoryEntryKind::File { cap, .. } = &entry.kind else {
+            continue;
+        };
+        let target = out.join(&entry.path);
+        if target.exists() {
+            return Err(
+                format!("refusing to overwrite existing file: {}", target.display()).into(),
+            );
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let cap = Cap::decode(cap)?;
+        let bytes = crow.get_bytes(&cap)?;
+        fs::write(&target, bytes)?;
+        restored_files += 1;
+    }
+
+    Ok(restored_files)
 }
 
 fn cmd_pin(pins: &PinIndex, cap_str: &str, name: Option<String>) -> DynResult<()> {
@@ -1403,6 +1619,66 @@ fn relative_catalog_path(base: &CatalogPath, child: &CatalogPath) -> DynResult<P
     Ok(PathBuf::from(relative))
 }
 
+fn directory_manifest_from_catalog(
+    view: &CatalogView,
+    path: &CatalogPath,
+) -> DynResult<DirectoryManifest> {
+    let mut entries = Vec::new();
+    for entry in catalog_subtree_entries(view, path) {
+        let rel = relative_catalog_path(path, &entry.path)?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let rel = catalog_manifest_relative_path(&rel)?;
+        match &entry.kind {
+            EntryKind::Dir => entries.push(DirectoryEntry::dir(rel)),
+            EntryKind::File { cap, name } => {
+                entries.push(DirectoryEntry::file(rel, cap.clone(), name.clone()));
+            }
+        }
+    }
+    Ok(DirectoryManifest::new(unix_now(), entries)?)
+}
+
+fn directory_logical_size(
+    crow: &Crow<FsStore>,
+    manifest: &DirectoryManifest,
+) -> DynResult<Option<u64>> {
+    let mut total = 0u64;
+    for cap in manifest.file_caps()? {
+        let Ok(file_manifest) = open_manifest(crow, &cap) else {
+            return Ok(None);
+        };
+        total = total.saturating_add(file_manifest.file_size);
+    }
+    Ok(Some(total))
+}
+
+fn directory_snapshot_name(path: &CatalogPath) -> Option<String> {
+    Some(format!("{} snapshot", path.file_name().unwrap_or("root")))
+}
+
+fn catalog_manifest_relative_path(path: &Path) -> DynResult<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                parts.push(
+                    part.to_str()
+                        .ok_or("directory caps require UTF-8 catalog paths")?
+                        .to_string(),
+                );
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err("directory cap paths must be relative".into()),
+        }
+    }
+    if parts.is_empty() {
+        return Err("directory cap path must not be empty".into());
+    }
+    Ok(parts.join("/"))
+}
+
 fn catalog_caps_under(view: &CatalogView, path: &CatalogPath) -> Vec<Cap> {
     view.files()
         .into_iter()
@@ -1675,6 +1951,13 @@ fn format_iso_timestamp(unix_secs: u64) -> String {
     let mi = (r % 3600) / 60;
     let s = r % 60;
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 struct ImportPlan {
@@ -1981,5 +2264,98 @@ mod tests {
         assert!(err.to_string().contains("is cataloged at"));
         assert!(err.to_string().contains("/cataloged.txt"));
         assert!(err.to_string().contains("crow unpin /path"));
+    }
+
+    #[test]
+    fn cap_dir_creates_pinned_directory_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let child = stored_cap(&crow, b"snapshot bytes");
+        catalog.mkdir("/docs/empty", true).unwrap();
+        catalog
+            .put_file("/docs/file.txt", child, Some("file.txt".into()))
+            .unwrap();
+
+        cmd_cap_dir(&crow, &pins, &catalog, "/docs", Some("docs cap".into())).unwrap();
+
+        let records = pins.list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name.as_deref(), Some("docs cap"));
+        let ManifestKind::Directory(manifest) = crow.open_manifest_kind(&records[0].cap).unwrap()
+        else {
+            panic!("expected directory manifest");
+        };
+        assert_eq!(manifest.file_count(), 1);
+        assert_eq!(manifest.dir_count(), 1);
+    }
+
+    #[test]
+    fn get_dir_restores_directory_snapshot_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let child = stored_cap(&crow, b"restored bytes");
+        let manifest = DirectoryManifest::new(
+            123,
+            vec![
+                DirectoryEntry::dir("nested"),
+                DirectoryEntry::file("nested/file.txt", child, Some("file.txt".into())),
+            ],
+        )
+        .unwrap();
+        let cap = crow.put_directory_manifest(&manifest).unwrap();
+
+        let out = tmp.path().join("out");
+        cmd_get_dir(
+            &crow,
+            &pins,
+            &catalog,
+            &cap.encode(),
+            out.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(out.join("nested/file.txt")).unwrap(),
+            b"restored bytes"
+        );
+    }
+
+    #[test]
+    fn add_dir_imports_directory_snapshot_to_catalog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let child = stored_cap(&crow, b"imported bytes");
+        let manifest = DirectoryManifest::new(
+            123,
+            vec![DirectoryEntry::file(
+                "nested/file.txt",
+                child.clone(),
+                Some("file.txt".into()),
+            )],
+        )
+        .unwrap();
+        let cap = crow.put_directory_manifest(&manifest).unwrap();
+        pins.add(cap.clone(), Some("dir".into()), None).unwrap();
+
+        cmd_add_dir(
+            &crow,
+            &pins,
+            &catalog,
+            &cap.manifest_hash.to_string()[..8],
+            "/imported",
+        )
+        .unwrap();
+
+        let path = CatalogPath::normalize("/imported/nested/file.txt").unwrap();
+        let view = catalog.view().unwrap();
+        let entry = view.get(&path).unwrap();
+        assert_eq!(entry.cap().unwrap().encode(), child.encode());
     }
 }
