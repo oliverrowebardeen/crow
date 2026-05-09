@@ -231,18 +231,23 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Drop a pin record. Chunks linger until `crow gc`.
+    /// Drop a flat pin or catalog path. Chunks linger until `crow gc`.
     #[command(
-        long_about = "Remove the pin record for a manifest. The chunks themselves stay \
-                      in the store until `crow gc` sweeps them — so `unpin` is \
-                      reversible (`crow pin <cap>` re-creates the pin and the data is \
-                      still recoverable).\n\
+        long_about = "Remove a flat pin record or detach a local catalog path. The \
+                      chunks themselves stay in the store until `crow gc` sweeps them \
+                      — so `unpin` is reversible if you still have the cap.\n\
+                      \n\
+                      Directories require -r/--recursive so an accidental `crow unpin \
+                      /docs` does not detach a whole subtree silently.\n\
                       \n\
                       Use `crow rm` instead if you want the chunks gone immediately."
     )]
     Unpin {
-        /// Full bech32m capability or hex prefix of a pinned manifest.
+        /// Catalog path, full bech32m capability, or hex prefix of a pinned manifest.
         cap_or_prefix: String,
+        /// Recursively detach a catalog directory subtree.
+        #[arg(short, long)]
+        recursive: bool,
     },
     /// Remove a pin or catalog path AND immediately delete unreferenced chunks.
     #[command(
@@ -277,7 +282,7 @@ enum Command {
         /// Destination catalog path, or existing directory.
         to: String,
     },
-    /// Sweep every chunk and manifest not referenced by any pin.
+    /// Sweep every chunk and manifest not referenced by any pin or catalog path.
     #[command(
         long_about = "Walk every chunk and manifest in the store; delete anything not \
                       referenced by a current pin or catalog path. The catch-all \
@@ -416,7 +421,10 @@ fn run(cli: Cli) -> DynResult<()> {
                     cmd_get_dir(&crow, &catalog, &path, &out, yes)
                 }
                 Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
-                Command::Unpin { cap_or_prefix } => cmd_unpin(&pins, &cap_or_prefix),
+                Command::Unpin {
+                    cap_or_prefix,
+                    recursive,
+                } => cmd_unpin(&pins, &catalog, &cap_or_prefix, recursive),
                 Command::Rm {
                     cap_or_prefix,
                     dry_run,
@@ -770,11 +778,46 @@ fn cmd_pin(pins: &PinIndex, cap_str: &str, name: Option<String>) -> DynResult<()
     Ok(())
 }
 
-fn cmd_unpin(pins: &PinIndex, arg: &str) -> DynResult<()> {
-    let rec = resolve_pin(pins, arg)?;
-    pins.remove(rec.cap.manifest_hash.inner())?;
-    println!("unpinned {}", &rec.manifest_hash_hex[..16]);
-    Ok(())
+fn cmd_unpin(pins: &PinIndex, catalog: &CatalogIndex, arg: &str, recursive: bool) -> DynResult<()> {
+    if let Ok(path) = CatalogPath::normalize(arg) {
+        let view = catalog.view()?;
+        if let Some(entry) = view.get(&path) {
+            if path.as_str() == "/" {
+                return Err("refusing to unpin catalog root".into());
+            }
+            if entry.is_dir() && !recursive {
+                return Err(format!(
+                    "{path} is a directory; use `crow unpin -r {path}` to detach it without deleting chunks"
+                )
+                .into());
+            }
+            let file_count = catalog_caps_under(&view, &path).len();
+            catalog.remove(path.as_str())?;
+            if entry.is_dir() {
+                println!(
+                    "unpinned catalog subtree {path} ({} file{})",
+                    file_count,
+                    if file_count == 1 { "" } else { "s" },
+                );
+            } else {
+                println!("unpinned catalog path {path}");
+            }
+            println!("chunks kept; run `crow gc` to sweep unreferenced data");
+            return Ok(());
+        }
+    }
+
+    match resolve_pin(pins, arg) {
+        Ok(rec) => {
+            pins.remove(rec.cap.manifest_hash.inner())?;
+            println!("unpinned {}", &rec.manifest_hash_hex[..16]);
+            Ok(())
+        }
+        Err(e) => match catalog_matches_arg(catalog, arg)? {
+            matches if matches.is_empty() => Err(e),
+            matches => Err(format_catalog_unpin_hint(arg, &matches).into()),
+        },
+    }
 }
 
 fn cmd_rm(
@@ -1376,6 +1419,54 @@ fn catalog_caps_not_under(view: &CatalogView, path: &CatalogPath) -> Vec<Cap> {
         .collect()
 }
 
+fn catalog_matches_arg(catalog: &CatalogIndex, arg: &str) -> DynResult<Vec<CatalogPath>> {
+    let arg = arg.trim();
+    let view = catalog.view()?;
+    let mut paths: Vec<CatalogPath> = if arg.starts_with("crow1") {
+        let cap = Cap::decode(arg)?;
+        view.files()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .cap()
+                    .is_some_and(|entry_cap| entry_cap.manifest_hash == cap.manifest_hash)
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
+    } else if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let prefix = arg.to_ascii_lowercase();
+        view.files()
+            .into_iter()
+            .filter(|entry| {
+                entry.cap().is_some_and(|cap| {
+                    cap.manifest_hash
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .starts_with(&prefix)
+                })
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    paths.sort();
+    Ok(paths)
+}
+
+fn format_catalog_unpin_hint(arg: &str, paths: &[CatalogPath]) -> String {
+    let mut msg = format!("'{arg}' is not a flat pin, but it is cataloged at:");
+    for path in paths.iter().take(8) {
+        msg.push_str("\n  ");
+        msg.push_str(path.as_str());
+    }
+    if paths.len() > 8 {
+        msg.push_str(&format!("\n  ... and {} more", paths.len() - 8));
+    }
+    msg.push_str("\nuse `crow unpin /path` to detach a catalog entry without deleting chunks");
+    msg
+}
+
 fn catalog_path_contains(parent: &CatalogPath, child: &CatalogPath) -> bool {
     if parent.as_str() == "/" {
         return child.as_str() != "/";
@@ -1765,6 +1856,11 @@ mod tests {
         )
     }
 
+    fn stored_cap(crow: &Crow<FsStore>, payload: &[u8]) -> Cap {
+        crow.put_bytes(payload, "text/plain", ErasureParams::default())
+            .unwrap()
+    }
+
     #[test]
     fn fetch_without_name_preserves_existing_pin_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1797,5 +1893,93 @@ mod tests {
         let (name, comment) = fetch_pin_metadata(&pins, &cap, Some("new.pdf".into())).unwrap();
         assert_eq!(name.as_deref(), Some("new.pdf"));
         assert_eq!(comment.as_deref(), Some("keep this"));
+    }
+
+    #[test]
+    fn unpin_catalog_file_detaches_without_deleting_chunks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"keep bytes");
+        catalog
+            .put_file("/note.txt", cap.clone(), Some("note.txt".into()))
+            .unwrap();
+
+        cmd_unpin(&pins, &catalog, "/note.txt", false).unwrap();
+
+        let path = CatalogPath::normalize("/note.txt").unwrap();
+        assert!(catalog.view().unwrap().get(&path).is_none());
+        assert!(
+            crow.store()
+                .has(Namespace::Manifests, cap.manifest_hash.inner())
+                .unwrap()
+        );
+        assert_eq!(crow.get_bytes(&cap).unwrap(), b"keep bytes");
+    }
+
+    #[test]
+    fn unpin_catalog_dir_requires_recursive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0x11);
+        catalog.mkdir("/docs", false).unwrap();
+        catalog
+            .put_file("/docs/a.txt", cap, Some("a.txt".into()))
+            .unwrap();
+
+        let err = cmd_unpin(&pins, &catalog, "/docs", false).expect_err("expected error");
+
+        assert!(err.to_string().contains("use `crow unpin -r /docs`"));
+        let path = CatalogPath::normalize("/docs/a.txt").unwrap();
+        assert!(catalog.view().unwrap().get(&path).is_some());
+    }
+
+    #[test]
+    fn unpin_catalog_dir_recursive_detaches_subtree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog
+            .put_file(
+                "/docs/a.txt",
+                cap_with_hash_byte(0x21),
+                Some("a.txt".into()),
+            )
+            .unwrap();
+        catalog
+            .put_file(
+                "/docs/nested/b.txt",
+                cap_with_hash_byte(0x22),
+                Some("b.txt".into()),
+            )
+            .unwrap();
+
+        cmd_unpin(&pins, &catalog, "/docs", true).unwrap();
+
+        let docs = CatalogPath::normalize("/docs").unwrap();
+        let nested = CatalogPath::normalize("/docs/nested/b.txt").unwrap();
+        let view = catalog.view().unwrap();
+        assert!(view.get(&docs).is_none());
+        assert!(view.get(&nested).is_none());
+    }
+
+    #[test]
+    fn unpin_full_cap_hint_lists_catalog_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0x31);
+        catalog
+            .put_file("/cataloged.txt", cap.clone(), Some("cataloged.txt".into()))
+            .unwrap();
+
+        let err = cmd_unpin(&pins, &catalog, &cap.encode(), false).expect_err("expected error");
+
+        assert!(err.to_string().contains("is cataloged at"));
+        assert!(err.to_string().contains("/cataloged.txt"));
+        assert!(err.to_string().contains("crow unpin /path"));
     }
 }

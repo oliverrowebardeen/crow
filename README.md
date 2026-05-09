@@ -74,7 +74,7 @@ crow mv <from-path> <to-path>
 crow put-dir <local-dir> [catalog-dir] [--yes]
 crow get-dir <catalog-dir> <local-dir> [--yes]
 crow pin  <cap> [--name NAME]
-crow unpin <cap-or-prefix>
+crow unpin [-r] <path-or-cap-or-prefix>
 crow rm   <path-or-cap-or-prefix> [--dry-run]
 crow gc   [--dry-run]
 crow stat
@@ -142,6 +142,8 @@ crow ls /docs/projects
 crow info /docs/projects/report.pdf
 crow get /docs/projects/report.pdf restored.pdf
 crow mv /docs/projects/report.pdf /docs/projects/q2-report.pdf
+crow unpin /docs/projects/q2-report.pdf       # detach path; chunks remain until gc
+crow unpin -r /docs/projects                  # detach a directory subtree
 crow rm /docs/projects/q2-report.pdf --dry-run
 ```
 
@@ -153,7 +155,7 @@ crow put-dir ./Photos /photos --yes
 crow get-dir /photos ./RestoredPhotos
 ```
 
-`put-dir` recursively stores regular files and records directory entries in the local catalog. Symlinks are rejected. `get-dir` reconstructs a catalog subtree into a normal filesystem directory and refuses to overwrite existing files.
+`put-dir` recursively stores regular files and records directory entries in the local catalog. Symlinks are rejected. `get-dir` creates the output directory if it does not exist, reconstructs the catalog subtree into it, and refuses to overwrite existing files.
 
 ### Pinning and garbage collection
 
@@ -161,12 +163,12 @@ crow get-dir /photos ./RestoredPhotos
 
 ```sh
 crow pin <cap> [--name NAME]          # add a flat pin (e.g. for a cap shared by someone else)
-crow unpin <cap-or-prefix>            # drop the flat pin; chunks linger until `crow gc`
+crow unpin [-r] <path-or-cap-or-prefix> # drop a flat pin or catalog path; chunks linger until `crow gc`
 crow rm    <path-or-cap-or-prefix>    # drop the pin/path AND delete chunks not held elsewhere
 crow gc    [--dry-run]                # sweep chunks/manifests not referenced by any pin or catalog path
 ```
 
-The split between `unpin` and `rm` is deliberate: `unpin` is reversible (re-pinning the same cap brings it back, since the chunks are still on disk), while `rm` is the unix-style "delete now." Use `--dry-run` on `rm` and `gc` to see what would happen before committing.
+The split between `unpin` and `rm` is deliberate: `unpin` is reversible if you still have the cap, since the chunks are still on disk, while `rm` is the unix-style "delete now." Catalog directories require `crow unpin -r /path` so a typo does not detach a whole subtree silently. Use `--dry-run` on `rm` and `gc` to see what would happen before committing.
 
 ### Personal-cluster fetch
 
@@ -348,12 +350,12 @@ BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed–
 
 Several devices owned by one user, on the same network, syncing files between them.
 
-1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, owner-pinning mark-and-sweep, and hash-prefix resolution for every command that takes a flat pin.
+1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
 2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted manifests and shares from a known peer after shared-token authorization.
-3. **mDNS discovery.** Daemons announce themselves on the local network the same way AirPrint and Chromecast do; other Crows on the same Wi-Fi automatically add them to a peer list. No central server, no DHT.
-4. **Replication policy.** Each device watches its pinned manifests and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
+3. **mDNS discovery — next.** Daemons announce themselves on the local network the same way AirPrint and Chromecast do; other Crows on the same Wi-Fi automatically add them to a peer list. Implementation should add a local peer registry, advertise the existing QUIC bind address plus device id, and let `crow fetch` accept a discovered device alias instead of only a raw socket address. No central server, no DHT.
+4. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
 5. **Replicated metadata sync.** Merge the local catalog event logs across devices, then add ACLs, version history, and holder hints. The on-disk catalog is already operation-log-shaped so this is a sync/merge step rather than a catalog rewrite.
-6. **Identity wiring.** Sign manifests with the Ed25519 key Crow already generates; verify the signature before pinning so a foreign device on the same Wi-Fi can't inject pins into your fleet.
+6. **Identity wiring.** Sign manifests with the Ed25519 key Crow already generates; verify the signature before pinning so a foreign device on the same Wi-Fi can't inject pins or catalog entries into your fleet.
 
 ### Phase 2 — cross-person sharing
 
