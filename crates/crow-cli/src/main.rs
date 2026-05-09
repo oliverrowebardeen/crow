@@ -8,7 +8,7 @@ use crow::{
     Cap, ChunkStore, Crow, DEFAULT_CHUNK_SIZE, ErasureParams, FsStore, GcOptions, Manifest,
     Namespace, PinIndex, PinRecord, compute_live_set,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
-    targeted_remove,
+    sweep, targeted_remove,
 };
 
 #[derive(Parser)]
@@ -69,6 +69,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Sweep every chunk and manifest not referenced by any current pin.
+    Gc {
+        /// Print what would be deleted without touching disk.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show storage stats.
     Stat,
 }
@@ -108,6 +114,7 @@ fn run(cli: Cli) -> DynResult<()> {
             cap_or_prefix,
             dry_run,
         } => cmd_rm(&crow, &pins, &cap_or_prefix, dry_run),
+        Command::Gc { dry_run } => cmd_gc(&crow, &pins, dry_run),
         Command::Stat => cmd_stat(&crow, &pins),
     }
 }
@@ -282,6 +289,37 @@ fn cmd_rm(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str, dry_run: bool) -> Dy
         report.deleted_chunks,
         if report.deleted_chunks == 1 { "" } else { "s" },
         format_size_u64(report.deleted_bytes),
+    );
+    Ok(())
+}
+
+fn cmd_gc(crow: &Crow<FsStore>, pins: &PinIndex, dry_run: bool) -> DynResult<()> {
+    let pin_caps: Vec<Cap> = pins.list()?.into_iter().map(|r| r.cap).collect();
+    let live = compute_live_set(crow.store(), &pin_caps)?;
+    let report = sweep(crow.store(), &live, GcOptions { dry_run })?;
+    let action = if dry_run { "would delete" } else { "deleted" };
+    if report.deleted_manifests + report.deleted_chunks == 0 {
+        println!("{action} 0 manifests / 0 chunks (nothing to do)");
+    } else {
+        println!(
+            "{action} {} manifest{} / {} chunk{} ({})",
+            report.deleted_manifests,
+            if report.deleted_manifests == 1 {
+                ""
+            } else {
+                "s"
+            },
+            report.deleted_chunks,
+            if report.deleted_chunks == 1 { "" } else { "s" },
+            format_size_u64(report.deleted_bytes),
+        );
+    }
+    println!(
+        "kept {} manifest{} / {} chunk{}",
+        report.kept_manifests,
+        if report.kept_manifests == 1 { "" } else { "s" },
+        report.kept_chunks,
+        if report.kept_chunks == 1 { "" } else { "s" },
     );
     Ok(())
 }
