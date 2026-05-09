@@ -15,7 +15,28 @@ use crow::{
 #[command(
     name = "crow",
     version,
-    about = "decentralized, content-addressed file storage"
+    about = "Decentralized, content-addressed file storage.",
+    long_about = "Decentralized, content-addressed file storage with Tahoe-LAFS-style \
+                  capabilities. Files get chunked, encrypted, erasure-coded, and stored \
+                  by the BLAKE3 hash of their bytes; the pointer to a file is a small \
+                  bech32m \"crow1…\" capability that bundles the manifest hash and its \
+                  decryption key.\n\
+                  \n\
+                  Quick start:\n\
+                  \n  \
+                  crow put report.pdf              # store, auto-pin, print cap\n  \
+                  crow ls                          # list pinned files\n  \
+                  crow info <4-char prefix>        # show metadata + pin status\n  \
+                  crow get <prefix> restored.pdf   # retrieve\n  \
+                  crow rm <prefix>                 # delete pin and chunks\n  \
+                  crow gc                          # sweep anything not pinned\n\
+                  \n\
+                  Most commands accept either a full crow1… capability or a hex prefix \
+                  of the manifest hash; ambiguous prefixes get an explicit error.\n\
+                  \n\
+                  Storage lives at $CROW_HOME, defaulting to $HOME/.crow.\n\
+                  \n\
+                  See `crow <command> --help` for per-command details."
 )]
 struct Cli {
     /// Storage directory. Defaults to $CROW_HOME, then $HOME/.crow.
@@ -28,7 +49,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Store a file; print its capability on stdout.
+    /// Store a file, auto-pin it, print its capability on stdout.
+    #[command(
+        long_about = "Encrypt, chunk, erasure-code, and store the bytes; record a pin \
+                      so chunks survive `crow gc`; print the resulting bech32m cap.\n\
+                      \n\
+                      The default pin name is the basename of the input file, or \
+                      `(unnamed)` for stdin. Use --name to override.\n\
+                      \n\
+                      Each `crow put` generates fresh keys, so the same input bytes \
+                      produce a different cap each time. Content addressing happens at \
+                      the share level, not the cap.\n\
+                      \n\
+                      Examples:\n  \
+                      crow put report.pdf\n  \
+                      crow put image.png --name screenshot.png\n  \
+                      tar cf - ~/Documents | crow put -"
+    )]
     Put {
         /// File to store. "-" reads from stdin.
         path: String,
@@ -43,42 +80,121 @@ enum Command {
         chunk_size: Option<u32>,
     },
     /// Retrieve a file by capability or hash prefix.
+    #[command(
+        long_about = "Resolve a full crow1… capability or a hex prefix of the manifest \
+                      hash, fetch the encrypted manifest, decrypt it, reconstruct the \
+                      file (using parity to recover any missing data shares), and \
+                      write it to <OUT>.\n\
+                      \n\
+                      <OUT> may be \"-\" for stdout, useful in pipelines.\n\
+                      \n\
+                      Examples:\n  \
+                      crow get crow1qyq…m0r restored.pdf\n  \
+                      crow get 3b52 ./out.bin\n  \
+                      crow get <prefix> - | tar xf -"
+    )]
     Get {
+        /// Full bech32m capability (`crow1…`) or hex prefix of the manifest hash.
         cap_or_prefix: String,
         /// Output path. "-" writes to stdout.
         out: String,
     },
     /// Print metadata for a capability or hash prefix.
-    Info { cap_or_prefix: String },
+    #[command(
+        long_about = "Decrypt and inspect the manifest behind a capability. Shows the \
+                      manifest hash, file size, MIME type, erasure params, stripe and \
+                      share counts, chunk size, creation timestamp, the algorithm \
+                      tuple, and pin status (name + pinned timestamp, or `pinned no`).\n\
+                      \n\
+                      Accepts either a full crow1… capability or a hex prefix of the \
+                      manifest hash. Caps that aren't pinned still resolve via their \
+                      full string."
+    )]
+    Info {
+        /// Full bech32m capability (`crow1…`) or hex prefix of a pinned manifest.
+        cap_or_prefix: String,
+    },
     /// List every pinned manifest.
+    #[command(
+        long_about = "List every pinned manifest, sorted by pin time (newest first). \
+                      Default columns: 8-char hash prefix, file size, MIME type, \
+                      pinned date (YYYY-MM-DD), name. --long shows the full hash, full \
+                      MIME, and an ISO-8601 timestamp."
+    )]
     Ls {
         /// Show full hashes, full mime types, and ISO timestamps.
         #[arg(short, long)]
         long: bool,
     },
     /// Pin a capability so its chunks survive `crow gc`.
+    #[command(
+        long_about = "Add a pin record for an externally-supplied capability — for \
+                      example, a cap shared by another device or a friend. The chunks \
+                      themselves still need to be present in the local store; pinning \
+                      a cap whose chunks aren't yet local is harmless and won't fetch \
+                      anything (Phase 1 step 2 will).\n\
+                      \n\
+                      `crow put` already auto-pins, so this command is mostly used \
+                      after `crow unpin` (re-pin) or with caps acquired out of band."
+    )]
     Pin {
+        /// Full bech32m capability (`crow1…`) to pin.
         cap: String,
+        /// Friendly name for the pin (shown in `crow ls`).
         #[arg(long)]
         name: Option<String>,
     },
-    /// Remove a pin record. Chunks linger until `crow gc` runs.
-    Unpin { cap_or_prefix: String },
-    /// Remove a pin and immediately delete its chunks (those not held by
-    /// another pin).
+    /// Drop a pin record. Chunks linger until `crow gc`.
+    #[command(
+        long_about = "Remove the pin record for a manifest. The chunks themselves stay \
+                      in the store until `crow gc` sweeps them — so `unpin` is \
+                      reversible (`crow pin <cap>` re-creates the pin and the data is \
+                      still recoverable).\n\
+                      \n\
+                      Use `crow rm` instead if you want the chunks gone immediately."
+    )]
+    Unpin {
+        /// Full bech32m capability or hex prefix of a pinned manifest.
+        cap_or_prefix: String,
+    },
+    /// Remove a pin AND immediately delete its chunks.
+    #[command(
+        long_about = "Remove the pin record AND delete this manifest's chunks (those \
+                      not also held by another pin). Targeted, immediate, not \
+                      deferred — the unix-style \"delete now.\"\n\
+                      \n\
+                      Use --dry-run to see what would be deleted before committing.\n\
+                      \n\
+                      Use `crow unpin` instead if you might want to re-pin later."
+    )]
     Rm {
+        /// Full bech32m capability or hex prefix of a pinned manifest.
         cap_or_prefix: String,
         /// Print what would be deleted without touching disk.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Sweep every chunk and manifest not referenced by any current pin.
+    /// Sweep every chunk and manifest not referenced by any pin.
+    #[command(
+        long_about = "Walk every chunk and manifest in the store; delete anything not \
+                      referenced by a current pin. The catch-all complement to `crow \
+                      rm` — cleans up after `crow unpin`, crashed puts, manually-\
+                      removed pins, etc.\n\
+                      \n\
+                      --dry-run reports what would be freed without touching disk; \
+                      run it first if you're not sure."
+    )]
     Gc {
         /// Print what would be deleted without touching disk.
         #[arg(long)]
         dry_run: bool,
     },
     /// Show storage stats.
+    #[command(
+        long_about = "Print the storage path, total manifest and chunk counts and \
+                      sizes, the number of pins, and how much would be freed by `crow \
+                      gc` (unreferenced manifests + chunks)."
+    )]
     Stat,
 }
 
