@@ -110,6 +110,14 @@ impl ChunkStore for FsStore {
         }
         Ok(out)
     }
+
+    fn size(&self, ns: Namespace, hash: &Hash) -> Result<Option<u64>> {
+        match fs::metadata(self.path(ns, hash)) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
 }
 
 #[cfg(test)]

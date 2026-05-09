@@ -38,6 +38,14 @@ pub trait ChunkStore: Send + Sync {
     /// Enumerate every hash currently stored in `ns`. Used by garbage
     /// collection and `crow stat`. Order is unspecified.
     fn list(&self, ns: Namespace) -> Result<Vec<Hash>>;
+
+    /// Byte size of a stored chunk. Returns None if the hash is absent.
+    /// Default implementation reads the bytes — backends should override
+    /// with a metadata-only path when one is available (e.g. fs::metadata
+    /// for FsStore).
+    fn size(&self, ns: Namespace, hash: &Hash) -> Result<Option<u64>> {
+        Ok(self.get(ns, hash)?.map(|b| b.len() as u64))
+    }
 }
 
 #[derive(Default)]
@@ -133,6 +141,9 @@ impl<T: ChunkStore + ?Sized> ChunkStore for &T {
     fn list(&self, ns: Namespace) -> Result<Vec<Hash>> {
         (**self).list(ns)
     }
+    fn size(&self, ns: Namespace, hash: &Hash) -> Result<Option<u64>> {
+        (**self).size(ns, hash)
+    }
 }
 
 impl<T: ChunkStore + ?Sized> ChunkStore for Arc<T> {
@@ -153,6 +164,9 @@ impl<T: ChunkStore + ?Sized> ChunkStore for Arc<T> {
     }
     fn list(&self, ns: Namespace) -> Result<Vec<Hash>> {
         (**self).list(ns)
+    }
+    fn size(&self, ns: Namespace, hash: &Hash) -> Result<Option<u64>> {
+        (**self).size(ns, hash)
     }
 }
 
