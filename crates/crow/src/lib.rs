@@ -21,6 +21,7 @@ pub mod cap;
 pub mod catalog;
 pub mod chunk;
 pub mod crypto;
+pub mod dir_manifest;
 pub mod erasure;
 pub mod error;
 pub mod fs_store;
@@ -35,6 +36,10 @@ pub use cap::{CAP_HRP, CAP_VERSION, Cap, Permission};
 pub use catalog::{CatalogEntry, CatalogIndex, CatalogOp, CatalogPath, CatalogView, EntryKind};
 pub use chunk::{ChunkStore, MemStore, Namespace};
 pub use crypto::{FileKey, ManifestKey};
+pub use dir_manifest::{
+    DIRECTORY_MANIFEST_MAGIC, DIRECTORY_MANIFEST_VERSION, DirectoryEntry, DirectoryEntryKind,
+    DirectoryManifest,
+};
 pub use erasure::{DEFAULT_CHUNK_SIZE, ErasureParams};
 pub use error::{Error, Result};
 pub use fs_store::FsStore;
@@ -48,4 +53,4 @@ pub use manifest::{
     Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, Stripe,
 };
 pub use pin::{PinIndex, PinRecord};
-pub use pipeline::Crow;
+pub use pipeline::{Crow, ManifestKind};

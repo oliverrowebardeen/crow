@@ -5,6 +5,7 @@ use bytes::Bytes;
 use crate::cap::Cap;
 use crate::chunk::{ChunkStore, Namespace};
 use crate::crypto::{self, FileKey, ManifestKey};
+use crate::dir_manifest::DirectoryManifest;
 use crate::erasure::{self, DEFAULT_CHUNK_SIZE, ErasureParams};
 use crate::error::{Error, Result};
 use crate::hash::{ChunkHash, Hash, ManifestHash};
@@ -14,6 +15,12 @@ use crate::manifest::{Algorithm, MANIFEST_VERSION, Manifest, Stripe};
 /// layers together. Generic over any [`ChunkStore`] backend.
 pub struct Crow<S: ChunkStore> {
     store: S,
+}
+
+#[derive(Clone, Debug)]
+pub enum ManifestKind {
+    File(Manifest),
+    Directory(DirectoryManifest),
 }
 
 impl<S: ChunkStore> Crow<S> {
@@ -134,6 +141,46 @@ impl<S: ChunkStore> Crow<S> {
         )?;
 
         Ok(Cap::new_read(manifest_hash, manifest_key))
+    }
+
+    /// Store an immutable directory snapshot manifest and return a read cap.
+    pub fn put_directory_manifest(&self, manifest: &DirectoryManifest) -> Result<Cap> {
+        manifest.validate()?;
+        let manifest_key = ManifestKey::random();
+        let sealed = manifest.seal(&manifest_key)?;
+        let manifest_hash_inner = Hash::of(&sealed);
+        let manifest_hash = ManifestHash(manifest_hash_inner);
+        self.store.put_unverified(
+            Namespace::Manifests,
+            manifest_hash_inner,
+            Bytes::from(sealed),
+        )?;
+        Ok(Cap::new_read(manifest_hash, manifest_key))
+    }
+
+    pub fn open_directory_manifest(&self, cap: &Cap) -> Result<DirectoryManifest> {
+        let encrypted_manifest = self
+            .store
+            .get(Namespace::Manifests, cap.manifest_hash.inner())?
+            .ok_or_else(|| Error::MissingChunk(format!("manifest {}", cap.manifest_hash)))?;
+        DirectoryManifest::open(&encrypted_manifest, &cap.manifest_key)
+    }
+
+    pub fn open_manifest_kind(&self, cap: &Cap) -> Result<ManifestKind> {
+        let encrypted_manifest = self
+            .store
+            .get(Namespace::Manifests, cap.manifest_hash.inner())?
+            .ok_or_else(|| Error::MissingChunk(format!("manifest {}", cap.manifest_hash)))?;
+
+        match DirectoryManifest::open(&encrypted_manifest, &cap.manifest_key) {
+            Ok(manifest) => Ok(ManifestKind::Directory(manifest)),
+            Err(directory_error) => match Manifest::open(&encrypted_manifest, &cap.manifest_key) {
+                Ok(manifest) => Ok(ManifestKind::File(manifest)),
+                Err(file_error) => Err(Error::Manifest(format!(
+                    "not a supported manifest: directory error: {directory_error}; file error: {file_error}"
+                ))),
+            },
+        }
     }
 
     /// Reconstruct the bytes referenced by `cap`, using parity to recover any

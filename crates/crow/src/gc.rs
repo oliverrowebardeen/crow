@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use crate::cap::Cap;
 use crate::catalog::CatalogView;
 use crate::chunk::{ChunkStore, Namespace};
+use crate::dir_manifest::DirectoryManifest;
 use crate::error::Result;
 use crate::hash::Hash;
 use crate::manifest::Manifest;
@@ -38,21 +39,45 @@ pub struct GcReport {
 /// manifest is gone and there's nothing for them to mark.
 pub fn compute_live_set<S: ChunkStore>(store: &S, caps: &[Cap]) -> Result<LiveSet> {
     let mut live: LiveSet = HashSet::new();
+    let mut visited_manifests = HashSet::new();
     for cap in caps {
-        let manifest_hash = *cap.manifest_hash.inner();
-        let encrypted = match store.get(Namespace::Manifests, &manifest_hash)? {
-            Some(b) => b,
-            None => continue,
-        };
-        live.insert((Namespace::Manifests, manifest_hash));
-        let manifest = Manifest::open(&encrypted, &cap.manifest_key)?;
-        for stripe in &manifest.stripes {
-            for chunk_hash in stripe.data.iter().chain(stripe.parity.iter()) {
-                live.insert((Namespace::Chunks, *chunk_hash.inner()));
+        mark_cap(store, cap, &mut live, &mut visited_manifests)?;
+    }
+    Ok(live)
+}
+
+fn mark_cap<S: ChunkStore>(
+    store: &S,
+    cap: &Cap,
+    live: &mut LiveSet,
+    visited_manifests: &mut HashSet<Hash>,
+) -> Result<()> {
+    let manifest_hash = *cap.manifest_hash.inner();
+    if !visited_manifests.insert(manifest_hash) {
+        return Ok(());
+    }
+    let encrypted = match store.get(Namespace::Manifests, &manifest_hash)? {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    live.insert((Namespace::Manifests, manifest_hash));
+
+    match DirectoryManifest::open(&encrypted, &cap.manifest_key) {
+        Ok(directory) => {
+            for child_cap in directory.file_caps()? {
+                mark_cap(store, &child_cap, live, visited_manifests)?;
+            }
+        }
+        Err(_) => {
+            let manifest = Manifest::open(&encrypted, &cap.manifest_key)?;
+            for stripe in &manifest.stripes {
+                for chunk_hash in stripe.data.iter().chain(stripe.parity.iter()) {
+                    live.insert((Namespace::Chunks, *chunk_hash.inner()));
+                }
             }
         }
     }
-    Ok(live)
+    Ok(())
 }
 
 /// Compute live chunks referenced by the current catalog view.
@@ -140,6 +165,7 @@ mod tests {
     use super::*;
     use crate::catalog::CatalogIndex;
     use crate::chunk::MemStore;
+    use crate::dir_manifest::{DirectoryEntry, DirectoryManifest};
     use crate::erasure::ErasureParams;
     use crate::pipeline::Crow;
     use tempfile::TempDir;
@@ -332,5 +358,56 @@ mod tests {
         assert_eq!(report.deleted_manifests, 0);
         assert_eq!(crow.get_bytes(&pinned).unwrap(), b"flat pin");
         assert_eq!(crow.get_bytes(&cataloged).unwrap(), b"catalog path");
+    }
+
+    #[test]
+    fn directory_manifest_cap_keeps_children_alive() {
+        let crow = Crow::new(MemStore::new());
+        let child = put(&crow, b"child bytes");
+        let dir = DirectoryManifest::new(
+            123,
+            vec![DirectoryEntry::file(
+                "child.txt",
+                child.clone(),
+                Some("child.txt".into()),
+            )],
+        )
+        .unwrap();
+        let dir_cap = crow.put_directory_manifest(&dir).unwrap();
+
+        let live = compute_live_set(crow.store(), std::slice::from_ref(&dir_cap)).unwrap();
+        let report = sweep(crow.store(), &live, GcOptions::default()).unwrap();
+
+        assert_eq!(report.deleted_chunks, 0);
+        assert_eq!(report.deleted_manifests, 0);
+        assert_eq!(crow.get_bytes(&child).unwrap(), b"child bytes");
+    }
+
+    #[test]
+    fn targeted_remove_preserves_child_held_by_directory_cap() {
+        let crow = Crow::new(MemStore::new());
+        let child = put(&crow, b"shared through dir");
+        let dir = DirectoryManifest::new(
+            123,
+            vec![DirectoryEntry::file(
+                "child.txt",
+                child.clone(),
+                Some("child.txt".into()),
+            )],
+        )
+        .unwrap();
+        let dir_cap = crow.put_directory_manifest(&dir).unwrap();
+
+        let report = targeted_remove(
+            crow.store(),
+            std::slice::from_ref(&child),
+            std::slice::from_ref(&dir_cap),
+            GcOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.deleted_chunks, 0);
+        assert_eq!(report.deleted_manifests, 0);
+        assert_eq!(crow.get_bytes(&child).unwrap(), b"shared through dir");
     }
 }
