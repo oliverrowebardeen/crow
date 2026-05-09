@@ -8,6 +8,9 @@ pub enum Error {
     #[error("invalid capability: {0}")]
     Cap(String),
 
+    #[error("catalog error: {0}")]
+    Catalog(String),
+
     #[error("invalid manifest: {0}")]
     Manifest(String),
 
