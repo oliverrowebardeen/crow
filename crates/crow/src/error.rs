@@ -33,6 +33,9 @@ pub enum Error {
     #[error("invalid hash: {0}")]
     Hash(String),
 
+    #[error("identity error: {0}")]
+    Identity(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

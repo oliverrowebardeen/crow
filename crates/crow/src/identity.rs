@@ -1,18 +1,34 @@
+use std::fs;
+use std::path::Path;
+
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::error::{Error, Result};
+
+const IDENTITY_FILE: &str = "identity.json";
+const IDENTITY_VERSION: u8 = 1;
+
 /// Per-device identity: an Ed25519 signing keypair plus an X25519 key-exchange
-/// keypair. Both are placeholders this version — neither is wired into the
-/// pipeline yet.
+/// keypair.
 ///
-/// The Ed25519 key will eventually populate `Manifest::creator_pubkey` and
-/// sign manifests for owner-pinning. The X25519 key is reserved for future
-/// peer-to-peer transport authentication. Generation lives here now so those
-/// passes are additive and do not change manifest hashes when they land.
+/// The Ed25519 key is the durable handle for a Crow node — it's what mDNS
+/// advertises (truncated, in the instance name; in full, in the TXT records),
+/// what `crow peers` displays, and what manifest signing will use once Phase 1
+/// step 6 lands. The X25519 key is held in reserve for future peer-to-peer
+/// authentication.
 pub struct Identity {
     pub signing: SigningKey,
     pub kx: StaticSecret,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IdentityJson {
+    version: u8,
+    signing_secret: String,
+    kx_secret: String,
 }
 
 impl Identity {
@@ -29,6 +45,57 @@ impl Identity {
 
     pub fn kx_pubkey(&self) -> [u8; 32] {
         PublicKey::from(&self.kx).to_bytes()
+    }
+
+    /// Load the identity from `<home>/identity.json`, generating and persisting
+    /// a fresh one if the file does not exist. Idempotent: a second call at
+    /// the same `home` returns the same identity bytes.
+    pub fn load_or_create(home: impl AsRef<Path>) -> Result<Self> {
+        let home = home.as_ref();
+        let path = home.join(IDENTITY_FILE);
+        if path.exists() {
+            Self::load(&path)
+        } else {
+            let identity = Self::random();
+            identity.save(home)?;
+            Ok(identity)
+        }
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)?;
+        let json: IdentityJson = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Identity(format!("deserialize {}: {e}", path.display())))?;
+        if json.version != IDENTITY_VERSION {
+            return Err(Error::Identity(format!(
+                "unsupported identity version {}; this build supports {}",
+                json.version, IDENTITY_VERSION
+            )));
+        }
+        let signing_bytes = decode_hex32(&json.signing_secret)
+            .ok_or_else(|| Error::Identity("signing_secret must be 64 hex chars".into()))?;
+        let kx_bytes = decode_hex32(&json.kx_secret)
+            .ok_or_else(|| Error::Identity("kx_secret must be 64 hex chars".into()))?;
+        Ok(Self {
+            signing: SigningKey::from_bytes(&signing_bytes),
+            kx: StaticSecret::from(kx_bytes),
+        })
+    }
+
+    fn save(&self, home: &Path) -> Result<()> {
+        fs::create_dir_all(home)?;
+        let target = home.join(IDENTITY_FILE);
+        let tmp = home.join(format!("{IDENTITY_FILE}.{}.tmp", std::process::id()));
+        let json = IdentityJson {
+            version: IDENTITY_VERSION,
+            signing_secret: hex(&self.signing.to_bytes()),
+            kx_secret: hex(&self.kx.to_bytes()),
+        };
+        let bytes = serde_json::to_vec_pretty(&json)
+            .map_err(|e| Error::Identity(format!("serialize: {e}")))?;
+        write_private(&tmp, &bytes)?;
+        fs::rename(&tmp, &target)?;
+        Ok(())
     }
 }
 
@@ -50,9 +117,39 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true).mode(0o600);
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn random_produces_distinct_identities() {
@@ -75,8 +172,71 @@ mod tests {
         let dbg = format!("{id:?}");
         assert!(dbg.contains("signing_pubkey"));
         assert!(dbg.contains("kx_pubkey"));
-        // No "secret" or "private" string should appear.
         assert!(!dbg.to_lowercase().contains("secret"));
         assert!(!dbg.to_lowercase().contains("private"));
+    }
+
+    #[test]
+    fn load_or_create_persists_across_calls() {
+        let tmp = TempDir::new().unwrap();
+        let first = Identity::load_or_create(tmp.path()).unwrap();
+        let second = Identity::load_or_create(tmp.path()).unwrap();
+        assert_eq!(first.signing_pubkey(), second.signing_pubkey());
+        assert_eq!(first.kx_pubkey(), second.kx_pubkey());
+    }
+
+    #[test]
+    fn load_or_create_persists_secret_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let first = Identity::load_or_create(tmp.path()).unwrap();
+        let second = Identity::load_or_create(tmp.path()).unwrap();
+        // The actual secrets roundtrip, not just the public half.
+        assert_eq!(first.signing.to_bytes(), second.signing.to_bytes());
+        assert_eq!(first.kx.to_bytes(), second.kx.to_bytes());
+    }
+
+    #[test]
+    fn load_or_create_creates_identity_file() {
+        let tmp = TempDir::new().unwrap();
+        let _ = Identity::load_or_create(tmp.path()).unwrap();
+        assert!(tmp.path().join("identity.json").exists());
+    }
+
+    #[test]
+    fn load_rejects_unknown_version() {
+        let tmp = TempDir::new().unwrap();
+        let bogus = serde_json::json!({
+            "version": 99,
+            "signing_secret": "00".repeat(32),
+            "kx_secret":      "00".repeat(32),
+        });
+        fs::write(
+            tmp.path().join("identity.json"),
+            serde_json::to_vec(&bogus).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Identity::load_or_create(tmp.path()),
+            Err(Error::Identity(_))
+        ));
+    }
+
+    #[test]
+    fn load_rejects_bad_hex() {
+        let tmp = TempDir::new().unwrap();
+        let bogus = serde_json::json!({
+            "version": 1,
+            "signing_secret": "z".repeat(64),
+            "kx_secret":      "00".repeat(32),
+        });
+        fs::write(
+            tmp.path().join("identity.json"),
+            serde_json::to_vec(&bogus).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Identity::load_or_create(tmp.path()),
+            Err(Error::Identity(_))
+        ));
     }
 }
