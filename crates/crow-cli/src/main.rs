@@ -35,18 +35,21 @@ enum Command {
         /// Override MIME type. Default: inferred from extension.
         #[arg(long)]
         mime: Option<String>,
+        /// Override the pin name. Default: file basename, or `(unnamed)` for stdin.
+        #[arg(long)]
+        name: Option<String>,
         /// Override chunk size in bytes. Must satisfy (chunk_size + 16) % 64 == 0.
         #[arg(long)]
         chunk_size: Option<u32>,
     },
-    /// Retrieve a file by its capability.
+    /// Retrieve a file by capability or hash prefix.
     Get {
-        cap: String,
+        cap_or_prefix: String,
         /// Output path. "-" writes to stdout.
         out: String,
     },
-    /// Print metadata for a capability.
-    Info { cap: String },
+    /// Print metadata for a capability or hash prefix.
+    Info { cap_or_prefix: String },
     /// List every pinned manifest.
     Ls {
         /// Show full hashes, full mime types, and ISO timestamps.
@@ -103,10 +106,11 @@ fn run(cli: Cli) -> DynResult<()> {
         Command::Put {
             path,
             mime,
+            name,
             chunk_size,
-        } => cmd_put(&crow, &path, mime, chunk_size),
-        Command::Get { cap, out } => cmd_get(&crow, &cap, &out),
-        Command::Info { cap } => cmd_info(&crow, &cap),
+        } => cmd_put(&crow, &pins, &path, mime, name, chunk_size),
+        Command::Get { cap_or_prefix, out } => cmd_get(&crow, &pins, &cap_or_prefix, &out),
+        Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &cap_or_prefix),
         Command::Ls { long } => cmd_ls(&crow, &pins, long),
         Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
         Command::Unpin { cap_or_prefix } => cmd_unpin(&pins, &cap_or_prefix),
@@ -129,8 +133,10 @@ fn resolve_home(explicit: Option<PathBuf>) -> DynResult<PathBuf> {
 
 fn cmd_put(
     crow: &Crow<FsStore>,
+    pins: &PinIndex,
     path: &str,
     mime: Option<String>,
+    name: Option<String>,
     chunk_size: Option<u32>,
 ) -> DynResult<()> {
     let bytes = read_all(path)?;
@@ -138,24 +144,22 @@ fn cmd_put(
     let chunk_size = chunk_size.unwrap_or_else(|| auto_chunk_size(bytes.len()));
 
     let cap = crow.put_bytes_with(&bytes, &mime_str, ErasureParams::default(), chunk_size)?;
+    let pin_name = name.or_else(|| default_name(path));
+    pins.add(cap.clone(), pin_name, None)?;
     println!("{}", cap.encode());
     Ok(())
 }
 
-fn cmd_get(crow: &Crow<FsStore>, cap_str: &str, out: &str) -> DynResult<()> {
-    let cap = Cap::decode(cap_str.trim())?;
+fn cmd_get(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str, out: &str) -> DynResult<()> {
+    let cap = resolve_cap(pins, arg)?;
     let bytes = crow.get_bytes(&cap)?;
     write_all(out, &bytes)?;
     Ok(())
 }
 
-fn cmd_info(crow: &Crow<FsStore>, cap_str: &str) -> DynResult<()> {
-    let cap = Cap::decode(cap_str.trim())?;
-    let encrypted = crow
-        .store()
-        .get(Namespace::Manifests, cap.manifest_hash.inner())?
-        .ok_or("manifest not found in local store")?;
-    let manifest = Manifest::open(&encrypted, &cap.manifest_key)?;
+fn cmd_info(crow: &Crow<FsStore>, pins: &PinIndex, arg: &str) -> DynResult<()> {
+    let cap = resolve_cap(pins, arg)?;
+    let manifest = open_manifest(crow, &cap)?;
 
     let stripes = manifest.stripes.len();
     let shares: usize = manifest
@@ -175,11 +179,22 @@ fn cmd_info(crow: &Crow<FsStore>, cap_str: &str) -> DynResult<()> {
         manifest.chunk_size,
         format_size(manifest.chunk_size as usize)
     );
-    println!("created   {}", manifest.created_at);
+    println!("created   {}", format_iso_timestamp(manifest.created_at));
     println!(
         "algo      {:?} / {:?} / {:?}",
         manifest.algorithm.aead, manifest.algorithm.kdf, manifest.algorithm.erasure_code
     );
+
+    if let Some(rec) = pins.get(cap.manifest_hash.inner())? {
+        let name = rec.name.as_deref().unwrap_or("(unnamed)");
+        println!(
+            "pinned    {} ({})",
+            format_iso_timestamp(rec.pinned_at),
+            name
+        );
+    } else {
+        println!("pinned    no");
+    }
     Ok(())
 }
 
@@ -391,6 +406,26 @@ fn open_manifest(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<Manifest> {
         .get(Namespace::Manifests, cap.manifest_hash.inner())?
         .ok_or("manifest not found in local store")?;
     Ok(Manifest::open(&encrypted, &cap.manifest_key)?)
+}
+
+fn resolve_cap(pins: &PinIndex, arg: &str) -> DynResult<Cap> {
+    let arg = arg.trim();
+    if arg.starts_with("crow1") {
+        Ok(Cap::decode(arg)?)
+    } else {
+        Ok(resolve_pin(pins, arg)?.cap)
+    }
+}
+
+fn default_name(path: &str) -> Option<String> {
+    if path == "-" {
+        None
+    } else {
+        Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+    }
 }
 
 fn resolve_pin(pins: &PinIndex, arg: &str) -> DynResult<PinRecord> {
