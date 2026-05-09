@@ -26,6 +26,7 @@ pub mod fs_store;
 pub mod hash;
 pub mod identity;
 pub mod manifest;
+pub mod pin;
 pub mod pipeline;
 
 pub use cap::{CAP_HRP, CAP_VERSION, Cap, Permission};
@@ -39,4 +40,5 @@ pub use identity::Identity;
 pub use manifest::{
     Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, Stripe,
 };
+pub use pin::{PinIndex, PinRecord};
 pub use pipeline::Crow;
