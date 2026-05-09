@@ -37,10 +37,12 @@ async fn client_fetches_manifest_and_chunk() {
 
     let client = connect_retry(addr).await;
     client.hello(token).await.unwrap();
-    assert!(client
-        .have(token, Namespace::Manifests, *cap.manifest_hash.inner())
-        .await
-        .unwrap());
+    assert!(
+        client
+            .have(token, Namespace::Manifests, *cap.manifest_hash.inner())
+            .await
+            .unwrap()
+    );
 
     let fetched_manifest = client
         .get(token, Namespace::Manifests, *cap.manifest_hash.inner())

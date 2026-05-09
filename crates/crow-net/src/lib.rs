@@ -250,7 +250,12 @@ impl Client {
         }
     }
 
-    pub async fn have(&self, token: ClusterToken, namespace: Namespace, hash: Hash) -> Result<bool> {
+    pub async fn have(
+        &self,
+        token: ClusterToken,
+        namespace: Namespace,
+        hash: Hash,
+    ) -> Result<bool> {
         match self
             .request(Request::Have {
                 version: PROTOCOL_VERSION,
@@ -370,9 +375,9 @@ async fn handle_request(store: Arc<FsStore>, token: ClusterToken, request: Reque
 
 fn request_token(request: &Request) -> Option<ClusterToken> {
     match request {
-        Request::Hello { token, .. }
-        | Request::Have { token, .. }
-        | Request::Get { token, .. } => Some(*token),
+        Request::Hello { token, .. } | Request::Have { token, .. } | Request::Get { token, .. } => {
+            Some(*token)
+        }
     }
 }
 
