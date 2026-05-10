@@ -2,8 +2,6 @@
 
 Decentralized, content-addressed, erasure-coded file storage with Tahoe-LAFS-style capabilities.
 
-Crow is part of **Nest**, a family of bird-named peer-to-peer apps. Pigeon does messaging (BLE / LoRa mesh); Finch does payments; Crow does files.
-
 A file in Crow is encrypted, chunked, hashed, erasure-coded, and stored as a set of content-addressed shares. The pointer to a file is a small token called a **capability** that bundles the manifest's content hash, its decryption key, and a permission. Sharing a file means sharing its capability. There are no accounts and no servers required; any device that holds at least *K* of *N* shares can reconstruct the file.
 
 ## Status
@@ -46,7 +44,13 @@ A tampered data share fails AEAD on decrypt. A tampered parity share also fails 
 
 ## Install
 
-Crow is not published to crates.io yet. Install the CLI from the workspace:
+Crow is not published to crates.io yet. Once this repository is public, install the CLI directly from GitHub:
+
+```sh
+cargo install --git https://github.com/oliverrowebardeen/crow.git --bin crow
+```
+
+For local development, install from a checkout:
 
 ```sh
 git clone https://github.com/oliverrowebardeen/crow
@@ -61,6 +65,8 @@ If you'd rather not install, every `crow …` command below has an in-place equi
 ```sh
 cargo run -q -p crow-cli -- <args…>
 ```
+
+Requirements: Rust 1.85+ and a network that allows UDP multicast for mDNS discovery. If discovery is blocked, `crow fetch` still works with an explicit `IP:port`.
 
 ## CLI
 
@@ -176,7 +182,7 @@ crow gc    [--dry-run]                # sweep chunks/manifests not referenced by
 
 The split between `unpin` and `rm` is deliberate: `unpin` is reversible if you still have the cap, since the chunks are still on disk, while `rm` is the unix-style "delete now." Catalog directories require `crow unpin -r /path` so a typo does not detach a whole subtree silently. Use `--dry-run` on `rm` and `gc` to see what would happen before committing.
 
-### Personal-cluster fetch
+### Two-device test
 
 Phase 1 networking is for trusted devices you own on the same LAN. It is not friend-scoped sharing yet: every device with the shared cluster token can ask a serving peer for encrypted chunks by hash. The peer never sees cap keys or plaintext.
 
@@ -240,6 +246,13 @@ $ crow get  "$CAP" report.pdf
 ```
 
 For personal devices on the same LAN, use `crow serve` + `crow fetch` as shown above. Specific file sharing with friends is deferred to Phase 2 so it can use scoped access instead of the personal-cluster token.
+
+### Security model
+
+- Capabilities are bearer tokens: anyone with a `crow1…` cap can decrypt the referenced file or directory snapshot if they can fetch enough encrypted shares.
+- The personal-cluster token is shared-secret authorization for LAN fetch. Treat it like a password for devices you own.
+- mDNS discovery is only convenience metadata. It is not trusted for authorization; fetch still requires the cluster token.
+- Crow is alpha software. Keep independent backups of important data until automatic multi-device replication is shipped and battle-tested.
 
 ### Pipelines
 
@@ -344,6 +357,8 @@ crow/
 │   └── crow-cli/                   # `crow` binary
 │       └── src/main.rs
 ├── .github/workflows/ci.yml        # fmt + clippy + test
+├── CONTRIBUTING.md
+├── SECURITY.md
 ├── LICENSE-APACHE
 ├── LICENSE-MIT
 └── README.md
@@ -360,7 +375,7 @@ cargo fmt --check
 
 CI runs the same fmt / clippy / test triple on every push to `main` and every pull request — see `.github/workflows/ci.yml`.
 
-Commits go on feature branches via pull requests — never push directly to `main`. Each commit does one thing (one feature, one bugfix, one refactor) and the message explains the *why*, not just the *what*.
+Commits should be focused and reviewed through pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for the short contribution guide and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Roadmap
 
@@ -383,14 +398,14 @@ Several devices owned by one user, on the same network, syncing files between th
 
 ### Phase 2 — cross-person sharing
 
-7. **Internet reachability.** A small zero-knowledge relay (à la pigeon-relay) plus NAT hole-punching for direct peer-to-peer between devices on different networks. The relay sees only opaque ciphertext.
+7. **Internet reachability.** A small zero-knowledge relay plus NAT hole-punching for direct peer-to-peer between devices on different networks. The relay sees only opaque ciphertext.
 8. **Sharing flow.** Explicit per-cap access lists, recipient pubkeys, optional expiry. Send a friend a cap, they pull from your devices (or via a relay), no Dropbox in the middle.
 
-### Phase 3 — offline / mesh
+### Phase 3 — offline / local transports
 
-9. **Pigeon transport integration.** Crow's chunk-fetch protocol over BLE, LoRa, and Wi-Fi-direct via Pigeon's existing mesh layer. Lower bandwidth, intermittent connectivity, but works without internet.
+9. **Offline transport integration.** Run Crow's chunk-fetch protocol over BLE, LoRa, and Wi-Fi Direct. Lower bandwidth, intermittent connectivity, but works without internet.
 
-A stripped-down BLE-direct integration may move earlier (after Phase 1) if in-person tap-to-share becomes a headline feature; bandwidth tradeoffs are real but Pigeon already does the hard parts.
+A stripped-down BLE-direct integration may move earlier if in-person tap-to-share becomes a headline feature; bandwidth tradeoffs are real.
 
 ### Not yet on the roadmap
 
