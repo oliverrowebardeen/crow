@@ -42,7 +42,9 @@ use crow_net::{
                   crow mv /docs/report.pdf /docs/q2.pdf\n  \
                   crow rm /docs/q2.pdf             # delete path and chunks\n  \
                   crow gc                          # sweep anything not pinned\n  \
-                  crow serve                       # serve chunks over QUIC\n\
+                  crow serve                       # serve chunks + advertise on mDNS\n  \
+                  crow peers                       # list LAN peers `crow serve` discovered\n  \
+                  crow fetch laptop <cap>          # pull a cap by node-id or friendly name\n\
                   \n\
                   File commands accept catalog paths, full crow1… capabilities, or \
                   hex prefixes of pinned manifest hashes; ambiguous prefixes get an \
