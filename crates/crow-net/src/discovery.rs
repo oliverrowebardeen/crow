@@ -130,7 +130,7 @@ impl Discovery {
     /// Snapshot of currently-known peers, sorted newest-seen first.
     pub fn peers(&self) -> Vec<PeerInfo> {
         let mut v: Vec<PeerInfo> = self.peers.read().unwrap().values().cloned().collect();
-        v.sort_by(|a, b| b.last_seen_unix.cmp(&a.last_seen_unix));
+        v.sort_by_key(|p| std::cmp::Reverse(p.last_seen_unix));
         v
     }
 
