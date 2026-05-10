@@ -230,7 +230,7 @@ crow fetch laptop              crow1qyq...m0r --name report.pdf
 crow get <prefix> report.pdf
 ```
 
-`fetch` pulls the encrypted manifest and missing shares, verifies every object by BLAKE3 hash before storing it, pins the cap locally, and exits successfully only when local reconstruction works. Automatic replication, replicated metadata sync, and friend-scoped access are later Phase 1 steps.
+`fetch` pulls the encrypted manifest and missing shares, verifies every object by BLAKE3 hash before storing it, pins the cap locally, and exits successfully only when local reconstruction works. Automatic replication and replicated metadata sync are later Phase 1 steps; friend-scoped access comes after scoped identity/workspace work.
 
 ### Sharing
 
@@ -245,7 +245,7 @@ $ crow pin "$CAP" --name report-from-friend.pdf
 $ crow get  "$CAP" report.pdf
 ```
 
-For personal devices on the same LAN, use `crow serve` + `crow fetch` as shown above. Specific file sharing with friends is deferred to Phase 2 so it can use scoped access instead of the personal-cluster token.
+For personal devices on the same LAN, use `crow serve` + `crow fetch` as shown above. Specific file sharing with friends is deferred until scoped access can replace the personal-cluster token.
 
 ### Security model
 
@@ -379,7 +379,12 @@ Commits should be focused and reviewed through pull requests. See [CONTRIBUTING.
 
 ## Roadmap
 
-Crow is being built in three phases. Phase 0 (the data model) and the start of Phase 1 are shipped; the rest is the plan.
+Crow is being built as a local-first storage protocol first, with two product surfaces on top:
+personal encrypted storage across your own devices, and shared signed context/artifact storage for
+developer and agent workflows. Those surfaces need the same near-term primitives: identity,
+signed provenance, CRDT metadata sync, and durable replication. The roadmap below keeps the
+personal-cloud path intact while leaving room to validate the agent/dev-team use case without
+turning Crow into an agent orchestrator or memory product.
 
 ### Phase 0 — data model (shipped)
 
@@ -392,18 +397,29 @@ Several devices owned by one user, on the same network, syncing files between th
 1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
 2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted file manifests, directory manifests, and shares from a known peer after shared-token authorization.
 3. **mDNS discovery — shipped.** `crow serve` advertises `_crow._udp.local.` with the daemon's `NodeId` (Ed25519 pubkey, persistent across restarts at `<home>/identity.json`), bound port, and friendly name. Other Crows on the same Wi-Fi auto-discover; the daemon writes `<home>/peers.json` every five seconds. `crow peers` reads the snapshot; `crow fetch <peer>` accepts a node-id hex prefix or friendly name in addition to `IP:port`. Discovery is unauthenticated by design — the existing shared `ClusterToken` still gates real chunk fetches.
-4. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
-5. **Replicated metadata sync.** Merge the local catalog event logs across devices, then add ACLs, version history, and holder hints. The on-disk catalog is already operation-log-shaped so this is a sync/merge step rather than a catalog rewrite.
-6. **Identity wiring.** Sign manifests with the Ed25519 key Crow already generates; verify the signature before pinning so a foreign device on the same Wi-Fi can't inject pins or catalog entries into your fleet.
+4. **Identity wiring + signed provenance.** Sign file manifests, directory manifests, and catalog events with the Ed25519 key Crow already generates; verify signatures before pinning or merging. This is the trust foundation for both personal devices and agent-produced artifacts.
+5. **Replicated metadata sync.** Merge local catalog event logs across devices with deterministic conflict rules, event IDs, author IDs, and clocks. The on-disk catalog is already operation-log-shaped so this should be a sync/merge step rather than a catalog rewrite.
+6. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
+7. **Health and verification UX.** Show which caps are reconstructable, which devices hold shares, which catalog events are signed/merged, and whether it is safe to treat Crow as durable storage.
 
-### Phase 2 — cross-person sharing
+### Phase 2 — adapters and shared workspaces
 
-7. **Internet reachability.** A small zero-knowledge relay plus NAT hole-punching for direct peer-to-peer between devices on different networks. The relay sees only opaque ciphertext.
-8. **Sharing flow.** Explicit per-cap access lists, recipient pubkeys, optional expiry. Send a friend a cap, they pull from your devices (or via a relay), no Dropbox in the middle.
+Make Crow useful to more than one local user or process without changing the core storage model.
 
-### Phase 3 — offline / local transports
+8. **Local HTTP API.** Expose put/get/list/pin/catalog/fetch operations from `crow serve` over a local API so tools in any language can use Crow without shelling out.
+9. **MCP server proof.** Provide a small MCP server that lets AI tools store and retrieve caps, read catalog resources, and publish signed context/artifact bundles. Crow should be the substrate under agents, not the agent runner.
+10. **Workspace object.** Add a signed workspace manifest/event log that names members, roles, trusted devices, and replication policy. Start local-first and single-team; avoid SaaS admin surfaces until the protocol shape is proven.
+11. **CI and SDK ergonomics.** Fast install path, Docker image, Python SDK first, then JS/TS. The first target is ephemeral jobs and agents that need to publish or fetch durable signed artifacts.
+12. **Streaming and resume.** Replace all large-object paths that require whole-file `Vec<u8>` buffering with streaming APIs and resumable transfer so build artifacts, datasets, and model files are realistic.
 
-9. **Offline transport integration.** Run Crow's chunk-fetch protocol over BLE, LoRa, and Wi-Fi Direct. Lower bandwidth, intermittent connectivity, but works without internet.
+### Phase 3 — cross-person sharing
+
+13. **Internet reachability.** A small zero-knowledge relay plus NAT hole-punching for direct peer-to-peer between devices on different networks. The relay sees only opaque ciphertext.
+14. **Sharing flow.** Explicit per-cap access lists, recipient pubkeys, optional expiry. Send a friend or teammate a cap, they pull from your devices (or via a relay), no Dropbox in the middle.
+
+### Phase 4 — offline / local transports
+
+15. **Offline transport integration.** Run Crow's chunk-fetch protocol over BLE, LoRa, and Wi-Fi Direct. Lower bandwidth, intermittent connectivity, but works without internet.
 
 A stripped-down BLE-direct integration may move earlier if in-person tap-to-share becomes a headline feature; bandwidth tradeoffs are real.
 
@@ -414,6 +430,8 @@ A stripped-down BLE-direct integration may move earlier if in-person tap-to-shar
 - Convergent encryption for cross-file dedup.
 - Content-defined chunking (FastCDC) for similar-file dedup.
 - Live shared folders — directory caps are immutable snapshots today, not mutable sync relationships.
+- Agent runner / scheduler — Crow may expose storage to agents, but should not become the orchestration layer.
+- Full team SaaS admin UI — useful later if workspaces land, but premature before the protocol and local API are proven.
 - `--rm-local` / destructive local-file lifecycle management — unsafe until multi-device replication can prove data is durable elsewhere.
 
 ## License
