@@ -51,7 +51,40 @@ pub fn save(path: &Path, snapshot: &PeerSnapshot) -> Result<()> {
         .map_err(|e| NetError::Protocol(format!("encode snapshot: {e}")))?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, path)?;
+    replace_file(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp, path).map_err(NetError::Io)
+}
+
+#[cfg(windows)]
+fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let tmp = tmp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // Windows std::fs::rename refuses to overwrite. MoveFileExW gives the same
+    // replace-existing behavior Unix rename already has.
+    let ok = unsafe { MoveFileExW(tmp.as_ptr(), path.as_ptr(), flags) };
+    if ok == 0 {
+        return Err(NetError::Io(std::io::Error::last_os_error()));
+    }
     Ok(())
 }
 
@@ -93,6 +126,50 @@ mod tests {
         assert_eq!(loaded.self_info.node_id, id.node_id());
         assert_eq!(loaded.self_info.friendly_name.as_deref(), Some("device-x"));
         assert!(loaded.peers.is_empty());
+    }
+
+    #[test]
+    fn save_replaces_existing_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let path = snapshot_path(tmp.path());
+        let first = Identity::random();
+        let second = Identity::random();
+
+        save(
+            &path,
+            &PeerSnapshot {
+                snapshot_at: 1,
+                self_info: SelfInfo {
+                    node_id: first.node_id(),
+                    friendly_name: Some("old-device".into()),
+                    address: "192.168.1.5:7070".parse().unwrap(),
+                },
+                peers: vec![],
+            },
+        )
+        .unwrap();
+
+        save(
+            &path,
+            &PeerSnapshot {
+                snapshot_at: 2,
+                self_info: SelfInfo {
+                    node_id: second.node_id(),
+                    friendly_name: Some("new-device".into()),
+                    address: "192.168.1.6:7070".parse().unwrap(),
+                },
+                peers: vec![],
+            },
+        )
+        .unwrap();
+
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.snapshot_at, 2);
+        assert_eq!(loaded.self_info.node_id, second.node_id());
+        assert_eq!(
+            loaded.self_info.friendly_name.as_deref(),
+            Some("new-device")
+        );
     }
 
     #[test]

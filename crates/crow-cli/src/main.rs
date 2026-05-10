@@ -1398,15 +1398,16 @@ fn cmd_peers(home: &Path, long: bool, json: bool) -> DynResult<()> {
     Ok(())
 }
 
-/// Resolve a `<peer>` CLI argument to a SocketAddr. Three forms in order:
+/// Resolve a `<peer>` CLI argument to one or more SocketAddr candidates.
+/// Three forms in order:
 /// 1. Parse as SocketAddr.
 /// 2. Hex prefix of a node id from the snapshot.
 /// 3. Exact friendly name from the snapshot.
-fn resolve_peer(home: &Path, arg: &str) -> DynResult<SocketAddr> {
+fn resolve_peer(home: &Path, arg: &str) -> DynResult<Vec<SocketAddr>> {
     let arg = arg.trim();
 
     if let Ok(addr) = arg.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
 
     let snapshot_path = peer_snapshot::snapshot_path(home);
@@ -1441,17 +1442,17 @@ fn resolve_peer(home: &Path, arg: &str) -> DynResult<SocketAddr> {
             snapshot_path.display()
         )
         .into()),
-        1 => candidates[0]
-            .addresses
-            .first()
-            .copied()
-            .ok_or_else(|| -> DynError {
-                format!(
+        1 => {
+            let addresses = candidates[0].addresses.clone();
+            if addresses.is_empty() {
+                return Err(format!(
                     "peer {} has no known address",
                     candidates[0].node_id.short()
                 )
-                .into()
-            }),
+                .into());
+            }
+            Ok(addresses)
+        }
         n => {
             let mut msg = format!("ambiguous peer '{arg}' ({n} matches):");
             for p in &candidates {
@@ -1583,11 +1584,10 @@ fn cmd_fetch(
     name: Option<String>,
 ) -> DynResult<()> {
     let token = load_token(home)?;
-    let socket_addr = resolve_peer(home, peer)?;
+    let socket_addrs = resolve_peer(home, peer)?;
     let cap = resolve_cap(pins, arg)?;
     let rt = runtime()?;
-    let client = rt.block_on(Client::connect(socket_addr))?;
-    rt.block_on(client.hello(token))?;
+    let (socket_addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
 
     let mut counters = FetchCounters::default();
     let manifest_state = fetch_manifest_object(crow, &rt, &client, token, &cap, &mut counters)?;
@@ -1637,6 +1637,7 @@ fn cmd_fetch(
         counters.already_local, counters.fetched, counters.remote_missing
     );
     println!("stored        {}", format_size_u64(counters.fetched_bytes));
+    println!("peer          {socket_addr}");
     println!(
         "pinned        {} {}",
         &cap.manifest_hash.to_string()[..8],
@@ -1666,6 +1667,35 @@ fn fetch_pin_metadata(
     let name = requested_name.or_else(|| existing_pin.as_ref().and_then(|r| r.name.clone()));
     let comment = existing_pin.and_then(|r| r.comment);
     Ok((name, comment))
+}
+
+fn connect_peer(
+    rt: &tokio::runtime::Runtime,
+    token: ClusterToken,
+    peer_arg: &str,
+    addresses: &[SocketAddr],
+) -> DynResult<(SocketAddr, Client)> {
+    let mut failures = Vec::new();
+    for addr in addresses {
+        match rt.block_on(Client::connect(*addr)) {
+            Ok(client) => match rt.block_on(client.hello(token)) {
+                Ok(()) => return Ok((*addr, client)),
+                Err(e) => failures.push(format!("{addr}: hello failed: {e}")),
+            },
+            Err(e) => failures.push(format!("{addr}: connect failed: {e}")),
+        }
+    }
+
+    let mut msg = format!(
+        "could not connect to peer '{peer_arg}' using {} candidate address{}",
+        addresses.len(),
+        if addresses.len() == 1 { "" } else { "es" },
+    );
+    for failure in failures {
+        msg.push_str("\n  ");
+        msg.push_str(&failure);
+    }
+    Err(msg.into())
 }
 
 fn cmd_token(home: &Path, command: TokenCommand) -> DynResult<()> {
@@ -2590,6 +2620,77 @@ mod tests {
         let (name, comment) = fetch_pin_metadata(&pins, &cap, Some("new.pdf".into())).unwrap();
         assert_eq!(name.as_deref(), Some("new.pdf"));
         assert_eq!(comment.as_deref(), Some("keep this"));
+    }
+
+    #[test]
+    fn resolve_peer_socket_addr_bypasses_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let addr = "127.0.0.1:7070".parse().unwrap();
+
+        assert_eq!(
+            resolve_peer(tmp.path(), "127.0.0.1:7070").unwrap(),
+            vec![addr]
+        );
+    }
+
+    #[test]
+    fn resolve_peer_returns_all_snapshot_addresses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let peer = Identity::random();
+        let self_id = Identity::random();
+        let addresses = vec![
+            "169.254.1.2:7070".parse().unwrap(),
+            "192.168.1.10:7070".parse().unwrap(),
+        ];
+        let snap = PeerSnapshot {
+            snapshot_at: peer_snapshot::now_unix(),
+            self_info: SelfInfo {
+                node_id: self_id.node_id(),
+                friendly_name: Some("self".into()),
+                address: "127.0.0.1:7070".parse().unwrap(),
+            },
+            peers: vec![PeerInfo {
+                node_id: peer.node_id(),
+                friendly_name: Some("laptop".into()),
+                addresses: addresses.clone(),
+                last_seen_unix: peer_snapshot::now_unix(),
+            }],
+        };
+        peer_snapshot::save(&peer_snapshot::snapshot_path(tmp.path()), &snap).unwrap();
+
+        assert_eq!(
+            resolve_peer(tmp.path(), &peer.node_id().short()).unwrap(),
+            addresses
+        );
+        assert_eq!(resolve_peer(tmp.path(), "laptop").unwrap(), addresses);
+    }
+
+    #[test]
+    fn connect_peer_falls_back_to_later_address() {
+        let bad_tmp = tempfile::TempDir::new().unwrap();
+        let good_tmp = tempfile::TempDir::new().unwrap();
+        let rt = runtime().unwrap();
+        let token = ClusterToken::random();
+        let wrong_token = ClusterToken::random();
+        let bad_server = rt
+            .block_on(crow_net::serve(
+                FsStore::open(bad_tmp.path()).unwrap(),
+                wrong_token,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .unwrap();
+        let good_server = rt
+            .block_on(crow_net::serve(
+                FsStore::open(good_tmp.path()).unwrap(),
+                token,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .unwrap();
+        let addresses = vec![bad_server.local_addr(), good_server.local_addr()];
+
+        let (connected_addr, _client) = connect_peer(&rt, token, "laptop", &addresses).unwrap();
+
+        assert_eq!(connected_addr, good_server.local_addr());
     }
 
     #[test]
