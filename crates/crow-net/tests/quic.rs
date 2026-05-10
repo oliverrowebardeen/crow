@@ -1,4 +1,4 @@
-use crow::{ChunkStore, Crow, ErasureParams, FsStore, Namespace};
+use crow::{ChunkStore, Crow, ErasureParams, FsStore, Identity, Namespace};
 use crow_net::{Client, ClusterToken};
 use tempfile::TempDir;
 
@@ -9,12 +9,14 @@ async fn client_fetches_manifest_and_chunk() {
     let tmp = TempDir::new().unwrap();
     let store = FsStore::open(tmp.path()).unwrap();
     let crow = Crow::new(store);
+    let identity = Identity::random();
     let cap = crow
         .put_bytes_with(
             b"hello over quic",
             "text/plain",
             ErasureParams::default(),
             TEST_CHUNK_SIZE,
+            &identity,
         )
         .unwrap();
     let encrypted_manifest = crow

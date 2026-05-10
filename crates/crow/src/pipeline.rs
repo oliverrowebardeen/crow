@@ -9,6 +9,7 @@ use crate::dir_manifest::DirectoryManifest;
 use crate::erasure::{self, DEFAULT_CHUNK_SIZE, ErasureParams};
 use crate::error::{Error, Result};
 use crate::hash::{ChunkHash, Hash, ManifestHash};
+use crate::identity::Identity;
 use crate::manifest::{Algorithm, MANIFEST_VERSION, Manifest, Stripe};
 
 /// Top-level facade tying chunk store, crypto, erasure, manifest, and cap
@@ -34,8 +35,14 @@ impl<S: ChunkStore> Crow<S> {
 
     /// Encrypt, erasure-code, and store the bytes; return a read capability.
     /// Uses [`DEFAULT_CHUNK_SIZE`] for chunking.
-    pub fn put_bytes(&self, plaintext: &[u8], mime: &str, params: ErasureParams) -> Result<Cap> {
-        self.put_bytes_with(plaintext, mime, params, DEFAULT_CHUNK_SIZE)
+    pub fn put_bytes(
+        &self,
+        plaintext: &[u8],
+        mime: &str,
+        params: ErasureParams,
+        identity: &Identity,
+    ) -> Result<Cap> {
+        self.put_bytes_with(plaintext, mime, params, DEFAULT_CHUNK_SIZE, identity)
     }
 
     /// Variant that lets callers tune `chunk_size` (must satisfy
@@ -47,6 +54,7 @@ impl<S: ChunkStore> Crow<S> {
         mime: &str,
         params: ErasureParams,
         chunk_size: u32,
+        identity: &Identity,
     ) -> Result<Cap> {
         params.validate()?;
         erasure::validate_chunk_size(chunk_size)?;
@@ -114,7 +122,7 @@ impl<S: ChunkStore> Crow<S> {
             });
         }
 
-        let manifest = Manifest {
+        let mut manifest = Manifest {
             version: MANIFEST_VERSION,
             algorithm: Algorithm::default(),
             file_size: plaintext.len() as u64,
@@ -130,6 +138,7 @@ impl<S: ChunkStore> Crow<S> {
             creator_pubkey: None,
             signature: None,
         };
+        manifest.sign(identity)?;
 
         let sealed = manifest.seal(&manifest_key)?;
         let manifest_hash_inner = Hash::of(&sealed);
@@ -144,8 +153,14 @@ impl<S: ChunkStore> Crow<S> {
     }
 
     /// Store an immutable directory snapshot manifest and return a read cap.
-    pub fn put_directory_manifest(&self, manifest: &DirectoryManifest) -> Result<Cap> {
+    pub fn put_directory_manifest(
+        &self,
+        manifest: &DirectoryManifest,
+        identity: &Identity,
+    ) -> Result<Cap> {
         manifest.validate()?;
+        let mut manifest = manifest.clone();
+        manifest.sign(identity)?;
         let manifest_key = ManifestKey::random();
         let sealed = manifest.seal(&manifest_key)?;
         let manifest_hash_inner = Hash::of(&sealed);

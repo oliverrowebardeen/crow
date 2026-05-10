@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::cap::Cap;
 use crate::crypto::{ManifestKey, open_manifest, seal_manifest};
 use crate::error::{Error, Result};
-use crate::manifest::Signature;
+use crate::identity::{Identity, NodeId};
+use crate::manifest::{Signature, SignatureStatus};
+
+use ed25519_dalek::{Signature as Ed25519Signature, Signer, Verifier, VerifyingKey};
 
 pub const DIRECTORY_MANIFEST_VERSION: u8 = 1;
 pub const DIRECTORY_MANIFEST_MAGIC: [u8; 4] = *b"CDIR";
@@ -16,7 +19,11 @@ pub struct DirectoryManifest {
     pub magic: [u8; 4],
     pub created_at: u64,
     pub entries: Vec<DirectoryEntry>,
+    /// Ed25519 public key of the directory snapshot creator. `None` means
+    /// legacy unsigned data.
     pub creator_pubkey: Option<[u8; 32]>,
+    /// Ed25519 signature over the canonical postcard encoding with this field
+    /// taken as `None`.
     pub signature: Option<Signature>,
 }
 
@@ -60,6 +67,7 @@ impl DirectoryManifest {
             )));
         }
         manifest.validate()?;
+        manifest.signature_status()?;
         Ok(manifest)
     }
 
@@ -71,6 +79,44 @@ impl DirectoryManifest {
     pub fn open(ciphertext: &[u8], key: &ManifestKey) -> Result<Self> {
         let plaintext = open_manifest(key, ciphertext)?;
         Self::deserialize(&plaintext)
+    }
+
+    pub fn sign(&mut self, identity: &Identity) -> Result<()> {
+        let creator = identity.signing_pubkey();
+        self.creator_pubkey = Some(creator);
+        self.signature = None;
+        let payload = self.signing_payload(creator)?;
+        let signature: Ed25519Signature = identity.signing.sign(&payload);
+        self.signature = Some(Signature(signature.to_bytes()));
+        Ok(())
+    }
+
+    pub fn signature_status(&self) -> Result<SignatureStatus> {
+        match (self.creator_pubkey, self.signature) {
+            (None, None) => Ok(SignatureStatus::Unsigned),
+            (Some(creator), Some(signature)) => {
+                let payload = self.signing_payload(creator)?;
+                let verifying_key = VerifyingKey::from_bytes(&creator)
+                    .map_err(|e| Error::Manifest(format!("invalid creator public key: {e}")))?;
+                let signature = Ed25519Signature::from_bytes(&signature.0);
+                verifying_key
+                    .verify(&payload, &signature)
+                    .map_err(|_| Error::Manifest("invalid directory manifest signature".into()))?;
+                Ok(SignatureStatus::Signed {
+                    creator: NodeId::from_bytes(creator),
+                })
+            }
+            _ => Err(Error::Manifest(
+                "malformed directory manifest signature fields".into(),
+            )),
+        }
+    }
+
+    fn signing_payload(&self, creator: [u8; 32]) -> Result<Vec<u8>> {
+        let mut canonical = self.clone();
+        canonical.creator_pubkey = Some(creator);
+        canonical.signature = None;
+        canonical.serialize()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -216,12 +262,31 @@ fn kind_rank(kind: &DirectoryEntryKind) -> u8 {
 mod tests {
     use super::*;
     use crate::hash::ManifestHash;
+    use crate::identity::Identity;
 
     fn cap_with_hash_byte(b: u8) -> Cap {
         Cap::new_read(
             ManifestHash::from_bytes([b; 32]),
             ManifestKey::from_bytes([b; 32]),
         )
+    }
+
+    fn sample() -> DirectoryManifest {
+        DirectoryManifest::new(
+            123,
+            vec![
+                DirectoryEntry::dir("docs"),
+                DirectoryEntry::file("docs/a.txt", cap_with_hash_byte(1), Some("a.txt".into())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn signed_sample() -> (DirectoryManifest, Identity) {
+        let identity = Identity::random();
+        let mut manifest = sample();
+        manifest.sign(&identity).unwrap();
+        (manifest, identity)
     }
 
     #[test]
@@ -254,6 +319,86 @@ mod tests {
         let sealed = manifest.seal(&key).unwrap();
         let opened = DirectoryManifest::open(&sealed, &key).unwrap();
         assert_eq!(opened.entries[0].path, "docs");
+    }
+
+    #[test]
+    fn sign_records_creator_and_signature() {
+        let (manifest, identity) = signed_sample();
+
+        assert_eq!(manifest.creator_pubkey, Some(identity.signing_pubkey()));
+        assert!(manifest.signature.is_some());
+        assert_eq!(
+            manifest.signature_status().unwrap(),
+            SignatureStatus::Signed {
+                creator: identity.node_id()
+            }
+        );
+    }
+
+    #[test]
+    fn signed_directory_manifest_seal_open_roundtrip() {
+        let key = ManifestKey::random();
+        let (manifest, _) = signed_sample();
+        let sealed = manifest.seal(&key).unwrap();
+        let opened = DirectoryManifest::open(&sealed, &key).unwrap();
+
+        assert_eq!(manifest.serialize().unwrap(), opened.serialize().unwrap());
+        assert!(matches!(
+            opened.signature_status().unwrap(),
+            SignatureStatus::Signed { .. }
+        ));
+    }
+
+    #[test]
+    fn signing_is_deterministic_for_same_manifest_and_identity() {
+        let identity = Identity::random();
+        let mut a = sample();
+        let mut b = sample();
+
+        a.sign(&identity).unwrap();
+        b.sign(&identity).unwrap();
+
+        assert_eq!(a.signature, b.signature);
+        assert_eq!(a.serialize().unwrap(), b.serialize().unwrap());
+    }
+
+    #[test]
+    fn unsigned_directory_manifest_is_legacy_compatible() {
+        assert_eq!(
+            sample().signature_status().unwrap(),
+            SignatureStatus::Unsigned
+        );
+        let bytes = sample().serialize().unwrap();
+        assert!(DirectoryManifest::deserialize(&bytes).is_ok());
+    }
+
+    #[test]
+    fn signed_directory_manifest_rejects_tampering() {
+        let (mut manifest, _) = signed_sample();
+        manifest.created_at += 1;
+
+        let err = manifest
+            .signature_status()
+            .expect_err("expected invalid signature");
+
+        assert!(
+            err.to_string()
+                .contains("invalid directory manifest signature")
+        );
+        assert!(DirectoryManifest::deserialize(&manifest.serialize().unwrap()).is_err());
+    }
+
+    #[test]
+    fn partial_signature_fields_are_rejected() {
+        let identity = Identity::random();
+        let mut creator_only = sample();
+        creator_only.creator_pubkey = Some(identity.signing_pubkey());
+        assert!(creator_only.signature_status().is_err());
+
+        let mut signature_only = sample();
+        signature_only.sign(&identity).unwrap();
+        signature_only.creator_pubkey = None;
+        assert!(signature_only.signature_status().is_err());
     }
 
     #[test]

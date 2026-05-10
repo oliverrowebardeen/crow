@@ -40,6 +40,7 @@ async fn fetch_via_mdns_discovered_address() {
             "text/plain",
             ErasureParams::default(),
             240,
+            &id_a,
         )
         .unwrap()
     };

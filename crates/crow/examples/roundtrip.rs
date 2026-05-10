@@ -6,13 +6,14 @@
 use rand::RngCore;
 use rand::rngs::OsRng;
 
-use crow::{Cap, ChunkStore, Crow, ErasureParams, Manifest, MemStore, Namespace};
+use crow::{Cap, ChunkStore, Crow, ErasureParams, Identity, Manifest, MemStore, Namespace};
 
 const PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 const CHUNK_SIZE: u32 = 65520; // 64 KiB - 16, aligned for RS
 
 fn main() {
     let crow = Crow::new(MemStore::new());
+    let identity = Identity::random();
 
     let mut payload = vec![0u8; PAYLOAD_BYTES];
     OsRng.fill_bytes(&mut payload);
@@ -27,6 +28,7 @@ fn main() {
             "application/octet-stream",
             ErasureParams::default(),
             CHUNK_SIZE,
+            &identity,
         )
         .expect("put_bytes_with");
     let encoded = cap.encode();

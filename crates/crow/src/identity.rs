@@ -16,8 +16,8 @@ const IDENTITY_VERSION: u8 = 1;
 ///
 /// The Ed25519 key is the durable handle for a Crow node — it's what mDNS
 /// advertises (truncated, in the instance name; in full, in the TXT records),
-/// what `crow peers` displays, and what manifest signing will use once Phase 1
-/// step 6 lands. The X25519 key is held in reserve for future peer-to-peer
+/// what `crow peers` displays, and what new file/directory manifests are
+/// signed with. The X25519 key is held in reserve for future peer-to-peer
 /// authentication.
 pub struct Identity {
     pub signing: SigningKey,

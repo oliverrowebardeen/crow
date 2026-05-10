@@ -4,8 +4,9 @@ use rand::rngs::OsRng;
 use tempfile::TempDir;
 
 use crow::{
-    Cap, ChunkStore, Crow, ErasureParams, Error, FsStore, GcOptions, Manifest, ManifestHash,
-    ManifestKey, MemStore, Namespace, PinIndex, compute_live_set, sweep, targeted_remove,
+    Cap, ChunkStore, Crow, DirectoryEntry, DirectoryManifest, ErasureParams, Error, FsStore,
+    GcOptions, Identity, Manifest, ManifestHash, ManifestKey, MemStore, Namespace, PinIndex,
+    SignatureStatus, compute_live_set, sweep, targeted_remove,
 };
 
 /// Test-friendly chunk size: 65 520 bytes (= 64 KiB − 16). Picked so that
@@ -21,11 +22,13 @@ fn random_bytes(n: usize) -> Vec<u8> {
 }
 
 fn put(crow: &Crow<MemStore>, plaintext: &[u8]) -> Cap {
+    let identity = Identity::random();
     crow.put_bytes_with(
         plaintext,
         "application/octet-stream",
         ErasureParams::default(),
         TEST_CHUNK_SIZE,
+        &identity,
     )
     .expect("put_bytes_with succeeds")
 }
@@ -51,6 +54,59 @@ fn roundtrip_empty() {
     let crow = Crow::new(MemStore::new());
     let cap = put(&crow, &[]);
     assert!(crow.get_bytes(&cap).unwrap().is_empty());
+}
+
+#[test]
+fn put_bytes_writes_signed_manifest() {
+    let crow = Crow::new(MemStore::new());
+    let identity = Identity::random();
+    let cap = crow
+        .put_bytes_with(
+            b"signed bytes",
+            "text/plain",
+            ErasureParams::default(),
+            TEST_CHUNK_SIZE,
+            &identity,
+        )
+        .unwrap();
+    let encrypted = crow
+        .store()
+        .get(Namespace::Manifests, cap.manifest_hash.inner())
+        .unwrap()
+        .unwrap();
+    let manifest = Manifest::open(&encrypted, &cap.manifest_key).unwrap();
+
+    assert_eq!(
+        manifest.signature_status().unwrap(),
+        SignatureStatus::Signed {
+            creator: identity.node_id()
+        }
+    );
+}
+
+#[test]
+fn put_directory_manifest_writes_signed_manifest() {
+    let crow = Crow::new(MemStore::new());
+    let identity = Identity::random();
+    let child = put(&crow, b"child");
+    let manifest = DirectoryManifest::new(
+        123,
+        vec![DirectoryEntry::file(
+            "child.txt",
+            child,
+            Some("child.txt".into()),
+        )],
+    )
+    .unwrap();
+    let cap = crow.put_directory_manifest(&manifest, &identity).unwrap();
+    let opened = crow.open_directory_manifest(&cap).unwrap();
+
+    assert_eq!(
+        opened.signature_status().unwrap(),
+        SignatureStatus::Signed {
+            creator: identity.node_id()
+        }
+    );
 }
 
 #[test]
@@ -259,11 +315,13 @@ fn cap_string_is_paste_friendly() {
 // ----------------------------------------------------------------------
 
 fn put_fs(crow: &Crow<FsStore>, plaintext: &[u8]) -> Cap {
+    let identity = Identity::random();
     crow.put_bytes_with(
         plaintext,
         "application/octet-stream",
         ErasureParams::default(),
         TEST_CHUNK_SIZE,
+        &identity,
     )
     .expect("put_bytes_with succeeds")
 }

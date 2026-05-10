@@ -10,7 +10,7 @@ use crow::{
     Cap, CatalogEntry, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
     ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, NodeId,
-    PinIndex, PinRecord, compute_live_set_from_roots,
+    PinIndex, PinRecord, SignatureStatus, compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
@@ -470,6 +470,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     &crow,
                     &pins,
                     &catalog,
+                    &Identity::load_or_create(&home)?,
                     PutArgs {
                         path: &path,
                         dest: dest.as_deref(),
@@ -488,13 +489,25 @@ fn run(cli: Cli) -> DynResult<()> {
                     pins: pins_only,
                 } => cmd_ls(&crow, &pins, &catalog, path.as_deref(), long, pins_only),
                 Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
-                Command::PutDir { source, dest, yes } => {
-                    cmd_put_dir(&crow, &catalog, &source, dest.as_deref(), yes)
-                }
+                Command::PutDir { source, dest, yes } => cmd_put_dir(
+                    &crow,
+                    &catalog,
+                    &Identity::load_or_create(&home)?,
+                    &source,
+                    dest.as_deref(),
+                    yes,
+                ),
                 Command::GetDir { path, out, yes } => {
                     cmd_get_dir(&crow, &pins, &catalog, &path, &out, yes)
                 }
-                Command::CapDir { path, name } => cmd_cap_dir(&crow, &pins, &catalog, &path, name),
+                Command::CapDir { path, name } => cmd_cap_dir(
+                    &crow,
+                    &pins,
+                    &catalog,
+                    &Identity::load_or_create(&home)?,
+                    &path,
+                    name,
+                ),
                 Command::AddDir {
                     cap_or_prefix,
                     dest,
@@ -544,6 +557,7 @@ fn cmd_put(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
     catalog: &CatalogIndex,
+    identity: &Identity,
     args: PutArgs<'_>,
 ) -> DynResult<()> {
     let catalog_dest = args
@@ -558,7 +572,13 @@ fn cmd_put(
         .chunk_size
         .unwrap_or_else(|| auto_chunk_size(bytes.len()));
 
-    let cap = crow.put_bytes_with(&bytes, &mime_str, ErasureParams::default(), chunk_size)?;
+    let cap = crow.put_bytes_with(
+        &bytes,
+        &mime_str,
+        ErasureParams::default(),
+        chunk_size,
+        identity,
+    )?;
     let pin_name = args.name.or_else(|| default_name(args.path));
     if let Some(catalog_path) = catalog_dest {
         catalog.put_file(catalog_path.as_str(), cap.clone(), pin_name)?;
@@ -623,6 +643,7 @@ fn cmd_info(
                 "algo      {:?} / {:?} / {:?}",
                 manifest.algorithm.aead, manifest.algorithm.kdf, manifest.algorithm.erasure_code
             );
+            print_signature_status(manifest.signature_status()?);
         }
         ManifestKind::Directory(manifest) => {
             println!("type      directory snapshot");
@@ -633,6 +654,7 @@ fn cmd_info(
                 None => println!("size      unknown (missing child manifests)"),
             }
             println!("created   {}", format_iso_timestamp(manifest.created_at));
+            print_signature_status(manifest.signature_status()?);
         }
     }
 
@@ -650,6 +672,17 @@ fn cmd_info(
         println!("cataloged yes");
     }
     Ok(())
+}
+
+fn print_signature_status(status: SignatureStatus) {
+    println!("{}", format_signature_status(status));
+}
+
+fn format_signature_status(status: SignatureStatus) -> String {
+    match status {
+        SignatureStatus::Unsigned => "signed    no (legacy/unsigned)".into(),
+        SignatureStatus::Signed { creator } => format!("signed    yes ({})", creator.short()),
+    }
 }
 
 fn cmd_ls(
@@ -760,6 +793,7 @@ fn cmd_mkdir(catalog: &CatalogIndex, path: &str, parents: bool) -> DynResult<()>
 fn cmd_put_dir(
     crow: &Crow<FsStore>,
     catalog: &CatalogIndex,
+    identity: &Identity,
     source: &str,
     dest: Option<&str>,
     yes: bool,
@@ -803,6 +837,7 @@ fn cmd_put_dir(
             &mime,
             ErasureParams::default(),
             auto_chunk_size(bytes.len()),
+            identity,
         )?;
         catalog.put_file(catalog_path.as_str(), cap, source_name)?;
     }
@@ -819,6 +854,7 @@ fn cmd_cap_dir(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
     catalog: &CatalogIndex,
+    identity: &Identity,
     path: &str,
     name: Option<String>,
 ) -> DynResult<()> {
@@ -832,7 +868,7 @@ fn cmd_cap_dir(
     }
 
     let manifest = directory_manifest_from_catalog(&view, &path)?;
-    let cap = crow.put_directory_manifest(&manifest)?;
+    let cap = crow.put_directory_manifest(&manifest, identity)?;
     let pin_name = name.or_else(|| directory_snapshot_name(&path));
     pins.add(cap.clone(), pin_name, None)?;
     println!("{}", cap.encode());
@@ -2584,7 +2620,8 @@ mod tests {
     }
 
     fn stored_cap(crow: &Crow<FsStore>, payload: &[u8]) -> Cap {
-        crow.put_bytes(payload, "text/plain", ErasureParams::default())
+        let identity = Identity::random();
+        crow.put_bytes(payload, "text/plain", ErasureParams::default(), &identity)
             .unwrap()
     }
 
@@ -2694,6 +2731,22 @@ mod tests {
     }
 
     #[test]
+    fn signature_status_format_matches_info_output() {
+        let identity = Identity::random();
+
+        assert_eq!(
+            format_signature_status(SignatureStatus::Unsigned),
+            "signed    no (legacy/unsigned)"
+        );
+        assert_eq!(
+            format_signature_status(SignatureStatus::Signed {
+                creator: identity.node_id()
+            }),
+            format!("signed    yes ({})", identity.node_id().short())
+        );
+    }
+
+    #[test]
     fn unpin_catalog_file_detaches_without_deleting_chunks() {
         let tmp = tempfile::TempDir::new().unwrap();
         let pins = PinIndex::open(tmp.path()).unwrap();
@@ -2793,7 +2846,16 @@ mod tests {
             .put_file("/docs/file.txt", child, Some("file.txt".into()))
             .unwrap();
 
-        cmd_cap_dir(&crow, &pins, &catalog, "/docs", Some("docs cap".into())).unwrap();
+        let identity = Identity::random();
+        cmd_cap_dir(
+            &crow,
+            &pins,
+            &catalog,
+            &identity,
+            "/docs",
+            Some("docs cap".into()),
+        )
+        .unwrap();
 
         let records = pins.list().unwrap();
         assert_eq!(records.len(), 1);
@@ -2821,7 +2883,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let cap = crow.put_directory_manifest(&manifest).unwrap();
+        let identity = Identity::random();
+        let cap = crow.put_directory_manifest(&manifest, &identity).unwrap();
 
         let out = tmp.path().join("out");
         cmd_get_dir(
@@ -2856,7 +2919,8 @@ mod tests {
             )],
         )
         .unwrap();
-        let cap = crow.put_directory_manifest(&manifest).unwrap();
+        let identity = Identity::random();
+        let cap = crow.put_directory_manifest(&manifest, &identity).unwrap();
         pins.add(cap.clone(), Some("dir".into()), None).unwrap();
 
         cmd_add_dir(

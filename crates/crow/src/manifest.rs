@@ -5,6 +5,9 @@ use crate::crypto::{FileKey, ManifestKey, open_manifest, seal_manifest};
 use crate::erasure::ErasureParams;
 use crate::error::{Error, Result};
 use crate::hash::ChunkHash;
+use crate::identity::{Identity, NodeId};
+
+use ed25519_dalek::{Signature as Ed25519Signature, Signer, Verifier, VerifyingKey};
 
 pub const MANIFEST_VERSION: u8 = 1;
 
@@ -69,6 +72,12 @@ impl PartialEq for Signature {
 
 impl Eq for Signature {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureStatus {
+    Unsigned,
+    Signed { creator: NodeId },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u8,
@@ -80,11 +89,11 @@ pub struct Manifest {
     pub chunk_size: u32,
     pub stripes: Vec<Stripe>,
     pub created_at: u64,
-    /// Ed25519 public key of the manifest creator. Reserved for the future
-    /// owner-pinning pass; always `None` in this version.
+    /// Ed25519 public key of the manifest creator. `None` means legacy
+    /// unsigned data.
     pub creator_pubkey: Option<[u8; 32]>,
     /// Ed25519 signature over the canonical postcard encoding with this field
-    /// taken as `None`. Reserved; always `None` in this version.
+    /// taken as `None`.
     pub signature: Option<Signature>,
 }
 
@@ -108,6 +117,7 @@ impl Manifest {
                 manifest.version, MANIFEST_VERSION
             )));
         }
+        manifest.signature_status()?;
         Ok(manifest)
     }
 
@@ -119,6 +129,44 @@ impl Manifest {
     pub fn open(ciphertext: &[u8], key: &ManifestKey) -> Result<Self> {
         let plaintext = open_manifest(key, ciphertext)?;
         Self::deserialize(&plaintext)
+    }
+
+    pub fn sign(&mut self, identity: &Identity) -> Result<()> {
+        let creator = identity.signing_pubkey();
+        self.creator_pubkey = Some(creator);
+        self.signature = None;
+        let payload = self.signing_payload(creator)?;
+        let signature: Ed25519Signature = identity.signing.sign(&payload);
+        self.signature = Some(Signature(signature.to_bytes()));
+        Ok(())
+    }
+
+    pub fn signature_status(&self) -> Result<SignatureStatus> {
+        match (self.creator_pubkey, self.signature) {
+            (None, None) => Ok(SignatureStatus::Unsigned),
+            (Some(creator), Some(signature)) => {
+                let payload = self.signing_payload(creator)?;
+                let verifying_key = VerifyingKey::from_bytes(&creator)
+                    .map_err(|e| Error::Manifest(format!("invalid creator public key: {e}")))?;
+                let signature = Ed25519Signature::from_bytes(&signature.0);
+                verifying_key
+                    .verify(&payload, &signature)
+                    .map_err(|_| Error::Manifest("invalid manifest signature".into()))?;
+                Ok(SignatureStatus::Signed {
+                    creator: NodeId::from_bytes(creator),
+                })
+            }
+            _ => Err(Error::Manifest(
+                "malformed manifest signature fields".into(),
+            )),
+        }
+    }
+
+    fn signing_payload(&self, creator: [u8; 32]) -> Result<Vec<u8>> {
+        let mut canonical = self.clone();
+        canonical.creator_pubkey = Some(creator);
+        canonical.signature = None;
+        canonical.serialize()
     }
 }
 
@@ -149,6 +197,13 @@ mod tests {
             creator_pubkey: None,
             signature: None,
         }
+    }
+
+    fn signed_sample() -> (Manifest, Identity) {
+        let identity = Identity::random();
+        let mut manifest = sample();
+        manifest.sign(&identity).unwrap();
+        (manifest, identity)
     }
 
     #[test]
@@ -191,6 +246,83 @@ mod tests {
         let sealed = m.seal(&key).unwrap();
         let opened = Manifest::open(&sealed, &key).unwrap();
         assert_eq!(m.serialize().unwrap(), opened.serialize().unwrap());
+    }
+
+    #[test]
+    fn sign_records_creator_and_signature() {
+        let (manifest, identity) = signed_sample();
+
+        assert_eq!(manifest.creator_pubkey, Some(identity.signing_pubkey()));
+        assert!(manifest.signature.is_some());
+        assert_eq!(
+            manifest.signature_status().unwrap(),
+            SignatureStatus::Signed {
+                creator: identity.node_id()
+            }
+        );
+    }
+
+    #[test]
+    fn signed_manifest_seal_open_roundtrip() {
+        let key = ManifestKey::random();
+        let (manifest, _) = signed_sample();
+        let sealed = manifest.seal(&key).unwrap();
+        let opened = Manifest::open(&sealed, &key).unwrap();
+
+        assert_eq!(manifest.serialize().unwrap(), opened.serialize().unwrap());
+        assert!(matches!(
+            opened.signature_status().unwrap(),
+            SignatureStatus::Signed { .. }
+        ));
+    }
+
+    #[test]
+    fn signing_is_deterministic_for_same_manifest_and_identity() {
+        let identity = Identity::random();
+        let mut a = sample();
+        let mut b = sample();
+
+        a.sign(&identity).unwrap();
+        b.sign(&identity).unwrap();
+
+        assert_eq!(a.signature, b.signature);
+        assert_eq!(a.serialize().unwrap(), b.serialize().unwrap());
+    }
+
+    #[test]
+    fn unsigned_manifest_is_legacy_compatible() {
+        assert_eq!(
+            sample().signature_status().unwrap(),
+            SignatureStatus::Unsigned
+        );
+        let bytes = sample().serialize().unwrap();
+        assert!(Manifest::deserialize(&bytes).is_ok());
+    }
+
+    #[test]
+    fn signed_manifest_rejects_tampering() {
+        let (mut manifest, _) = signed_sample();
+        manifest.file_size += 1;
+
+        let err = manifest
+            .signature_status()
+            .expect_err("expected invalid signature");
+
+        assert!(err.to_string().contains("invalid manifest signature"));
+        assert!(Manifest::deserialize(&manifest.serialize().unwrap()).is_err());
+    }
+
+    #[test]
+    fn partial_signature_fields_are_rejected() {
+        let identity = Identity::random();
+        let mut creator_only = sample();
+        creator_only.creator_pubkey = Some(identity.signing_pubkey());
+        assert!(creator_only.signature_status().is_err());
+
+        let mut signature_only = sample();
+        signature_only.sign(&identity).unwrap();
+        signature_only.creator_pubkey = None;
+        assert!(signature_only.signature_status().is_err());
     }
 
     #[test]

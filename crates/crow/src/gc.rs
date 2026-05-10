@@ -167,15 +167,18 @@ mod tests {
     use crate::chunk::MemStore;
     use crate::dir_manifest::{DirectoryEntry, DirectoryManifest};
     use crate::erasure::ErasureParams;
+    use crate::identity::Identity;
     use crate::pipeline::Crow;
     use tempfile::TempDir;
 
     fn put(crow: &Crow<MemStore>, payload: &[u8]) -> Cap {
+        let identity = Identity::random();
         crow.put_bytes_with(
             payload,
             "application/octet-stream",
             ErasureParams::default(),
             240,
+            &identity,
         )
         .expect("put_bytes_with")
     }
@@ -373,7 +376,8 @@ mod tests {
             )],
         )
         .unwrap();
-        let dir_cap = crow.put_directory_manifest(&dir).unwrap();
+        let identity = Identity::random();
+        let dir_cap = crow.put_directory_manifest(&dir, &identity).unwrap();
 
         let live = compute_live_set(crow.store(), std::slice::from_ref(&dir_cap)).unwrap();
         let report = sweep(crow.store(), &live, GcOptions::default()).unwrap();
@@ -396,7 +400,8 @@ mod tests {
             )],
         )
         .unwrap();
-        let dir_cap = crow.put_directory_manifest(&dir).unwrap();
+        let identity = Identity::random();
+        let dir_cap = crow.put_directory_manifest(&dir, &identity).unwrap();
 
         let report = targeted_remove(
             crow.store(),

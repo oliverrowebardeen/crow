@@ -8,7 +8,7 @@ A file in Crow is encrypted, chunked, hashed, erasure-coded, and stored as a set
 
 This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, **manual LAN fetch over QUIC**, and **mDNS LAN peer discovery**: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, automatic peer discovery on the local network, and subcommands such as `put`, `get`, `mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `rm`, `gc`, `serve`, `peers`, and `fetch`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
 
-Automatic replication policy, replicated metadata sync, friend-scoped sharing, and live identity-based manifest signing are deferred. See [Roadmap](#roadmap).
+Automatic replication policy, replicated metadata sync, catalog event signing, and friend-scoped sharing are deferred. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -26,7 +26,7 @@ plaintext  →  encrypt  →  chunk  →  Reed–Solomon  →  store as content-
 | Chunk store | Content-addressed byte store, namespaced by chunks vs manifests; in-memory or on-disk             | `crow::chunk`, `crow::fs_store`     |
 | Crypto      | AES-256-GCM with HKDF-SHA-256-derived per-share nonces; keys zeroize on drop                      | `crow::crypto`                      |
 | Erasure     | Reed–Solomon stripe encoding (default 3-of-5) via `reed-solomon-simd`                             | `crow::erasure`                     |
-| Manifest    | Postcard-serialized, AES-256-GCM-sealed; declares its algorithm tuple; reserved signature fields  | `crow::manifest`                    |
+| Manifest    | Postcard-serialized, AES-256-GCM-sealed, and Ed25519-signed for creator provenance                | `crow::manifest`                    |
 | Capability  | Bech32m `crow1…` string carrying (version, permission, manifest hash, manifest key)               | `crow::cap`                         |
 | Pin index   | Per-pin JSON files at `<home>/pins/<hash>.json`, atomic writes, prefix lookup                     | `crow::pin`                         |
 | Catalog     | CRDT-shaped append-only path event log at `<home>/catalog/events.jsonl`                           | `crow::catalog`                     |
@@ -120,6 +120,7 @@ shares    5
 chunk     240 (240 B)
 created   2026-05-09T01:17:32Z
 algo      Aes256Gcm / HkdfSha256 / ReedSolomon
+signed    yes (8dad17fbe7b1f81c)
 pinned    2026-05-09T01:17:32Z (note.txt)
 
 $ crow get 3b52 restored.txt
@@ -250,6 +251,7 @@ For personal devices on the same LAN, use `crow serve` + `crow fetch` as shown a
 ### Security model
 
 - Capabilities are bearer tokens: anyone with a `crow1…` cap can decrypt the referenced file or directory snapshot if they can fetch enough encrypted shares.
+- Manifest signatures prove which Crow identity created a file or directory snapshot; they do not grant access or imply that the creator is trusted.
 - The personal-cluster token is shared-secret authorization for LAN fetch. Treat it like a password for devices you own.
 - mDNS discovery is only convenience metadata. It is not trusted for authorization; fetch still requires the cluster token.
 - Crow is alpha software. Keep independent backups of important data until automatic multi-device replication is shipped and battle-tested.
@@ -294,14 +296,16 @@ Each chunk file is exactly `chunk_size + 16` bytes (the AEAD tag). Writes are co
 ## Library
 
 ```rust
-use crow::{Crow, ErasureParams, MemStore};
+use crow::{Crow, ErasureParams, Identity, MemStore};
 
 let crow = Crow::new(MemStore::new());
+let identity = Identity::random();
 
 let cap = crow.put_bytes(
     b"hello, crow",
     "text/plain",
     ErasureParams::default(),  // 3-of-5
+    &identity,
 )?;
 
 println!("{}", cap.encode());                 // crow1...
@@ -313,7 +317,7 @@ For a persistent store, swap in `FsStore`. To pin and garbage-collect:
 
 ```rust
 use crow::{
-    CatalogIndex, Crow, ErasureParams, FsStore, GcOptions, PinIndex,
+    CatalogIndex, Crow, ErasureParams, FsStore, GcOptions, Identity, PinIndex,
     compute_live_set_from_roots, sweep,
 };
 
@@ -321,8 +325,9 @@ let store = FsStore::open("/tmp/crow-data")?;
 let pins  = PinIndex::open("/tmp/crow-data")?;
 let catalog = CatalogIndex::open("/tmp/crow-data")?;
 let crow  = Crow::new(store);
+let identity = Identity::load_or_create("/tmp/crow-data")?;
 
-let cap = crow.put_bytes(b"hi", "text/plain", ErasureParams::default())?;
+let cap = crow.put_bytes(b"hi", "text/plain", ErasureParams::default(), &identity)?;
 pins.add(cap.clone(), Some("note".into()), None)?;
 
 // later, sweep anything not pinned or cataloged
@@ -397,8 +402,8 @@ Several devices owned by one user, on the same network, syncing files between th
 1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
 2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted file manifests, directory manifests, and shares from a known peer after shared-token authorization.
 3. **mDNS discovery — shipped.** `crow serve` advertises `_crow._udp.local.` with the daemon's `NodeId` (Ed25519 pubkey, persistent across restarts at `<home>/identity.json`), bound port, and friendly name. Other Crows on the same Wi-Fi auto-discover; the daemon writes `<home>/peers.json` every five seconds. `crow peers` reads the snapshot; `crow fetch <peer>` accepts a node-id hex prefix or friendly name in addition to `IP:port`. Discovery is unauthenticated by design — the existing shared `ClusterToken` still gates real chunk fetches.
-4. **Identity wiring + signed provenance.** Sign file manifests, directory manifests, and catalog events with the Ed25519 key Crow already generates; verify signatures before pinning or merging. This is the trust foundation for both personal devices and agent-produced artifacts.
-5. **Replicated metadata sync.** Merge local catalog event logs across devices with deterministic conflict rules, event IDs, author IDs, and clocks. The on-disk catalog is already operation-log-shaped so this should be a sync/merge step rather than a catalog rewrite.
+4. **Manifest signing — shipped.** New file manifests and directory snapshot manifests are signed with the Ed25519 key Crow already generates; old unsigned caps still read as legacy data, while invalid signed manifests are rejected. This proves provenance by key, not authorization or trust.
+5. **Replicated metadata sync + catalog event signing.** Merge local catalog event logs across devices with deterministic conflict rules, event IDs, author IDs, clocks, and event signatures. The on-disk catalog is already operation-log-shaped so this should be a sync/merge step rather than a catalog rewrite.
 6. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
 7. **Health and verification UX.** Show which caps are reconstructable, which devices hold shares, which catalog events are signed/merged, and whether it is safe to treat Crow as durable storage.
 

@@ -8,14 +8,14 @@
 //! - [`crypto`] — file-key / manifest-key types and AES-256-GCM seal/open with
 //!   HKDF-derived nonces.
 //! - [`erasure`] — Reed–Solomon stripe encode/decode.
-//! - [`manifest`] — the encrypted, content-addressed file manifest.
+//! - [`manifest`] — the encrypted, content-addressed, signed file manifest.
 //! - [`cap`] — Tahoe-LAFS-style capabilities encoded with Bech32m.
-//! - [`identity`] — Ed25519 + X25519 keypair holder (placeholder; not yet
-//!   wired into the pipeline).
+//! - [`identity`] — Ed25519 + X25519 keypair holder; Ed25519 signs new
+//!   manifests for provenance.
 //! - [`pipeline`] — the [`pipeline::Crow`] facade tying everything together.
 //!
 //! Networking discovery, automatic replication, replicated metadata sync, and
-//! live manifest signing are out of scope for this crate version.
+//! trust-scoped sharing are out of scope for this crate version.
 
 pub mod cap;
 pub mod catalog;
@@ -50,7 +50,8 @@ pub use gc::{
 pub use hash::{ChunkHash, Hash, ManifestHash};
 pub use identity::{Identity, NodeId};
 pub use manifest::{
-    Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, Stripe,
+    Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, SignatureStatus,
+    Stripe,
 };
 pub use pin::{PinIndex, PinRecord};
 pub use pipeline::{Crow, ManifestKind};
