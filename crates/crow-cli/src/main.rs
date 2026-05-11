@@ -34,9 +34,12 @@ use serde::{Deserialize, Serialize};
                   \n\
                   Quick start:\n\
                   \n  \
+                  crow setup --name laptop       # initialize identity, token, device name\n  \
                   crow mkdir /docs                 # create a local catalog folder\n  \
                   crow put report.pdf /docs/       # store, pin, catalog by path\n  \
                   crow ls /docs                    # list catalog entries\n  \
+                  crow cap /docs/report.pdf        # print a file cap\n  \
+                  crow share /docs/report.pdf      # print cap + receive command\n  \
                   crow info /docs/report.pdf       # show metadata + pin status\n  \
                   crow get /docs/report.pdf out.pdf # retrieve\n  \
                   crow put-dir ./Photos /photos    # import a folder tree\n  \
@@ -46,7 +49,7 @@ use serde::{Deserialize, Serialize};
                   crow gc                          # sweep anything not pinned\n  \
                   crow serve                       # serve chunks + advertise on mDNS\n  \
                   crow peers                       # list LAN peers `crow serve` discovered\n  \
-                  crow fetch laptop <cap>          # pull a cap by node-id or friendly name\n\
+                  crow receive laptop <cap> /docs/report.pdf # fetch + catalog\n\
                   \n\
                   File commands accept catalog paths, full crow1… capabilities, or \
                   hex prefixes of pinned manifest hashes; ambiguous prefixes get an \
