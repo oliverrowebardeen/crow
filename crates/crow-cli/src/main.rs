@@ -157,6 +157,30 @@ enum Command {
         /// Catalog path, full bech32m capability (`crow1…`), or pinned hash prefix.
         cap_or_prefix: String,
     },
+    /// Print a shareable cap and receive command for a file or directory.
+    #[command(
+        long_about = "Prepare a file or catalog directory for sharing. Files reuse \
+                      their existing cap. Catalog directories are frozen into a new \
+                      immutable directory snapshot cap and pinned locally. The default \
+                      output avoids embedding your device name; use `crow peers` on \
+                      the receiving device to choose a peer name, node-id prefix, or \
+                      IP:port.\n\
+                      \n\
+                      Examples:\n  \
+                      crow share /docs/report.pdf\n  \
+                      crow share /docs --name docs-snapshot\n  \
+                      crow share /docs/report.pdf --plain"
+    )]
+    Share {
+        /// Catalog path, full bech32m capability (`crow1…`), or pinned hash prefix.
+        cap_or_prefix: String,
+        /// Friendly name for a new directory snapshot pin.
+        #[arg(long)]
+        name: Option<String>,
+        /// Print only the cap.
+        #[arg(long)]
+        plain: bool,
+    },
     /// Print metadata for a catalog path, capability, or hash prefix.
     #[command(
         long_about = "Decrypt and inspect the manifest behind a capability. Shows the \
@@ -757,6 +781,20 @@ fn run(cli: Cli) -> DynResult<()> {
                 }
                 Command::Cat { cap_or_prefix } => cmd_cat(&crow, &pins, &catalog, &cap_or_prefix),
                 Command::Cap { cap_or_prefix } => cmd_cap(&pins, &catalog, &cap_or_prefix),
+                Command::Share {
+                    cap_or_prefix,
+                    name,
+                    plain,
+                } => cmd_share(
+                    &home,
+                    &crow,
+                    &pins,
+                    &catalog,
+                    &Identity::load_or_create(&home)?,
+                    &cap_or_prefix,
+                    name,
+                    plain,
+                ),
                 Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &catalog, &cap_or_prefix),
                 Command::Ls {
                     path,
@@ -943,6 +981,126 @@ fn cap_for_target(pins: &PinIndex, catalog: &CatalogIndex, arg: &str) -> DynResu
     }
 
     Ok(resolve_file_ref(catalog, pins, raw)?.cap)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShareKind {
+    File,
+    DirectorySnapshot,
+    Cap,
+}
+
+#[derive(Debug)]
+struct ShareReport {
+    kind: ShareKind,
+    cap: Cap,
+    suggested_dest: Option<CatalogPath>,
+    token_configured: bool,
+}
+
+struct ShareRequest<'a> {
+    arg: &'a str,
+    name: Option<String>,
+}
+
+fn cmd_share(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    arg: &str,
+    name: Option<String>,
+    plain: bool,
+) -> DynResult<()> {
+    let report = share_target(
+        home,
+        crow,
+        pins,
+        catalog,
+        identity,
+        ShareRequest { arg, name },
+    )?;
+    if plain {
+        println!("{}", report.cap.encode());
+        return Ok(());
+    }
+
+    println!("type      {}", share_kind_label(&report.kind));
+    println!("cap       {}", report.cap.encode());
+    if report.token_configured {
+        println!("token     configured");
+    } else {
+        println!("token     missing (run `crow setup` before LAN fetch)");
+    }
+    let receive_dest = report
+        .suggested_dest
+        .as_ref()
+        .map(|path| format!(" {path}"))
+        .unwrap_or_default();
+    println!(
+        "receive   crow receive <peer> {}{}",
+        report.cap.encode(),
+        receive_dest
+    );
+    Ok(())
+}
+
+fn share_target(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    request: ShareRequest<'_>,
+) -> DynResult<ShareReport> {
+    let token_configured = TokenStore::open(home).exists();
+    let raw = request.arg.trim();
+    if !raw.starts_with("crow1") {
+        if let Ok(path) = CatalogPath::normalize(raw) {
+            let view = catalog.view()?;
+            if let Some(entry) = view.get(&path) {
+                return match &entry.kind {
+                    EntryKind::File { cap, .. } => Ok(ShareReport {
+                        kind: ShareKind::File,
+                        cap: cap.clone(),
+                        suggested_dest: Some(path),
+                        token_configured,
+                    }),
+                    EntryKind::Dir => {
+                        let manifest = directory_manifest_from_catalog(&view, &path)?;
+                        let cap = crow.put_directory_manifest(&manifest, identity)?;
+                        let pin_name = request.name.or_else(|| directory_snapshot_name(&path));
+                        pins.add(cap.clone(), pin_name, None)?;
+                        Ok(ShareReport {
+                            kind: ShareKind::DirectorySnapshot,
+                            cap,
+                            suggested_dest: Some(path),
+                            token_configured,
+                        })
+                    }
+                };
+            }
+            if raw.starts_with('/') {
+                return Err(format!("catalog path not found: {path}").into());
+            }
+        }
+    }
+
+    Ok(ShareReport {
+        kind: ShareKind::Cap,
+        cap: resolve_file_ref(catalog, pins, raw)?.cap,
+        suggested_dest: None,
+        token_configured,
+    })
+}
+
+fn share_kind_label(kind: &ShareKind) -> &'static str {
+    match kind {
+        ShareKind::File => "file",
+        ShareKind::DirectorySnapshot => "directory snapshot",
+        ShareKind::Cap => "cap",
+    }
 }
 
 fn cmd_info(
@@ -4357,6 +4515,106 @@ mod tests {
         assert!(dir_err.to_string().contains("catalog directory"));
         assert!(dir_err.to_string().contains("crow share /docs"));
         assert!(missing_err.to_string().contains("catalog path not found"));
+    }
+
+    #[test]
+    fn share_catalog_file_reports_existing_cap_and_token_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let identity = Identity::random();
+        let cap = stored_cap(&crow, b"share me");
+        TokenStore::open(tmp.path())
+            .save(ClusterToken::from_bytes([1u8; 32]))
+            .unwrap();
+        catalog
+            .put_file("/docs.txt", cap.clone(), Some("docs.txt".into()))
+            .unwrap();
+
+        let report = share_target(
+            tmp.path(),
+            &crow,
+            &pins,
+            &catalog,
+            &identity,
+            ShareRequest {
+                arg: "/docs.txt",
+                name: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.kind, ShareKind::File);
+        assert_eq!(report.cap.encode(), cap.encode());
+        assert_eq!(
+            report.suggested_dest.as_ref().map(CatalogPath::as_str),
+            Some("/docs.txt")
+        );
+        assert!(report.token_configured);
+    }
+
+    #[test]
+    fn share_full_cap_does_not_require_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let identity = Identity::random();
+        let cap = cap_with_hash_byte(0x62);
+
+        let report = share_target(
+            tmp.path(),
+            &crow,
+            &pins,
+            &catalog,
+            &identity,
+            ShareRequest {
+                arg: &cap.encode(),
+                name: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.kind, ShareKind::Cap);
+        assert_eq!(report.cap.encode(), cap.encode());
+        assert!(!report.token_configured);
+    }
+
+    #[test]
+    fn share_directory_creates_pinned_snapshot_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let identity = Identity::random();
+        let child = stored_cap(&crow, b"child");
+        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog
+            .put_file("/docs/nested/file.txt", child, Some("file.txt".into()))
+            .unwrap();
+
+        let report = share_target(
+            tmp.path(),
+            &crow,
+            &pins,
+            &catalog,
+            &identity,
+            ShareRequest {
+                arg: "/docs",
+                name: Some("docs shared".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.kind, ShareKind::DirectorySnapshot);
+        let manifest = crow.open_directory_manifest(&report.cap).unwrap();
+        assert_eq!(manifest.file_count(), 1);
+        let pin = pins
+            .get(report.cap.manifest_hash.inner())
+            .unwrap()
+            .expect("directory snapshot should be pinned");
+        assert_eq!(pin.name.as_deref(), Some("docs shared"));
     }
 
     #[test]
