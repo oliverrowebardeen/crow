@@ -10,7 +10,7 @@ use crow::{
     Cap, CatalogEntry, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
     ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, NodeId,
-    PinIndex, PinRecord, SignatureStatus, compute_live_set_from_roots,
+    PinIndex, PinRecord, SignatureStatus, compute_live_set, compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
@@ -189,6 +189,21 @@ enum Command {
     Find {
         /// Basename glob pattern. Slash-separated path globs are not supported.
         pattern: String,
+    },
+    /// Summarize logical and local stored size for a catalog path.
+    #[command(
+        long_about = "Show size usage for a catalog file or directory. Logical size is \
+                      the sum of file sizes from manifests. Stored size is the unique \
+                      local manifest/chunk bytes currently present for the referenced \
+                      caps, so copied/shared caps are counted once for storage.\n\
+                      \n\
+                      Examples:\n  \
+                      crow du\n  \
+                      crow du /docs"
+    )]
+    Du {
+        /// Optional catalog path. Defaults to /.
+        path: Option<String>,
     },
     /// Create a local catalog directory.
     #[command(
@@ -520,6 +535,7 @@ fn run(cli: Cli) -> DynResult<()> {
                 } => cmd_ls(&crow, &pins, &catalog, path.as_deref(), long, pins_only),
                 Command::Tree { path } => cmd_tree(&catalog, path.as_deref()),
                 Command::Find { pattern } => cmd_find(&catalog, &pattern),
+                Command::Du { path } => cmd_du(&crow, &catalog, path.as_deref()),
                 Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
                 Command::PutDir { source, dest, yes } => cmd_put_dir(
                     &crow,
@@ -922,6 +938,133 @@ fn simple_glob_matches(pattern: &str, text: &str) -> bool {
         }
     }
     dp[pattern.len()][text.len()]
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DuReport {
+    path: CatalogPath,
+    files: usize,
+    directories: usize,
+    logical_bytes: u64,
+    unknown_files: usize,
+    stored_manifests: usize,
+    stored_chunks: usize,
+    stored_bytes: u64,
+}
+
+fn cmd_du(crow: &Crow<FsStore>, catalog: &CatalogIndex, path: Option<&str>) -> DynResult<()> {
+    let view = catalog.view()?;
+    let path = match path {
+        Some(path) => CatalogPath::normalize(path)?,
+        None => CatalogPath::root(),
+    };
+    let report = catalog_du_report(crow, &view, &path)?;
+    for line in format_du_report(&report) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn catalog_du_report(
+    crow: &Crow<FsStore>,
+    view: &CatalogView,
+    path: &CatalogPath,
+) -> DynResult<DuReport> {
+    let Some(entry) = view.get(path) else {
+        return Err(format!("catalog path not found: {path}").into());
+    };
+
+    let entries: Vec<&CatalogEntry> = if entry.is_dir() {
+        catalog_subtree_entries(view, path)
+            .into_iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::File { .. }))
+            .collect()
+    } else {
+        vec![entry]
+    };
+
+    let mut caps = Vec::new();
+    let mut logical_bytes = 0u64;
+    let mut unknown_files = 0usize;
+    for entry in &entries {
+        let Some(cap) = entry.cap() else {
+            continue;
+        };
+        caps.push(cap.clone());
+        match cap_logical_size(crow, cap)? {
+            Some(bytes) => logical_bytes = logical_bytes.saturating_add(bytes),
+            None => unknown_files += 1,
+        }
+    }
+
+    let live = compute_live_set(crow.store(), &caps)?;
+    let stored_manifests = live
+        .iter()
+        .filter(|(namespace, _)| *namespace == Namespace::Manifests)
+        .count();
+    let stored_chunks = live
+        .iter()
+        .filter(|(namespace, _)| *namespace == Namespace::Chunks)
+        .count();
+    let stored_bytes = live
+        .iter()
+        .filter_map(|(namespace, hash)| crow.store().size(*namespace, hash).ok().flatten())
+        .sum();
+
+    Ok(DuReport {
+        path: path.clone(),
+        files: entries.len(),
+        directories: if entry.is_dir() {
+            catalog_subtree_entries(view, path)
+                .into_iter()
+                .filter(|entry| entry.is_dir())
+                .count()
+        } else {
+            0
+        },
+        logical_bytes,
+        unknown_files,
+        stored_manifests,
+        stored_chunks,
+        stored_bytes,
+    })
+}
+
+fn cap_logical_size(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<Option<u64>> {
+    match crow.open_manifest_kind(cap) {
+        Ok(ManifestKind::File(manifest)) => Ok(Some(manifest.file_size)),
+        Ok(ManifestKind::Directory(manifest)) => directory_logical_size(crow, &manifest),
+        Err(_) => Ok(None),
+    }
+}
+
+fn format_du_report(report: &DuReport) -> Vec<String> {
+    let mut lines = vec![
+        format!("path          {}", report.path),
+        format!("files         {}", report.files),
+        format!("directories   {}", report.directories),
+        format!("logical       {}", format_size_u64(report.logical_bytes)),
+        format!("stored        {}", format_size_u64(report.stored_bytes)),
+        format!(
+            "objects       {} manifest{} / {} chunk{}",
+            report.stored_manifests,
+            if report.stored_manifests == 1 {
+                ""
+            } else {
+                "s"
+            },
+            report.stored_chunks,
+            if report.stored_chunks == 1 { "" } else { "s" },
+        ),
+    ];
+    if report.unknown_files > 0 {
+        lines.push(format!(
+            "unknown       {} file{}",
+            report.unknown_files,
+            if report.unknown_files == 1 { "" } else { "s" }
+        ));
+    }
+    lines
 }
 
 fn pin_listing_metadata(
@@ -3069,6 +3212,74 @@ mod tests {
         assert!(simple_glob_matches("report-??.pdf", "report-01.pdf"));
         assert!(!simple_glob_matches("report-??.pdf", "report-001.pdf"));
         assert!(!simple_glob_matches("*.md", "notes.MD"));
+    }
+
+    #[test]
+    fn du_sums_logical_size_but_deduplicates_stored_objects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"shared");
+        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog
+            .put_file("/docs/a.txt", cap.clone(), Some("a.txt".into()))
+            .unwrap();
+        catalog
+            .put_file("/docs/nested/b.txt", cap, Some("b.txt".into()))
+            .unwrap();
+        let path = CatalogPath::normalize("/docs").unwrap();
+
+        let report = catalog_du_report(&crow, &catalog.view().unwrap(), &path).unwrap();
+
+        assert_eq!(report.files, 2);
+        assert_eq!(report.directories, 1);
+        assert_eq!(report.logical_bytes, 12);
+        assert_eq!(report.unknown_files, 0);
+        assert_eq!(report.stored_manifests, 1);
+        assert_eq!(report.stored_chunks, 5);
+        assert!(report.stored_bytes > report.logical_bytes);
+    }
+
+    #[test]
+    fn du_reports_file_targets_and_missing_manifests() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let missing = cap_with_hash_byte(0x48);
+        catalog.mkdir("/docs", false).unwrap();
+        catalog
+            .put_file("/docs/missing.txt", missing, Some("missing.txt".into()))
+            .unwrap();
+        let path = CatalogPath::normalize("/docs/missing.txt").unwrap();
+
+        let report = catalog_du_report(&crow, &catalog.view().unwrap(), &path).unwrap();
+
+        assert_eq!(report.files, 1);
+        assert_eq!(report.directories, 0);
+        assert_eq!(report.logical_bytes, 0);
+        assert_eq!(report.unknown_files, 1);
+        assert_eq!(report.stored_manifests, 0);
+        assert_eq!(report.stored_chunks, 0);
+        assert!(
+            format_du_report(&report)
+                .iter()
+                .any(|line| line == "unknown       1 file")
+        );
+    }
+
+    #[test]
+    fn du_missing_path_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let err = catalog_du_report(
+            &crow,
+            &catalog.view().unwrap(),
+            &CatalogPath::normalize("/missing").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("catalog path not found"));
     }
 
     #[test]
