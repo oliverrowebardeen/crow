@@ -6,7 +6,7 @@ A file in Crow is encrypted, chunked, hashed, erasure-coded, and stored as a set
 
 ## Status
 
-This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, **manual LAN fetch over QUIC**, and **mDNS LAN peer discovery**: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, automatic peer discovery on the local network, and subcommands such as `put`, `get`, `mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `rm`, `gc`, `serve`, `peers`, and `fetch`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
+This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, **manual LAN fetch over QUIC**, and **mDNS LAN peer discovery**: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, automatic peer discovery on the local network, and subcommands such as `put`, `get`, `cat`, `mkdir`, `ls`, `tree`, `find`, `du`, `mv`, `cp`, `put-dir`, `get-dir`, `stat`, `grep`, `rm`, `gc`, `serve`, `peers`, and `fetch`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
 
 Automatic replication policy, replicated metadata sync, catalog event signing, and friend-scoped sharing are deferred. See [Roadmap](#roadmap).
 
@@ -73,10 +73,15 @@ Requirements: Rust 1.85+ and a network that allows UDP multicast for mDNS discov
 ```
 crow put <file> [catalog-path] [--name NAME] [--mime MIME] [--chunk-size N]
 crow get <path-or-cap-or-prefix> <out>
+crow cat <path-or-cap-or-prefix>
 crow info <path-or-cap-or-prefix>
 crow mkdir [-p] <catalog-path>
 crow ls [catalog-path] [--long] [--pins]
+crow tree [catalog-path]
+crow find <basename-glob>
+crow du [catalog-path]
 crow mv <from-path> <to-path>
+crow cp <src-path-or-cap-or-prefix> <catalog-path>
 crow put-dir <local-dir> [catalog-dir] [--yes]
 crow cap-dir <catalog-dir> [--name NAME]
 crow get-dir <catalog-dir-or-dir-cap> <local-dir> [--yes]
@@ -85,7 +90,8 @@ crow pin  <cap> [--name NAME]
 crow unpin [-r] <path-or-cap-or-prefix>
 crow rm   <path-or-cap-or-prefix> [--dry-run]
 crow gc   [--dry-run]
-crow stat
+crow stat [path-or-cap-or-prefix]
+crow grep <regex> <path-or-cap-or-prefix>
 crow token init|show|set
 crow serve [--bind ADDR] [--name NAME]
 crow peers [--long] [--json]
@@ -127,6 +133,9 @@ $ crow get 3b52 restored.txt
 $ diff note.txt restored.txt && echo ok
 ok
 
+$ crow cat 3b52
+hello, crow
+
 $ crow rm 3b52
 removed pin 3b52b656c0d08234 (note.txt)
 deleted 1 manifest / 5 chunks (1.48 KiB)
@@ -136,6 +145,7 @@ store         /home/alice/.crow
 manifests     0 files / 0 B
 chunks        0 files / 0 B
 pins          0
+catalog files 0
 unreferenced  0 manifests / 0 chunks (0 B)
 ```
 
@@ -148,14 +158,24 @@ If you pass a catalog destination to `put`, Crow stores the file under that path
 ```sh
 crow mkdir -p /docs/projects
 crow put report.pdf /docs/projects/
+crow put notes.md /docs/projects/
 crow ls /docs/projects
+crow tree /docs
+crow find '*.pdf'
+crow du /docs
 crow info /docs/projects/report.pdf
+crow stat /docs/projects/report.pdf
 crow get /docs/projects/report.pdf restored.pdf
+crow cat /docs/projects/notes.md | grep TODO
+crow grep TODO /docs
+crow cp /docs/projects/report.pdf /docs/projects/q2-copy.pdf
 crow mv /docs/projects/report.pdf /docs/projects/q2-report.pdf
 crow unpin /docs/projects/q2-report.pdf       # detach path; chunks remain until gc
 crow unpin -r /docs/projects                  # detach a directory subtree
 crow rm /docs/projects/q2-report.pdf --dry-run
 ```
+
+`tree`, `find`, and `du` work from catalog metadata plus local manifests: no network traversal is implied. `find` searches basenames only. `cp` is metadata-only and points another catalog path at the same cap without duplicating chunks. `cat` writes raw file bytes to stdout, while `grep` reconstructs and searches file contents; use `find` when you only need a cheap name search.
 
 Bulk folder import/export is explicit and asks for confirmation:
 
@@ -264,10 +284,11 @@ tar cf - ~/Documents | crow put -
 
 # write the bytes back to stdout
 crow get crow1qyq...m0r - > backup.tar
+crow cat crow1qyq...m0r > backup.tar
 
 # end-to-end stream
 echo 'secret' | crow put - > note.cap
-crow get "$(cat note.cap)" -
+crow cat "$(cat note.cap)"
 ```
 
 ### Storage layout
@@ -399,7 +420,7 @@ BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed–
 
 Several devices owned by one user, on the same network, syncing files between them.
 
-1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `mv`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
+1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`mkdir`, `ls`, `tree`, `find`, `du`, `cat`, `mv`, `cp`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`, `grep`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
 2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted file manifests, directory manifests, and shares from a known peer after shared-token authorization.
 3. **mDNS discovery — shipped.** `crow serve` advertises `_crow._udp.local.` with the daemon's `NodeId` (Ed25519 pubkey, persistent across restarts at `<home>/identity.json`), bound port, and friendly name. Other Crows on the same Wi-Fi auto-discover; the daemon writes `<home>/peers.json` every five seconds. `crow peers` reads the snapshot; `crow fetch <peer>` accepts a node-id hex prefix or friendly name in addition to `IP:port`. Discovery is unauthenticated by design — the existing shared `ClusterToken` still gates real chunk fetches.
 4. **Manifest signing — shipped.** New file manifests and directory snapshot manifests are signed with the Ed25519 key Crow already generates; old unsigned caps still read as legacy data, while invalid signed manifests are rejected. This proves provenance by key, not authorization or trust.
