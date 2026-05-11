@@ -447,75 +447,233 @@ Commits should be focused and reviewed through pull requests. See [CONTRIBUTING.
 
 ## Roadmap
 
+This roadmap describes where Crow is headed. Later phases are plans that may change as the project develops.
+
 Crow is being built as a local-first storage protocol first. The primary product surface is a
 personal encrypted file space across your own devices; the same primitives can also support shared
 signed context/artifact storage for developers and agents. Those surfaces need the same foundations:
 identity, signed provenance, CRDT metadata sync, durable replication, and transport that works over
 LAN, mesh, and the internet.
 
+### Target model
+
 The long-term user model is a **nest**: a named encrypted vault shared by trusted devices. A nest has
-its own file tree, device list, keys, sharing rules, and storage policy. Today Crow has one local
-catalog and a shared personal-cluster token; the roadmap moves that toward multiple nameable nests
-without making users think about shards or manifests.
+its own file tree, device list, keys, sharing rules, and storage policy. Users should think in terms
+of nests, paths, devices, safety, and availability. They should not need to think about manifests,
+shares, shard indexes, or peer addresses during normal use.
 
-### Phase 0 — data model (shipped)
+- **Nest.** A named encrypted file space, e.g. `personal`, `work`, `family-photos`, or `agents`.
+- **Device.** A trusted machine attached to a nest with a cryptographic identity and local friendly name.
+- **Catalog.** The CRDT-shaped file tree every trusted device can merge.
+- **Object.** Encrypted manifests and shares addressed by BLAKE3 hashes.
+- **Cap.** A portable bearer token for one immutable object or directory snapshot; powerful but not the main daily UX.
+- **Pin.** A policy saying "keep this path available on this device."
+- **Cache.** Temporary local bytes Crow may delete when safe.
+- **Mirror.** A policy saying "keep the whole nest available on this device."
+- **Prime.** An operational command saying "this device is online; make it useful now."
+- **Drain.** An operational command saying "this device is leaving; move hot responsibility elsewhere."
+- **Sync.** Nest convergence, not "clone everything from one peer."
+- **Health.** The user-facing answer to "can I open this now, and is it safe if a device disappears?"
 
-BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed–Solomon erasure (default 3-of-5), postcard-serialized AEAD-sealed manifests, bech32m capabilities, in-memory and on-disk chunk stores, end-to-end put/get pipeline.
+### Execution rules
 
-### Phase 1 — personal device foundation
+- Keep the current CLI working while adding the nest layer. Do not break existing `~/.crow` stores without a migration path.
+- Use one coherent commit per step. Each CLI command or protocol change should usually be its own commit.
+- Every CLI change needs help text, README updates, and tests covering success and important edge cases.
+- Preserve existing low-level commands until their replacement is shipped. Hide or document them as advanced before removing anything.
+- Do not make normal users manage shards directly. Sharding is an internal placement mechanism; the UI is safety, availability, pinning, cache, mirror, prime, and drain.
+- Do not depend on users remembering `crow drain` for correctness. Sudden sleep, crash, power loss, and network loss must be repaired by background health checks.
+- Do not add destructive local-file lifecycle management such as `--rm-local` until Crow can prove data is durable on independent devices.
+- Treat mDNS names and friendly names as convenience only. Authorization must come from nest membership, scoped keys, and signed identity.
+- Keep caps as stable protocol primitives even if daily UX moves toward nests and native sharing.
+- Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` before merging non-doc changes.
+
+### Command fate audit
+
+| Current feature | Future role | Recommendation |
+| --- | --- | --- |
+| `put`, `get`, `cat` | Core file I/O inside the active nest | Keep; later auto-fetch missing bytes from reachable devices when possible. |
+| `mkdir`, `ls`, `tree`, `find`, `grep`, `du` | Core filesystem-style UX | Keep; scope to active nest and teach `du` to separate logical size, local bytes, cache, pins, and replicas. |
+| `put-dir`, `get-dir` | Bulk import/export between regular filesystem and a nest | Keep; eventually integrate with first-class directory objects and FUSE/app surfaces. |
+| `mv`, `cp`, `rm` | Catalog mutation | Keep; make mutations signed nest events and keep `rm --dry-run` safety. |
+| `info`, `stat` | Object/path metadata | Consolidate semantics: `stat` for a path/object, future `status` for nest health. Keep aliases if useful. |
+| `pin`, `unpin` | Local availability policy | Reframe: `pin` means keep bytes available here; `unpin` means stop requiring local availability, not necessarily delete from the nest. |
+| `gc` | Local maintenance | Keep as advanced/manual; long-term daemon should perform safe cache cleanup automatically. |
+| `cap` | Raw protocol link | Keep as advanced/power-user output for scripts and one-off object sharing. |
+| `share`, `receive` | Transitional cap handoff | Keep now; later route normal sharing through offer/inbox/accept while preserving raw cap mode. |
+| `cap-dir`, `add-dir` | Immutable directory snapshots | Keep as snapshot tools; long-term add first-class mutable shared directories. |
+| `serve` | Local daemon | Keep; future app or service should run it automatically. |
+| `peers` | Discovered network endpoints | Keep as diagnostic; future daily command is `crow nest devices`. |
+| `device` | Local identity/name | Keep; nest membership should reference device identities, not just friendly names. |
+| `setup` | Bootstrap wrapper | Keep; future `setup` should create or join a default nest. |
+| `token` | Shared personal-cluster secret | Replace with nest invites and scoped keys. Keep temporarily as an advanced LAN testing bridge. |
+| `fetch` | Low-level object transfer | Keep as advanced/debug. Normal use should be `sync`, lazy fetch, or native sharing. |
+| `sync <peer>` | Manual peer pull | Reframe as `sync` for nest convergence; keep `sync <device>` as an explicit/debug override. |
+| New `nest` | Named encrypted vaults | Add as the main namespace: `create`, `list`, `use`, `rename`, `devices`, `status`, `invite`, `join`, `leave`. |
+| New `status` | Health and availability | Add as a first-class command before destructive storage controls. |
+| New `mirror`, `evict` | Placement policy | Add after health exists. `evict` must refuse unsafe deletion. |
+| New `prime`, `drain` | Temporary availability operations | Add after availability accounting exists; these should move hot shards/cache, not change permanent membership. |
+| New `inbox`, `accept` | Native sharing | Add with offer objects so users can share through Crow without a separate chat app. |
+
+### Phase 0 — shipped data model
+
+BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed-Solomon erasure
+(default 3-of-5), postcard-serialized AEAD-sealed manifests, bech32m capabilities, in-memory and
+on-disk chunk stores, end-to-end put/get pipeline, and signed manifests.
+
+Done means the current invariant stays true forever: a file can be put, represented by a cap,
+fetched from content-addressed encrypted shares, and reconstructed even with up to `N - K` missing
+shares per stripe.
+
+### Phase 1 — shipped personal device foundation
 
 Several devices owned by one user, initially on the same LAN, syncing files between them.
 
-1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`setup`, `device`, `mkdir`, `ls`, `tree`, `find`, `du`, `cat`, `cap`, `share`, `receive`, `sync`, `mv`, `cp`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`, `grep`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
-2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted file manifests, directory manifests, and shares from a known peer after shared-token authorization.
-3. **mDNS discovery — shipped.** `crow serve` advertises `_crow._udp.local.` with the daemon's `NodeId` (Ed25519 pubkey, persistent across restarts at `<home>/identity.json`), bound port, and friendly name. Other Crows on the same Wi-Fi auto-discover; the daemon writes `<home>/peers.json` every five seconds. `crow peers` reads the snapshot; `crow fetch <peer>` accepts a node-id hex prefix or friendly name in addition to `IP:port`. Discovery is unauthenticated by design — the existing shared `ClusterToken` still gates real chunk fetches.
-4. **Manifest signing — shipped.** New file manifests and directory snapshot manifests are signed with the Ed25519 key Crow already generates; old unsigned caps still read as legacy data, while invalid signed manifests are rejected. This proves provenance by key, not authorization or trust.
-5. **Manual personal-cloud sync — shipped.** `crow sync <peer>` pulls catalog events from a trusted personal device, merges them deterministically, then fetches and verifies missing encrypted objects for every cataloged file. This removes the need to manually pass caps between your own devices, but it is still explicit, pull-based sync.
-6. **Background sync + catalog event signing.** Move from manual `crow sync` to quiet peer-to-peer catalog convergence, and sign catalog events with the device identity so a device can prove who created, renamed, or removed a path.
-7. **Metadata-first sync.** Let every trusted device see the same file tree without forcing every device to store every byte. A laptop or phone should be able to know `/photos/trip.mov` exists while downloading or reconstructing the bytes only when needed.
-8. **Health and verification UX.** Show which paths are reconstructable, cached locally, available from peers, under-replicated, or unsafe to delete from the regular filesystem. This is the prerequisite for treating Crow as durable storage.
+1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, local catalog paths, folder import/export, tree/find/du/cat/stat/grep, immutable directory snapshot caps, and path-aware `unpin`.
+2. **Daemon + chunk-fetch — shipped.** `crow serve` listens over QUIC and serves encrypted manifests/chunks to authorized clients.
+3. **mDNS discovery — shipped.** LAN discovery advertises node id, port, and friendly name; authorization still comes from the token, not mDNS.
+4. **Manifest signing — shipped.** New manifests are signed with the device Ed25519 identity; invalid signed manifests are rejected.
+5. **Manual sync — shipped.** `crow sync <peer>` pulls catalog events and enough encrypted objects to make catalog files locally reconstructable.
 
-### Phase 2 — nests and storage policy
+Phase 1 is useful for private LAN testing, but it is not the final product model. It currently
+increases storage use when every device fully syncs every object. Future phases must move toward
+metadata-first sync, selective local bytes, and policy-driven placement.
 
-Turn the single personal catalog into explicit named spaces and start making storage placement smart.
+### Phase 2 — nest foundation
 
-9. **Named nests.** Add commands for multiple encrypted vaults, e.g. `crow nest create personal`, `crow nest use personal`, `crow nest devices`, and `crow nest status`. Each nest owns its catalog, trusted device set, keys, and policy.
-10. **Pin, cache, mirror, evict.** Make byte placement explicit: pin a path on this device, mirror a whole nest on an anchor device, cache recently opened files, and evict local chunks only when Crow can prove the nest still has enough copies elsewhere.
-11. **Prime and drain.** Add operational commands for temporary device availability. `crow prime [path]` means "this device is online; make it useful now" by pulling hot shards/cache for the current nest or subtree and letting the device count toward near-term availability. `crow drain [path]` means "this device is leaving" by moving hot shard responsibility elsewhere, verifying the nest is still healthy, then deleting only temporary local shards that are safe to remove. These commands improve laptop/airport/offline workflows, but correctness must not depend on people remembering to run `drain`; background health checks still have to repair after sudden sleep, crash, or network loss.
-12. **Replication policy.** Move beyond "sync everything here" by tracking how many independent devices should hold each file or shard. Initial policy can be replica-based; later policy can place erasure-coded shards across devices to save space compared with full replication.
-13. **Shard placement scheduler.** Use device role, free space, uptime, network quality, battery, and trust level to decide where encrypted shares should live. The user-facing state should stay simple: safe, at risk, available now, or needs another device online.
+Turn the single local catalog into explicit named encrypted spaces without breaking the existing CLI.
 
-### Phase 3 — internet, mesh, and friend testing
+1. **Nest metadata model.** Add a nest record with stable id, human name, created timestamp, creator device id, catalog root, storage policy, member list, and key material references. Keep the actual secret material separate from display metadata.
+2. **Storage layout migration.** Introduce a future layout such as `<home>/nests/<nest-id>/catalog`, `<home>/nests/<nest-id>/pins`, and `<home>/nests/<nest-id>/policy.json`. Migrate the current single catalog/pin index into a default `personal` nest on first use.
+3. **Active nest selection.** Add `crow nest list`, `crow nest create <name>`, `crow nest use <name-or-id>`, `crow nest current`, and `--nest <name-or-id>`. Existing commands should operate inside the active nest.
+4. **Nest-safe setup.** Make `crow setup` create identity plus a default `personal` nest. If legacy setup data exists, adopt it instead of overwriting it.
+5. **Nest devices view.** Add `crow nest devices` as the user-facing trusted-device list. Keep `crow peers` as lower-level LAN/network discovery.
+6. **Migration tests.** Cover empty homes, legacy homes, active nest switching, duplicate names, invalid names, and rollback-safe partial migration.
 
-Make a nest usable when devices are not on the same Wi-Fi, and make it possible to test with trusted
-friends without giving them the full personal-cluster token.
+Acceptance criteria: existing README workflows still work; new users see a default nest; multiple
+nests can coexist without cross-contaminating catalog entries, pins, policies, or member metadata.
 
-14. **Internet reachability.** Add NAT traversal plus a small zero-knowledge relay for devices on different networks. Relays should see only opaque ciphertext and routing metadata, never cap keys or plaintext.
-15. **Stable device addressing.** Keep mDNS as LAN convenience, but make device identity cryptographic and routable across LAN, internet relay, and mesh transports. Friendly names remain local labels, not authorization.
-16. **Crow-native sharing flow.** Add offer/inbox/accept semantics so a friend or teammate can receive an encrypted share invitation through Crow instead of a separate chat app. The durable version uses recipient pubkeys, explicit per-cap access lists, optional expiry, and pull-through from your devices or a relay.
-17. **Friend backup / scoped storage.** Let a trusted friend hold encrypted backup shards for a specific nest or path without gaining access to the whole nest. This is the safe path for real-world testing with friends before broader public infrastructure exists.
-18. **Mesh transport.** Run the same chunk-fetch protocol over mesh-friendly links such as Wi-Fi Direct, BLE, LoRa, or community mesh networks. Mesh is slower and intermittent, so it should be treated as another route for catalog sync and shard fetch, not a separate product mode.
+### Phase 3 — signed metadata and nest membership
 
-### Phase 4 — adapters and shared workspaces
+Replace shared-token trust with explicit nest membership.
 
-Make Crow useful to more than one local user or process without changing the core storage model.
+1. **Signed catalog events.** Sign every catalog event with the device identity. Validation should reject malformed signatures, unknown writers when policy requires membership, and event replay with mismatched ids.
+2. **Member roles.** Start with simple roles: owner/admin, writer, reader, storage-only. Do not build SaaS/team admin UI yet; the CLI and data model are enough.
+3. **Device invites.** Add `crow nest invite` and `crow nest join` for your own devices. The invite should carry nest id, bootstrap endpoint hints, allowed device pubkey or pairing secret, and scoped permissions.
+4. **Scoped authorization.** Replace the shared cluster token with per-nest authorization. A device should only be able to request catalog data and objects for nests it belongs to.
+5. **Revocation shape.** Add a first conservative revocation model: stop accepting future signed events from a removed device and stop serving new object requests to it. Historical objects already copied to the device remain out of scope until key rotation exists.
+6. **Compatibility bridge.** Keep `token` and token-based LAN fetch as an advanced testing mode until nest invites are reliable.
 
-19. **Local HTTP API.** Expose put/get/list/pin/catalog/fetch operations from `crow serve` over a local API so tools in any language can use Crow without shelling out.
-20. **MCP server proof.** Provide a small MCP server that lets AI tools store and retrieve caps, read catalog resources, and publish signed context/artifact bundles. Crow should be the substrate under agents, not the agent runner.
-21. **Workspace object.** Add a signed workspace manifest/event log that names members, roles, trusted devices, and replication policy. Start local-first and single-team; avoid SaaS admin surfaces until the protocol shape is proven.
-22. **CI and SDK ergonomics.** Fast install path, Docker image, Python SDK first, then JS/TS. The first target is ephemeral jobs and agents that need to publish or fetch durable signed artifacts.
-23. **Streaming and resume.** Replace all large-object paths that require whole-file `Vec<u8>` buffering with streaming APIs and resumable transfer so build artifacts, datasets, and model files are realistic.
+Acceptance criteria: two devices can join the same nest without copying a raw shared cluster token;
+catalog events show who created them; a non-member cannot sync nest metadata or fetch objects through
+the normal protocol.
 
-### Not yet on the roadmap
+### Phase 4 — metadata-first sync
 
-- Sled / redb backends — `FsStore` with temp+rename atomic writes is sufficient for the foreseeable workloads; revisit when concurrent access patterns demand it.
-- Write capabilities — only `Read` exists today.
-- Convergent encryption for cross-file dedup.
-- Content-defined chunking (FastCDC) for similar-file dedup.
-- Live shared folders — directory caps are immutable snapshots today, not mutable sync relationships.
-- Agent runner / scheduler — Crow may expose storage to agents, but should not become the orchestration layer.
-- Full team SaaS admin UI — useful later if workspaces land, but premature before the protocol and local API are proven.
-- `--rm-local` / destructive local-file lifecycle management — unsafe until multi-device replication can prove data is durable elsewhere.
+Make `sync` mean "converge this nest" instead of "download everything from that peer."
+
+1. **Split catalog sync from object sync.** Pull and merge catalog events without automatically fetching every manifest and share.
+2. **No-arg sync.** Add `crow sync` to sync the active nest with all reachable trusted devices. Keep `crow sync <device>` for explicit debugging or targeted repair.
+3. **Object availability index.** Track which devices claim to hold which manifests/shares, when that claim was last seen, and whether it was verified.
+4. **Lazy object fetch.** `get`, `cat`, `grep`, and `get-dir` should attempt to fetch missing objects from reachable trusted devices when local reconstruction fails.
+5. **Bounded sync modes.** Support metadata-only, path-scoped, and full-local sync. The default should not silently clone the entire nest onto small devices.
+6. **Conflict reporting.** Catalog CRDT conflicts should be deterministic and visible. Do not silently lose path updates.
+
+Acceptance criteria: a phone or laptop can see a large file in the catalog without storing its bytes;
+opening the file pulls enough encrypted shares from reachable devices; `crow sync` does not imply
+"store everything locally" unless policy says so.
+
+### Phase 5 — health, placement, and storage policy
+
+Make Crow answer whether data is safe, available, local, cached, pinned, mirrored, or at risk.
+
+1. **Health model.** Define states such as `local`, `available-now`, `available-if-device-online`, `under-replicated`, `unverified`, `at-risk`, and `missing`.
+2. **`crow status`.** Add a nest-level health command that summarizes catalog events, local bytes, remote availability, missing shares, under-replicated paths, and unsafe-to-evict objects.
+3. **`crow stat` detail.** Keep `stat` focused on one path/object: logical size, local bytes, cap, manifest hash, erasure params, signing key, pin/cache/mirror state, and known shard locations.
+4. **Policy file.** Add per-nest policy for minimum replicas, shard target, local cache budget, path-specific pins, mirror devices, and whether friend/storage-only devices may hold encrypted shares.
+5. **Pin semantics.** `crow pin /path` means keep this path locally available. `crow unpin /path` means remove that local requirement, not necessarily remove the path from the nest.
+6. **Mirror semantics.** Add `crow mirror on|off [path]` after health exists. A mirror device keeps the whole nest or subtree reconstructable locally.
+7. **Safe evict.** Add `crow evict [path]` only after health can prove the nest remains reconstructable elsewhere. It deletes local cache/temp shards, not catalog entries.
+8. **Background healer.** The daemon should repair under-replicated objects when devices disappear, new storage appears, or policy changes.
+9. **Prime and drain.** Add `crow prime [path]` to pull hot shards/cache onto this device for near-term availability. Add `crow drain [path]` to move hot shard responsibility elsewhere before leaving. Both commands must be best-effort accelerators, not correctness requirements.
+10. **Shard placement scheduler.** Decide where encrypted shares live using free space, uptime, network quality, battery, trust level, and policy. Start simple and deterministic; optimize later.
+
+Acceptance criteria: Crow can tell a user whether it is safe to evict local bytes; a laptop going
+offline without `drain` marks affected objects as degraded and triggers repair when other storage is
+available; users do not need to manually reason about 3-of-5 shards.
+
+### Phase 6 — internet and mesh transport
+
+Make nests work when devices are not on the same Wi-Fi.
+
+1. **Transport abstraction.** Split "who is this device?" from "how can I reach it?" Keep QUIC/LAN as one route, not the whole network model.
+2. **Stable device addressing.** Use cryptographic device ids as stable addresses. Friendly names remain local labels and are never authorization.
+3. **NAT traversal.** Add direct internet connectivity where possible with hole punching.
+4. **Zero-knowledge relay.** Add an optional relay that sees opaque ciphertext and routing metadata only. It should not see cap keys, plaintext, or decrypted catalog contents.
+5. **Route selection.** Try LAN first, then direct internet, then relay, then mesh/offline routes. Report which route was used in debug output.
+6. **Mesh route support.** Carry the same object-fetch/catalog-sync protocol over Wi-Fi Direct, BLE, LoRa, or community mesh links. Expect low bandwidth and intermittent availability.
+7. **Resume and retry.** Large object transfer must resume after route changes, sleep, or flaky connectivity.
+
+Acceptance criteria: a friend or second device on another network can participate in a scoped nest
+test without opening router ports manually; relays cannot decrypt stored data; mesh is a route, not
+a separate storage mode.
+
+### Phase 7 — Crow-native sharing and friend backup
+
+Make sharing happen through Crow instead of external chat plus manual caps.
+
+1. **Offer object.** Define an encrypted share offer containing sender, recipient, path/cap, permissions, expiry, optional message, and retrieval hints.
+2. **Inbox.** Add `crow inbox` to list pending offers delivered through reachable devices, relay, or mesh.
+3. **Accept flow.** Add `crow accept <offer>` to materialize a shared file, directory snapshot, or nest invitation into a local path/nest.
+4. **Scoped access.** Recipients should get only the caps/keys needed for the shared object or subtree, not the sender's whole nest.
+5. **Friend backup.** Let a trusted friend hold encrypted backup shards for a nest/path without gaining read access. This requires scoped storage authorization distinct from content decryption.
+6. **Directory sharing.** Keep immutable directory caps for snapshots, then add first-class shareable directory objects when catalog/live-folder semantics are ready.
+7. **Abuse and privacy basics.** Add block/delete offer behavior, expiry, local audit logs, and clear display of what metadata a recipient or relay can see.
+
+Acceptance criteria: a user can send a Crow-native offer to a friend, the friend can accept it, and
+the friend can fetch/reconstruct the shared object without receiving the sender's whole nest token.
+
+### Phase 8 — developer and agent surfaces
+
+Expose Crow as infrastructure for dev teams and agent-heavy workflows without turning Crow into an
+agent runner.
+
+1. **Local HTTP API.** Expose put/get/list/pin/catalog/status/fetch/sync operations from the daemon over a local API so tools in any language can use Crow without shelling out.
+2. **Streaming APIs.** Replace large-object paths that require whole-file `Vec<u8>` buffering with streaming put/get and resumable transfer.
+3. **MCP server.** Provide a small MCP server that lets AI tools read catalog resources, store/retrieve caps, publish signed context bundles, and inspect status.
+4. **Workspace object.** Add a signed workspace manifest/event log that names members, roles, trusted devices, and replication policy. This can reuse nest machinery but should not force personal users into team concepts.
+5. **SDKs and CI.** Add Python SDK first, then JS/TS. Provide Docker/CI install paths for ephemeral jobs that need to fetch or publish signed artifacts quickly.
+6. **Provenance UX.** Make signed producer identity visible for artifacts and agent outputs. Provenance is a core dev-team value, not just a security detail.
+7. **Observability.** Add structured logs and optional Prometheus-style metrics for daemon health, transfer failures, object availability, and policy repair.
+
+Acceptance criteria: a local agent or CI job can store an artifact, publish a signed reference, and
+another process can fetch it through the local API without needing to parse CLI output.
+
+### Phase 9 — public release hardening
+
+Prepare the project for external users.
+
+1. **README compression.** Turn this internal roadmap into a shorter public roadmap while moving execution detail to design docs if needed.
+2. **Install path.** Decide on crates.io, GitHub release binaries, Homebrew, Docker, or a staged combination.
+3. **Security review checklist.** Document bearer cap risks, token deprecation, relay privacy, local filesystem permissions, key storage, and backup warnings.
+4. **Compatibility policy.** State what formats are stable and what can still change before 1.0.
+5. **CLI polish.** Clearly separate daily commands from advanced protocol/debug commands in help output.
+6. **Cross-platform tests.** Verify macOS, Linux, and Windows behavior, especially atomic rename, daemon binding, mDNS behavior, path normalization, and file permissions.
+7. **Example scenarios.** Provide tested walkthroughs for one laptop, two personal devices on LAN, internet relay test, friend share, and agent artifact storage.
+
+Acceptance criteria: a technical external user can install Crow, understand alpha safety limits, run
+a two-device test, and avoid known footguns.
+
+### Deferred or explicit non-goals
+
+- Sled / redb backends: `FsStore` with temp+rename atomic writes is sufficient until concurrent access patterns demand a database.
+- Write capabilities: only `Read` exists today; add write caps only after nest membership and signed catalog events are solid.
+- Convergent encryption: useful for dedup, but dangerous for privacy if rushed.
+- Content-defined chunking: FastCDC-style similar-file dedup can wait until storage placement works.
+- Full live shared folders: directory caps are immutable snapshots today; mutable shared directories require catalog/nest semantics first.
+- Agent runner / scheduler: Crow may expose storage to agents, but should not become the orchestration layer.
+- Full team SaaS admin UI: useful later if workspaces land, but premature before protocol, local API, and workspace model are proven.
+- Destructive local-file lifecycle management: `--rm-local` remains unsafe until multi-device health can prove data is durable elsewhere.
 
 ## License
 
