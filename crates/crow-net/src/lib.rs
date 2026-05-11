@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use crow::{ChunkStore, FsStore, Hash, Namespace};
+use crow::{CatalogEvent, CatalogIndex, ChunkStore, FsStore, Hash, Namespace};
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -194,6 +194,10 @@ pub enum Request {
         namespace: WireNamespace,
         hash: [u8; 32],
     },
+    CatalogEvents {
+        version: u16,
+        token: ClusterToken,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +205,7 @@ pub enum Response {
     Hello { version: u16 },
     Have { present: bool },
     Bytes { bytes: Vec<u8> },
+    CatalogEvents { events: Vec<CatalogEvent> },
     Missing,
     Unauthorized,
     Error { message: String },
@@ -238,22 +243,48 @@ impl Server {
 /// dependent services (e.g. mDNS advertisement) without racing the first
 /// peer.
 pub async fn serve(store: FsStore, token: ClusterToken, bind: SocketAddr) -> Result<Server> {
+    serve_inner(store, None, token, bind).await
+}
+
+pub async fn serve_with_catalog(
+    store: FsStore,
+    catalog: CatalogIndex,
+    token: ClusterToken,
+    bind: SocketAddr,
+) -> Result<Server> {
+    serve_inner(store, Some(catalog), token, bind).await
+}
+
+async fn serve_inner(
+    store: FsStore,
+    catalog: Option<CatalogIndex>,
+    token: ClusterToken,
+    bind: SocketAddr,
+) -> Result<Server> {
     let endpoint = Endpoint::server(server_config()?, bind)?;
     let addr = endpoint.local_addr()?;
     let store = Arc::new(store);
-    let handle = tokio::spawn(accept_loop(endpoint, store, token));
+    let catalog = catalog.map(Arc::new);
+    let handle = tokio::spawn(accept_loop(endpoint, store, catalog, token));
     Ok(Server { addr, handle })
 }
 
-async fn accept_loop(endpoint: Endpoint, store: Arc<FsStore>, token: ClusterToken) -> Result<()> {
+async fn accept_loop(
+    endpoint: Endpoint,
+    store: Arc<FsStore>,
+    catalog: Option<Arc<CatalogIndex>>,
+    token: ClusterToken,
+) -> Result<()> {
     while let Some(incoming) = endpoint.accept().await {
         let store = store.clone();
+        let catalog = catalog.clone();
         tokio::spawn(async move {
             if let Ok(connection) = incoming.await {
                 while let Ok((send, recv)) = connection.accept_bi().await {
                     let store = store.clone();
+                    let catalog = catalog.clone();
                     tokio::spawn(async move {
-                        let _ = handle_stream(store, token, send, recv).await;
+                        let _ = handle_stream(store, catalog, token, send, recv).await;
                     });
                 }
             }
@@ -349,6 +380,22 @@ impl Client {
         }
     }
 
+    pub async fn catalog_events(&self, token: ClusterToken) -> Result<Vec<CatalogEvent>> {
+        match self
+            .request(Request::CatalogEvents {
+                version: PROTOCOL_VERSION,
+                token,
+            })
+            .await?
+        {
+            Response::CatalogEvents { events } => Ok(events),
+            Response::Unauthorized => Err(NetError::Unauthorized),
+            other => Err(NetError::Protocol(format!(
+                "unexpected catalog events response: {other:?}"
+            ))),
+        }
+    }
+
     async fn request(&self, request: Request) -> Result<Response> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         write_frame(&mut send, &request).await?;
@@ -359,12 +406,13 @@ impl Client {
 
 async fn handle_stream(
     store: Arc<FsStore>,
+    catalog: Option<Arc<CatalogIndex>>,
     token: ClusterToken,
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
     let response = match read_frame::<Request>(&mut recv).await {
-        Ok(request) => handle_request(store, token, request).await,
+        Ok(request) => handle_request(store, catalog, token, request).await,
         Err(e) => Response::Error {
             message: e.to_string(),
         },
@@ -374,7 +422,12 @@ async fn handle_stream(
     Ok(())
 }
 
-async fn handle_request(store: Arc<FsStore>, token: ClusterToken, request: Request) -> Response {
+async fn handle_request(
+    store: Arc<FsStore>,
+    catalog: Option<Arc<CatalogIndex>>,
+    token: ClusterToken,
+    request: Request,
+) -> Response {
     if request_token(&request) != Some(token) {
         return Response::Unauthorized;
     }
@@ -412,14 +465,26 @@ async fn handle_request(store: Arc<FsStore>, token: ClusterToken, request: Reque
                 },
             }
         }
+        Request::CatalogEvents { .. } => match catalog {
+            Some(catalog) => match catalog.load_events() {
+                Ok(events) => Response::CatalogEvents { events },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            },
+            None => Response::Error {
+                message: "catalog sync is not available on this server".into(),
+            },
+        },
     }
 }
 
 fn request_token(request: &Request) -> Option<ClusterToken> {
     match request {
-        Request::Hello { token, .. } | Request::Have { token, .. } | Request::Get { token, .. } => {
-            Some(*token)
-        }
+        Request::Hello { token, .. }
+        | Request::Have { token, .. }
+        | Request::Get { token, .. }
+        | Request::CatalogEvents { token, .. } => Some(*token),
     }
 }
 
@@ -427,7 +492,8 @@ fn request_version(request: &Request) -> u16 {
     match request {
         Request::Hello { version, .. }
         | Request::Have { version, .. }
-        | Request::Get { version, .. } => *version,
+        | Request::Get { version, .. }
+        | Request::CatalogEvents { version, .. } => *version,
     }
 }
 
@@ -561,6 +627,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn token_roundtrip() {
@@ -587,5 +654,54 @@ mod tests {
         store.save(second).unwrap();
         assert_eq!(store.init(false).unwrap(), second);
         assert_ne!(store.init(true).unwrap(), second);
+    }
+
+    #[test]
+    fn catalog_events_request_returns_events_for_valid_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FsStore::open(tmp.path()).unwrap());
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs", false).unwrap();
+        let token = ClusterToken::random();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let response = rt.block_on(handle_request(
+            store,
+            Some(Arc::new(catalog)),
+            token,
+            Request::CatalogEvents {
+                version: PROTOCOL_VERSION,
+                token,
+            },
+        ));
+
+        match response {
+            Response::CatalogEvents { events } => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(events[0].op, crow::CatalogOp::Mkdir { .. }));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_events_request_rejects_wrong_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(FsStore::open(tmp.path()).unwrap());
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let token = ClusterToken::random();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let response = rt.block_on(handle_request(
+            store,
+            Some(Arc::new(catalog)),
+            token,
+            Request::CatalogEvents {
+                version: PROTOCOL_VERSION,
+                token: ClusterToken::random(),
+            },
+        ));
+
+        assert_eq!(response, Response::Unauthorized);
     }
 }

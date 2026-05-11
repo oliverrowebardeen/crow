@@ -33,7 +33,9 @@ pub mod pin;
 pub mod pipeline;
 
 pub use cap::{CAP_HRP, CAP_VERSION, Cap, Permission};
-pub use catalog::{CatalogEntry, CatalogIndex, CatalogOp, CatalogPath, CatalogView, EntryKind};
+pub use catalog::{
+    CatalogEntry, CatalogEvent, CatalogIndex, CatalogOp, CatalogPath, CatalogView, EntryKind,
+};
 pub use chunk::{ChunkStore, MemStore, Namespace};
 pub use crypto::{FileKey, ManifestKey};
 pub use dir_manifest::{
