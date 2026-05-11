@@ -2868,52 +2868,54 @@ fn cmd_serve(
     let friendly_name = resolve_serve_name(home, name_override)?;
     let root = store.root().display().to_string();
     let snapshot_path = peer_snapshot::snapshot_path(home);
-
-    let rt = runtime()?;
-    rt.block_on(serve_loop(
-        store,
-        catalog,
-        token,
+    let config = ServeLoopConfig {
         bind,
         node_id,
         friendly_name,
         root,
         snapshot_path,
-    ))
+    };
+
+    let rt = runtime()?;
+    rt.block_on(serve_loop(store, catalog, token, config))
+}
+
+struct ServeLoopConfig {
+    bind: SocketAddr,
+    node_id: NodeId,
+    friendly_name: Option<String>,
+    root: String,
+    snapshot_path: PathBuf,
 }
 
 async fn serve_loop(
     store: FsStore,
     catalog: CatalogIndex,
     token: ClusterToken,
-    bind: SocketAddr,
-    node_id: NodeId,
-    friendly_name: Option<String>,
-    root: String,
-    snapshot_path: PathBuf,
+    config: ServeLoopConfig,
 ) -> DynResult<()> {
-    let server = crow_net::serve_with_catalog(store, catalog, token, bind).await?;
+    let server = crow_net::serve_with_catalog(store, catalog, token, config.bind).await?;
     let actual_addr = server.local_addr();
 
     let advert = LocalAdvert {
-        node_id,
+        node_id: config.node_id,
         port: actual_addr.port(),
-        friendly_name: friendly_name.clone(),
+        friendly_name: config.friendly_name.clone(),
     };
     let discovery = Discovery::start(Some(advert))?;
 
-    println!("serving {root} on {actual_addr}");
+    println!("serving {} on {actual_addr}", config.root);
     println!(
         "node {} ({})",
-        node_id.short(),
-        friendly_name.as_deref().unwrap_or("unnamed")
+        config.node_id.short(),
+        config.friendly_name.as_deref().unwrap_or("unnamed")
     );
     println!("cluster token: configured");
     println!("mDNS service: _crow._udp.local.");
 
     let self_info = SelfInfo {
-        node_id,
-        friendly_name: friendly_name.clone(),
+        node_id: config.node_id,
+        friendly_name: config.friendly_name.clone(),
         address: actual_addr,
     };
 
@@ -2926,11 +2928,11 @@ async fn serve_loop(
             biased;
             _ = &mut ctrl_c => {
                 println!();
-                let _ = write_peer_snapshot(&snapshot_path, &self_info, &discovery);
+                let _ = write_peer_snapshot(&config.snapshot_path, &self_info, &discovery);
                 break;
             }
             _ = interval.tick() => {
-                if let Err(e) = write_peer_snapshot(&snapshot_path, &self_info, &discovery) {
+                if let Err(e) = write_peer_snapshot(&config.snapshot_path, &self_info, &discovery) {
                     eprintln!("crow: failed to write peer snapshot: {e}");
                 }
             }
