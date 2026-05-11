@@ -529,6 +529,28 @@ enum Command {
         #[command(subcommand)]
         command: Option<DeviceCommand>,
     },
+    /// Initialize this device for personal-cluster use.
+    #[command(
+        long_about = "Create the local Crow identity if missing, configure an optional \
+                      friendly device name, and create or import the shared \
+                      personal-cluster token. This is a convenience wrapper around \
+                      `crow device name`, `crow token init`, and `crow token set`.\n\
+                      \n\
+                      Examples:\n  \
+                      crow setup --name laptop\n  \
+                      crow setup --name phone --token <64-hex-token>"
+    )]
+    Setup {
+        /// Persist a friendly name advertised by `crow serve`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Store a token copied from another trusted device.
+        #[arg(long)]
+        token: Option<String>,
+        /// Replace an existing local token with a newly generated one.
+        #[arg(long)]
+        force_token: bool,
+    },
     /// Manage the shared personal-cluster token.
     #[command(subcommand)]
     Token(TokenCommand),
@@ -628,6 +650,41 @@ fn validate_device_name(name: &str) -> DynResult<String> {
     Ok(name.to_string())
 }
 
+fn sanitize_device_name(name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut last_was_sep = false;
+    for b in name.bytes() {
+        let c = if b.is_ascii_alphanumeric() {
+            last_was_sep = false;
+            b as char
+        } else if matches!(b, b'-' | b'_' | b'.') {
+            if last_was_sep {
+                continue;
+            }
+            last_was_sep = true;
+            b as char
+        } else {
+            if last_was_sep {
+                continue;
+            }
+            last_was_sep = true;
+            '-'
+        };
+        out.push(c);
+        if out.len() == 32 {
+            break;
+        }
+    }
+    let out = out
+        .trim_matches(|c| matches!(c, '-' | '_' | '.'))
+        .to_string();
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn default_setup_name() -> Option<String> {
+    default_friendly_name().and_then(|name| sanitize_device_name(&name))
+}
+
 fn configured_friendly_name(home: &Path) -> DynResult<Option<String>> {
     Ok(DeviceConfig::load(home)?.name)
 }
@@ -644,6 +701,11 @@ fn run(cli: Cli) -> DynResult<()> {
     let home = resolve_home(cli.home)?;
     match cli.command {
         Command::Device { command } => cmd_device(&home, command),
+        Command::Setup {
+            name,
+            token,
+            force_token,
+        } => cmd_setup(&home, name, token, force_token),
         Command::Token(command) => cmd_token(&home, command),
         Command::Serve { bind, name } => {
             let store = FsStore::open(&home)?;
@@ -740,6 +802,7 @@ fn run(cli: Cli) -> DynResult<()> {
                 Command::Serve { .. }
                 | Command::Peers { .. }
                 | Command::Device { .. }
+                | Command::Setup { .. }
                 | Command::Token(_) => {
                     unreachable!("handled above")
                 }
@@ -2215,6 +2278,116 @@ fn cmd_device(home: &Path, command: Option<DeviceCommand>) -> DynResult<()> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SetupTokenAction {
+    Created,
+    Existing,
+    Imported,
+    Replaced,
+}
+
+#[derive(Debug)]
+struct SetupReport {
+    node_id: NodeId,
+    name: Option<String>,
+    token: ClusterToken,
+    token_action: SetupTokenAction,
+}
+
+fn cmd_setup(
+    home: &Path,
+    name: Option<String>,
+    token: Option<String>,
+    force_token: bool,
+) -> DynResult<()> {
+    let report = setup_device(home, name, token, force_token)?;
+    println!("home      {}", home.display());
+    println!("node      {}", report.node_id);
+    println!("short     {}", report.node_id.short());
+    println!(
+        "name      {}",
+        report.name.as_deref().unwrap_or("(not set)")
+    );
+    println!(
+        "token     {}",
+        setup_token_action_label(&report.token_action)
+    );
+    println!();
+    println!("On another trusted device:");
+    println!(
+        "  crow setup --token {}{}",
+        report.token.encode(),
+        report
+            .name
+            .as_ref()
+            .map(|name| format!(" --name {name}"))
+            .unwrap_or_default()
+    );
+    println!();
+    println!("Then run `crow serve` on the device that has chunks.");
+    Ok(())
+}
+
+fn setup_device(
+    home: &Path,
+    name: Option<String>,
+    token: Option<String>,
+    force_token: bool,
+) -> DynResult<SetupReport> {
+    let identity = Identity::load_or_create(home)?;
+    let mut config = DeviceConfig::load(home)?;
+    let name = match name {
+        Some(name) => Some(validate_device_name(&name)?),
+        None => config.name.clone().or_else(default_setup_name),
+    };
+    if config.name != name {
+        config.name = name.clone();
+        config.save(home)?;
+    }
+
+    let tokens = TokenStore::open(home);
+    let (token, token_action) = if let Some(token) = token {
+        let token = ClusterToken::decode(&token)?;
+        let existed = tokens.exists();
+        tokens.save(token)?;
+        (
+            token,
+            if existed {
+                SetupTokenAction::Replaced
+            } else {
+                SetupTokenAction::Imported
+            },
+        )
+    } else {
+        let existed = tokens.exists();
+        let token = tokens.init(force_token)?;
+        (
+            token,
+            match (existed, force_token) {
+                (true, true) => SetupTokenAction::Replaced,
+                (true, false) => SetupTokenAction::Existing,
+                (false, _) => SetupTokenAction::Created,
+            },
+        )
+    };
+
+    Ok(SetupReport {
+        node_id: identity.node_id(),
+        name,
+        token,
+        token_action,
+    })
+}
+
+fn setup_token_action_label(action: &SetupTokenAction) -> &'static str {
+    match action {
+        SetupTokenAction::Created => "created",
+        SetupTokenAction::Existing => "already configured",
+        SetupTokenAction::Imported => "imported",
+        SetupTokenAction::Replaced => "replaced",
+    }
+}
+
 fn cmd_peers(home: &Path, long: bool, json: bool) -> DynResult<()> {
     let path = peer_snapshot::snapshot_path(home);
     let snap = match peer_snapshot::load(&path)? {
@@ -3626,6 +3799,16 @@ mod tests {
     }
 
     #[test]
+    fn device_name_sanitizer_makes_hostname_command_safe() {
+        assert_eq!(
+            sanitize_device_name("Alice's MacBook Pro.local"),
+            Some("Alice-s-MacBook-Pro.local".into())
+        );
+        assert_eq!(sanitize_device_name("///"), None);
+        assert_eq!(sanitize_device_name(&"a".repeat(40)).unwrap().len(), 32);
+    }
+
+    #[test]
     fn serve_name_prefers_cli_override_then_saved_name() {
         let tmp = tempfile::TempDir::new().unwrap();
         DeviceConfig {
@@ -3645,6 +3828,58 @@ mod tests {
             Some("saved")
         );
         assert!(resolve_serve_name(tmp.path(), Some("bad name".into())).is_err());
+    }
+
+    #[test]
+    fn setup_creates_identity_token_and_device_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let report = setup_device(tmp.path(), Some("laptop".into()), None, false).unwrap();
+
+        assert_eq!(report.name.as_deref(), Some("laptop"));
+        assert_eq!(report.token_action, SetupTokenAction::Created);
+        assert_eq!(
+            DeviceConfig::load(tmp.path()).unwrap().name.as_deref(),
+            Some("laptop")
+        );
+        assert_eq!(TokenStore::open(tmp.path()).load().unwrap(), report.token);
+        assert_eq!(
+            Identity::load_or_create(tmp.path()).unwrap().node_id(),
+            report.node_id
+        );
+    }
+
+    #[test]
+    fn setup_imports_existing_token_and_reuses_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let token = ClusterToken::from_bytes([9u8; 32]);
+
+        let imported = setup_device(
+            tmp.path(),
+            Some("phone".into()),
+            Some(token.encode()),
+            false,
+        )
+        .unwrap();
+        let reused = setup_device(tmp.path(), None, None, false).unwrap();
+
+        assert_eq!(imported.token_action, SetupTokenAction::Imported);
+        assert_eq!(reused.token_action, SetupTokenAction::Existing);
+        assert_eq!(reused.token, token);
+        assert_eq!(reused.name.as_deref(), Some("phone"));
+    }
+
+    #[test]
+    fn setup_force_token_replaces_existing_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original = setup_device(tmp.path(), Some("laptop".into()), None, false)
+            .unwrap()
+            .token;
+
+        let replaced = setup_device(tmp.path(), None, None, true).unwrap();
+
+        assert_eq!(replaced.token_action, SetupTokenAction::Replaced);
+        assert_ne!(replaced.token.encode(), original.encode());
     }
 
     #[test]
