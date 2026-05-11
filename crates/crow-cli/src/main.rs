@@ -536,12 +536,12 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Pull catalog metadata from a trusted peer.
+    /// Pull catalog metadata and missing objects from a trusted peer.
     #[command(
         long_about = "Connect to a trusted Crow peer, pull its catalog event log, \
-                      merge any new path metadata locally, and report what changed. \
-                      A later phase of this command also fetches missing objects so \
-                      synced paths are locally reconstructable.\n\
+                      merge any new path metadata locally, then fetch missing \
+                      manifests/chunks for every cataloged file so synced paths are \
+                      locally reconstructable.\n\
                       \n\
                       Examples:\n  \
                       crow sync laptop\n  \
@@ -907,7 +907,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
-                Command::Sync { peer } => cmd_sync_metadata(&home, &catalog, &peer),
+                Command::Sync { peer } => cmd_sync(&home, &crow, &catalog, &peer),
                 Command::Receive {
                     peer,
                     cap_or_prefix,
@@ -3042,21 +3042,48 @@ struct SyncCatalogReport {
     catalog_files: usize,
 }
 
-fn cmd_sync_metadata(home: &Path, catalog: &CatalogIndex, peer: &str) -> DynResult<()> {
+fn cmd_sync(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    peer: &str,
+) -> DynResult<()> {
     let token = load_token(home)?;
     let socket_addrs = resolve_peer(home, peer)?;
     let rt = runtime()?;
     let (socket_addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
     let remote_events = rt.block_on(client.catalog_events(token))?;
-    let report = sync_catalog_events(catalog, remote_events)?;
+    let catalog_report = sync_catalog_events(catalog, remote_events)?;
+    let object_report = sync_catalog_objects(crow, &rt, &client, token, catalog)?;
 
     println!("peer          {socket_addr}");
-    println!("remote events {}", report.remote_events);
-    println!("new events    {}", report.new_events);
-    println!("local events  {}", report.local_events);
-    println!("catalog files {}", report.catalog_files);
-    println!("status        catalog synced");
-    Ok(())
+    println!("remote events {}", catalog_report.remote_events);
+    println!("new events    {}", catalog_report.new_events);
+    println!("local events  {}", catalog_report.local_events);
+    println!("catalog files {}", object_report.catalog_files);
+    println!(
+        "objects       {} local / {} fetched / {} missing",
+        object_report.already_local, object_report.fetched, object_report.remote_missing
+    );
+    println!(
+        "stored        {}",
+        format_size_u64(object_report.fetched_bytes)
+    );
+    if object_report.failed_caps == 0 && object_report.remote_missing == 0 {
+        println!("status        synced");
+        Ok(())
+    } else {
+        println!(
+            "status        incomplete ({} unreconstructable catalog file{})",
+            object_report.failed_caps,
+            if object_report.failed_caps == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        Err("sync incomplete: some catalog files are not reconstructable".into())
+    }
 }
 
 fn sync_catalog_events(
@@ -3072,6 +3099,47 @@ fn sync_catalog_events(
         new_events,
         local_events,
         catalog_files,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SyncObjectReport {
+    catalog_files: usize,
+    fetched: usize,
+    already_local: usize,
+    remote_missing: usize,
+    fetched_bytes: u64,
+    failed_caps: usize,
+}
+
+fn sync_catalog_objects(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    token: ClusterToken,
+    catalog: &CatalogIndex,
+) -> DynResult<SyncObjectReport> {
+    let caps = catalog.view()?.file_caps();
+    let mut counters = FetchCounters::default();
+    let mut visited = HashSet::new();
+    for cap in &caps {
+        fetch_cap_recursive(crow, rt, client, token, cap, &mut counters, &mut visited)?;
+    }
+
+    let mut failed_caps = 0usize;
+    for cap in &caps {
+        if verify_cap_reconstructable(crow, cap).is_err() {
+            failed_caps += 1;
+        }
+    }
+
+    Ok(SyncObjectReport {
+        catalog_files: caps.len(),
+        fetched: counters.fetched,
+        already_local: counters.already_local,
+        remote_missing: counters.remote_missing,
+        fetched_bytes: counters.fetched_bytes,
+        failed_caps,
     })
 }
 
@@ -4342,6 +4410,84 @@ mod tests {
                 .get(&CatalogPath::normalize("/docs/report.pdf").unwrap())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn sync_catalog_objects_fetches_missing_file_and_is_idempotent() {
+        let source = tempfile::TempDir::new().unwrap();
+        let dest = tempfile::TempDir::new().unwrap();
+        let source_crow = Crow::new(FsStore::open(source.path()).unwrap());
+        let source_catalog = CatalogIndex::open(source.path()).unwrap();
+        let cap = stored_cap(&source_crow, b"cloud bytes");
+        source_catalog.mkdir("/docs", false).unwrap();
+        source_catalog
+            .put_file("/docs/report.txt", cap.clone(), Some("report.txt".into()))
+            .unwrap();
+
+        let token = ClusterToken::random();
+        let rt = runtime().unwrap();
+        let server = rt
+            .block_on(crow_net::serve_with_catalog(
+                FsStore::open(source.path()).unwrap(),
+                CatalogIndex::open(source.path()).unwrap(),
+                token,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .unwrap();
+        let client = rt.block_on(Client::connect(server.local_addr())).unwrap();
+        rt.block_on(client.hello(token)).unwrap();
+
+        let dest_catalog = CatalogIndex::open(dest.path()).unwrap();
+        let dest_crow = Crow::new(FsStore::open(dest.path()).unwrap());
+        let events = rt.block_on(client.catalog_events(token)).unwrap();
+        sync_catalog_events(&dest_catalog, events).unwrap();
+
+        let first = sync_catalog_objects(&dest_crow, &rt, &client, token, &dest_catalog).unwrap();
+        let second = sync_catalog_objects(&dest_crow, &rt, &client, token, &dest_catalog).unwrap();
+
+        assert_eq!(first.catalog_files, 1);
+        assert!(first.fetched > 0);
+        assert_eq!(first.remote_missing, 0);
+        assert_eq!(first.failed_caps, 0);
+        assert_eq!(dest_crow.get_bytes(&cap).unwrap(), b"cloud bytes");
+        assert_eq!(second.fetched, 0);
+        assert_eq!(second.remote_missing, 0);
+        assert_eq!(second.failed_caps, 0);
+    }
+
+    #[test]
+    fn sync_catalog_objects_reports_incomplete_peer_data() {
+        let source = tempfile::TempDir::new().unwrap();
+        let dest = tempfile::TempDir::new().unwrap();
+        let source_catalog = CatalogIndex::open(source.path()).unwrap();
+        let cap = cap_with_hash_byte(0x64);
+        source_catalog
+            .put_file("/missing.txt", cap, Some("missing.txt".into()))
+            .unwrap();
+
+        let token = ClusterToken::random();
+        let rt = runtime().unwrap();
+        let server = rt
+            .block_on(crow_net::serve_with_catalog(
+                FsStore::open(source.path()).unwrap(),
+                CatalogIndex::open(source.path()).unwrap(),
+                token,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .unwrap();
+        let client = rt.block_on(Client::connect(server.local_addr())).unwrap();
+        rt.block_on(client.hello(token)).unwrap();
+
+        let dest_catalog = CatalogIndex::open(dest.path()).unwrap();
+        let dest_crow = Crow::new(FsStore::open(dest.path()).unwrap());
+        let events = rt.block_on(client.catalog_events(token)).unwrap();
+        sync_catalog_events(&dest_catalog, events).unwrap();
+
+        let report = sync_catalog_objects(&dest_crow, &rt, &client, token, &dest_catalog).unwrap();
+
+        assert_eq!(report.catalog_files, 1);
+        assert_eq!(report.remote_missing, 1);
+        assert_eq!(report.failed_caps, 1);
     }
 
     #[test]
