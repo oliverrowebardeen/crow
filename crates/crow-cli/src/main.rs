@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
                   crow gc                          # sweep anything not pinned\n  \
                   crow serve                       # serve chunks + advertise on mDNS\n  \
                   crow peers                       # list LAN peers `crow serve` discovered\n  \
+                  crow sync laptop                 # pull catalog + chunks from your device\n  \
                   crow receive laptop <cap> /docs/report.pdf # fetch + catalog\n\
                   \n\
                   File commands accept catalog paths, full crow1… capabilities, or \

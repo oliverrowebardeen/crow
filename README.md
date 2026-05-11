@@ -6,9 +6,9 @@ A file in Crow is encrypted, chunked, hashed, erasure-coded, and stored as a set
 
 ## Status
 
-This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, **manual LAN fetch over QUIC**, and **mDNS LAN peer discovery**: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, automatic peer discovery on the local network, and subcommands such as `setup`, `device`, `put`, `get`, `cat`, `cap`, `share`, `receive`, `mkdir`, `ls`, `tree`, `find`, `du`, `mv`, `cp`, `put-dir`, `get-dir`, `stat`, `grep`, `rm`, `gc`, `serve`, `peers`, and `fetch`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
+This crate ships the **data model**, a **daily-driver CLI**, a local filesystem-style catalog, **manual LAN fetch/sync over QUIC**, and **mDNS LAN peer discovery**: chunks, manifests, capabilities, in-memory and on-disk stores, pinning, garbage collection, QUIC chunk serving, automatic peer discovery on the local network, and subcommands such as `setup`, `device`, `put`, `get`, `cat`, `cap`, `share`, `receive`, `mkdir`, `ls`, `tree`, `find`, `du`, `mv`, `cp`, `put-dir`, `get-dir`, `stat`, `grep`, `rm`, `gc`, `serve`, `peers`, `fetch`, and `sync`. The core invariant — file → cap → reconstructed file, including with shares missing — is covered end-to-end by integration tests against a real on-disk store.
 
-Automatic replication policy, replicated metadata sync, catalog event signing, and friend-scoped sharing are deferred. See [Roadmap](#roadmap).
+Background replication policy, catalog event signing, and friend-scoped sharing are deferred. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -102,6 +102,7 @@ crow token init|show|set
 crow serve [--bind ADDR] [--name NAME]
 crow peers [--long] [--json]
 crow fetch <peer> <cap-or-prefix> [--name NAME]
+crow sync <peer>
 ```
 
 `<file>` and `<out>` accept `-` for stdin / stdout. Storage lives at `$CROW_HOME` (default `~/.crow`); override per-invocation with `--home PATH`.
@@ -258,11 +259,26 @@ crow fetch laptop              crow1qyq...m0r --name report.pdf
 crow get <prefix> report.pdf
 ```
 
-`fetch` pulls the encrypted manifest and missing shares, verifies every object by BLAKE3 hash before storing it, pins the cap locally, and exits successfully only when local reconstruction works. Automatic replication and replicated metadata sync are later Phase 1 steps; friend-scoped access comes after scoped identity/workspace work.
+`fetch` pulls one encrypted manifest and its missing shares, verifies every object by BLAKE3 hash before storing it, pins the cap locally, and exits successfully only when local reconstruction works.
+
+For your own devices, `sync` is the easier path: it pulls the peer's catalog event log, merges paths locally, then fetches missing encrypted manifests and chunks for every cataloged file.
+
+```sh
+# On laptop:
+crow put report.pdf /docs/
+crow serve
+
+# On phone:
+crow sync laptop
+crow tree /docs
+crow get /docs/report.pdf report.pdf
+```
+
+`sync` is manual and pull-based today. It does not yet run in the background, enforce a replication target, or prove that data is safe after one device disappears. Friend-scoped access comes after scoped identity/workspace work.
 
 ### Sharing
 
-The cap is the only secret a holder needs. It's ASCII, ~117 chars, paste-friendly. For the LAN happy path, use `share` and `receive`:
+The cap is the only secret a holder needs. It's ASCII, ~117 chars, paste-friendly. For your own devices, prefer `crow sync <peer>` so paths and chunks move together without manually copying caps. For one-off file or directory handoff, use `share` and `receive`:
 
 ```sh
 # Source device:
@@ -290,13 +306,14 @@ crow share /photos --name photos-snapshot
 crow receive laptop crow1qyq... /imports/photos
 ```
 
-If two peers have the same friendly name, `crow receive laptop ...` fails with the matching node-id prefixes and IP:port addresses. Retry with a longer node-id prefix or explicit IP:port. Specific file sharing with friends is deferred until scoped access can replace the personal-cluster token.
+If two peers have the same friendly name, `crow receive laptop ...` or `crow sync laptop` fails with the matching node-id prefixes and IP:port addresses. Retry with a longer node-id prefix or explicit IP:port. Specific file sharing with friends is deferred until scoped access can replace the personal-cluster token.
 
 ### Security model
 
 - Capabilities are bearer tokens: anyone with a `crow1…` cap can decrypt the referenced file or directory snapshot if they can fetch enough encrypted shares.
 - Manifest signatures prove which Crow identity created a file or directory snapshot; they do not grant access or imply that the creator is trusted.
 - The personal-cluster token is shared-secret authorization for LAN fetch. Treat it like a password for devices you own.
+- `crow sync` gives a trusted personal device your catalog metadata and asks it for encrypted objects by hash. Do not use a shared cluster token with devices you do not control.
 - Device names and mDNS discovery are only convenience metadata. They are advertised only while `crow serve` runs, are not trusted for authorization, and are never embedded in caps.
 - Crow is alpha software. Keep independent backups of important data until automatic multi-device replication is shipped and battle-tested.
 
@@ -445,32 +462,33 @@ BLAKE3 content addressing, AES-256-GCM with HKDF-SHA-256-derived nonces, Reed–
 
 Several devices owned by one user, on the same network, syncing files between them.
 
-1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`setup`, `device`, `mkdir`, `ls`, `tree`, `find`, `du`, `cat`, `cap`, `share`, `receive`, `mv`, `cp`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`, `grep`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
+1. **Storage hardening + local catalog — shipped.** Pinning, garbage collection, and the daily-driver CLI (`setup`, `device`, `mkdir`, `ls`, `tree`, `find`, `du`, `cat`, `cap`, `share`, `receive`, `sync`, `mv`, `cp`, `put-dir`, `get-dir`, `cap-dir`, `add-dir`, `pin`, `unpin`, `rm`, `gc`, `stat`, `grep`) covered above. Per-pin JSON files at `<home>/pins/<hash>.json`, a CRDT-shaped catalog event log at `<home>/catalog/events.jsonl`, immutable directory snapshot caps, owner-pinning mark-and-sweep, hash-prefix resolution for every command that takes a flat pin, and path-aware `unpin` for non-destructive catalog detach.
 2. **Daemon + chunk-fetch — shipped.** A long-running `crow serve` process listens over QUIC. Minimal protocol: *who are you*, *do you have hash X*, *send me hash X*. `crow fetch <peer> <cap>` pulls encrypted file manifests, directory manifests, and shares from a known peer after shared-token authorization.
 3. **mDNS discovery — shipped.** `crow serve` advertises `_crow._udp.local.` with the daemon's `NodeId` (Ed25519 pubkey, persistent across restarts at `<home>/identity.json`), bound port, and friendly name. Other Crows on the same Wi-Fi auto-discover; the daemon writes `<home>/peers.json` every five seconds. `crow peers` reads the snapshot; `crow fetch <peer>` accepts a node-id hex prefix or friendly name in addition to `IP:port`. Discovery is unauthenticated by design — the existing shared `ClusterToken` still gates real chunk fetches.
 4. **Manifest signing — shipped.** New file manifests and directory snapshot manifests are signed with the Ed25519 key Crow already generates; old unsigned caps still read as legacy data, while invalid signed manifests are rejected. This proves provenance by key, not authorization or trust.
-5. **Replicated metadata sync + catalog event signing.** Merge local catalog event logs across devices with deterministic conflict rules, event IDs, author IDs, clocks, and event signatures. The on-disk catalog is already operation-log-shaped so this should be a sync/merge step rather than a catalog rewrite.
-6. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
-7. **Health and verification UX.** Show which caps are reconstructable, which devices hold shares, which catalog events are signed/merged, and whether it is safe to treat Crow as durable storage.
+5. **Manual personal-cloud sync — shipped.** `crow sync <peer>` pulls catalog events from a trusted personal device, merges them deterministically, then fetches and verifies missing encrypted objects for every cataloged file. This removes the need to manually pass caps between your own devices, but it is still explicit, pull-based sync.
+6. **Background sync + catalog event signing.** Move from manual `crow sync` to quiet peer-to-peer catalog convergence, and sign catalog events with the device identity so a device can prove who created, renamed, or removed a path.
+7. **Replication policy.** Each device watches its pinned manifests and catalog file paths and quietly redistributes shares so any one device can drop offline without loss. Soft target: every share lives on at least two devices in the fleet.
+8. **Health and verification UX.** Show which caps are reconstructable, which devices hold shares, which catalog events are signed/merged, and whether it is safe to treat Crow as durable storage.
 
 ### Phase 2 — adapters and shared workspaces
 
 Make Crow useful to more than one local user or process without changing the core storage model.
 
-8. **Local HTTP API.** Expose put/get/list/pin/catalog/fetch operations from `crow serve` over a local API so tools in any language can use Crow without shelling out.
-9. **MCP server proof.** Provide a small MCP server that lets AI tools store and retrieve caps, read catalog resources, and publish signed context/artifact bundles. Crow should be the substrate under agents, not the agent runner.
-10. **Workspace object.** Add a signed workspace manifest/event log that names members, roles, trusted devices, and replication policy. Start local-first and single-team; avoid SaaS admin surfaces until the protocol shape is proven.
-11. **CI and SDK ergonomics.** Fast install path, Docker image, Python SDK first, then JS/TS. The first target is ephemeral jobs and agents that need to publish or fetch durable signed artifacts.
-12. **Streaming and resume.** Replace all large-object paths that require whole-file `Vec<u8>` buffering with streaming APIs and resumable transfer so build artifacts, datasets, and model files are realistic.
+9. **Local HTTP API.** Expose put/get/list/pin/catalog/fetch operations from `crow serve` over a local API so tools in any language can use Crow without shelling out.
+10. **MCP server proof.** Provide a small MCP server that lets AI tools store and retrieve caps, read catalog resources, and publish signed context/artifact bundles. Crow should be the substrate under agents, not the agent runner.
+11. **Workspace object.** Add a signed workspace manifest/event log that names members, roles, trusted devices, and replication policy. Start local-first and single-team; avoid SaaS admin surfaces until the protocol shape is proven.
+12. **CI and SDK ergonomics.** Fast install path, Docker image, Python SDK first, then JS/TS. The first target is ephemeral jobs and agents that need to publish or fetch durable signed artifacts.
+13. **Streaming and resume.** Replace all large-object paths that require whole-file `Vec<u8>` buffering with streaming APIs and resumable transfer so build artifacts, datasets, and model files are realistic.
 
 ### Phase 3 — cross-person sharing
 
-13. **Internet reachability.** A small zero-knowledge relay plus NAT hole-punching for direct peer-to-peer between devices on different networks. The relay sees only opaque ciphertext.
-14. **Sharing flow.** Explicit per-cap access lists, recipient pubkeys, optional expiry. Send a friend or teammate a cap, they pull from your devices (or via a relay), no Dropbox in the middle.
+14. **Internet reachability.** A small zero-knowledge relay plus NAT hole-punching for direct peer-to-peer between devices on different networks. The relay sees only opaque ciphertext.
+15. **Crow-native sharing flow.** Add offer/inbox/accept semantics so a friend or teammate can receive an encrypted share invitation through Crow instead of a separate chat app. The durable version uses recipient pubkeys, explicit per-cap access lists, optional expiry, and pull-through from your devices or a relay.
 
 ### Phase 4 — offline / local transports
 
-15. **Offline transport integration.** Run Crow's chunk-fetch protocol over BLE, LoRa, and Wi-Fi Direct. Lower bandwidth, intermittent connectivity, but works without internet.
+16. **Offline transport integration.** Run Crow's chunk-fetch protocol over BLE, LoRa, and Wi-Fi Direct. Lower bandwidth, intermittent connectivity, but works without internet.
 
 A stripped-down BLE-direct integration may move earlier if in-person tap-to-share becomes a headline feature; bandwidth tradeoffs are real.
 
