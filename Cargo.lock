@@ -408,6 +408,7 @@ dependencies = [
  "crow",
  "crow-net",
  "regex",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

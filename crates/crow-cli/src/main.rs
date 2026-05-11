@@ -19,6 +19,7 @@ use crow_net::{
     SelfInfo, TokenStore, default_friendly_name, peer_snapshot,
 };
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
 #[command(
@@ -514,9 +515,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set this device's local Crow identity metadata.
+    #[command(
+        long_about = "Show this device's Crow identity, friendly name, token status, \
+                      and peer snapshot status. Use `crow device name <NAME>` to set \
+                      the friendly name advertised by `crow serve` on the LAN.\n\
+                      \n\
+                      Friendly names are local convenience metadata. They are never \
+                      embedded in caps and are only advertised while `crow serve` is \
+                      running."
+    )]
+    Device {
+        #[command(subcommand)]
+        command: Option<DeviceCommand>,
+    },
     /// Manage the shared personal-cluster token.
     #[command(subcommand)]
     Token(TokenCommand),
+}
+
+#[derive(Subcommand)]
+enum DeviceCommand {
+    /// Persist the friendly name advertised by `crow serve`.
+    Name {
+        /// Short command-safe device name, e.g. laptop, phone, macbook-air.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -550,9 +574,76 @@ fn main() -> ExitCode {
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type DynResult<T> = std::result::Result<T, DynError>;
 
+const DEVICE_CONFIG_FILE: &str = "device.json";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct DeviceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+impl DeviceConfig {
+    fn load(home: &Path) -> DynResult<Self> {
+        let path = device_config_path(home);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)
+                .map_err(|e| format!("decode {}: {e}", path.display()))?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("read {}: {e}", path.display()).into()),
+        }
+    }
+
+    fn save(&self, home: &Path) -> DynResult<()> {
+        let path = device_config_path(home);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|e| format!("encode {}: {e}", path.display()))?;
+        fs::write(&path, json)?;
+        Ok(())
+    }
+}
+
+fn device_config_path(home: &Path) -> PathBuf {
+    home.join(DEVICE_CONFIG_FILE)
+}
+
+fn validate_device_name(name: &str) -> DynResult<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("device name cannot be empty".into());
+    }
+    if name.len() > 32 {
+        return Err("device name must be 32 characters or fewer".into());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(
+            "device name may only contain ASCII letters, numbers, '-', '_', and '.'".into(),
+        );
+    }
+    Ok(name.to_string())
+}
+
+fn configured_friendly_name(home: &Path) -> DynResult<Option<String>> {
+    Ok(DeviceConfig::load(home)?.name)
+}
+
+fn resolve_serve_name(home: &Path, name_override: Option<String>) -> DynResult<Option<String>> {
+    Ok(name_override
+        .map(|name| validate_device_name(&name))
+        .transpose()?
+        .or(configured_friendly_name(home)?)
+        .or_else(default_friendly_name))
+}
+
 fn run(cli: Cli) -> DynResult<()> {
     let home = resolve_home(cli.home)?;
     match cli.command {
+        Command::Device { command } => cmd_device(&home, command),
         Command::Token(command) => cmd_token(&home, command),
         Command::Serve { bind, name } => {
             let store = FsStore::open(&home)?;
@@ -646,7 +737,10 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
-                Command::Serve { .. } | Command::Peers { .. } | Command::Token(_) => {
+                Command::Serve { .. }
+                | Command::Peers { .. }
+                | Command::Device { .. }
+                | Command::Token(_) => {
                     unreachable!("handled above")
                 }
             }
@@ -2075,6 +2169,52 @@ fn cap_stat_lines(
     Ok(lines)
 }
 
+fn cmd_device(home: &Path, command: Option<DeviceCommand>) -> DynResult<()> {
+    match command {
+        Some(DeviceCommand::Name { name }) => {
+            let name = validate_device_name(&name)?;
+            let mut config = DeviceConfig::load(home)?;
+            config.name = Some(name.clone());
+            config.save(home)?;
+            println!("device name {name}");
+            Ok(())
+        }
+        None => {
+            let identity = Identity::load_or_create(home)?;
+            let config = DeviceConfig::load(home)?;
+            let token_status = if TokenStore::open(home).exists() {
+                "configured"
+            } else {
+                "missing"
+            };
+            let snapshot_path = peer_snapshot::snapshot_path(home);
+            let snapshot_status = match peer_snapshot::load(&snapshot_path)? {
+                Some(snap) => {
+                    let age = peer_snapshot::now_unix().saturating_sub(snap.snapshot_at);
+                    format!(
+                        "{} peer{} ({}s old)",
+                        snap.peers.len(),
+                        if snap.peers.len() == 1 { "" } else { "s" },
+                        age
+                    )
+                }
+                None => "missing".into(),
+            };
+
+            println!("home      {}", home.display());
+            println!("node      {}", identity.node_id());
+            println!("short     {}", identity.node_id().short());
+            println!(
+                "name      {}",
+                config.name.as_deref().unwrap_or("(not set)")
+            );
+            println!("token     {token_status}");
+            println!("peers     {snapshot_status}");
+            Ok(())
+        }
+    }
+}
+
 fn cmd_peers(home: &Path, long: bool, json: bool) -> DynResult<()> {
     let path = peer_snapshot::snapshot_path(home);
     let snap = match peer_snapshot::load(&path)? {
@@ -2241,7 +2381,7 @@ fn cmd_serve(
     let token = load_token(home)?;
     let identity = Identity::load_or_create(home)?;
     let node_id = identity.node_id();
-    let friendly_name = name_override.or_else(default_friendly_name);
+    let friendly_name = resolve_serve_name(home, name_override)?;
     let root = store.root().display().to_string();
     let snapshot_path = peer_snapshot::snapshot_path(home);
 
@@ -3459,6 +3599,52 @@ mod tests {
             }),
             format!("signed    yes ({})", identity.node_id().short())
         );
+    }
+
+    #[test]
+    fn device_config_saves_and_loads_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = DeviceConfig {
+            name: Some("laptop".into()),
+        };
+
+        config.save(tmp.path()).unwrap();
+
+        assert_eq!(
+            DeviceConfig::load(tmp.path()).unwrap().name.as_deref(),
+            Some("laptop")
+        );
+    }
+
+    #[test]
+    fn device_name_validation_rejects_shell_hostile_names() {
+        assert_eq!(validate_device_name("macbook-air").unwrap(), "macbook-air");
+        assert!(validate_device_name("").is_err());
+        assert!(validate_device_name("two words").is_err());
+        assert!(validate_device_name("../../../x").is_err());
+        assert!(validate_device_name(&"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn serve_name_prefers_cli_override_then_saved_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        DeviceConfig {
+            name: Some("saved".into()),
+        }
+        .save(tmp.path())
+        .unwrap();
+
+        assert_eq!(
+            resolve_serve_name(tmp.path(), Some("override".into()))
+                .unwrap()
+                .as_deref(),
+            Some("override")
+        );
+        assert_eq!(
+            resolve_serve_name(tmp.path(), None).unwrap().as_deref(),
+            Some("saved")
+        );
+        assert!(resolve_serve_name(tmp.path(), Some("bad name".into())).is_err());
     }
 
     #[test]
