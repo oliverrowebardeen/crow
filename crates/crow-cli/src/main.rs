@@ -661,6 +661,14 @@ type DynResult<T> = std::result::Result<T, DynError>;
 
 const DEVICE_CONFIG_FILE: &str = "device.json";
 
+#[derive(Clone, Copy)]
+struct StoreContext<'a> {
+    home: &'a Path,
+    crow: &'a Crow<FsStore>,
+    pins: &'a PinIndex,
+    catalog: &'a CatalogIndex,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct DeviceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -810,16 +818,23 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                     plain,
-                } => cmd_share(
-                    &home,
-                    &crow,
-                    &pins,
-                    &catalog,
-                    &Identity::load_or_create(&home)?,
-                    &cap_or_prefix,
-                    name,
-                    plain,
-                ),
+                } => {
+                    let identity = Identity::load_or_create(&home)?;
+                    cmd_share(
+                        StoreContext {
+                            home: &home,
+                            crow: &crow,
+                            pins: &pins,
+                            catalog: &catalog,
+                        },
+                        &identity,
+                        ShareCliRequest {
+                            arg: &cap_or_prefix,
+                            name,
+                            plain,
+                        },
+                    )
+                }
                 Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &catalog, &cap_or_prefix),
                 Command::Ls {
                     path,
@@ -883,14 +898,18 @@ fn run(cli: Cli) -> DynResult<()> {
                     catalog_dest,
                     name,
                 } => cmd_receive(
-                    &home,
-                    &crow,
-                    &pins,
-                    &catalog,
-                    &peer,
-                    &cap_or_prefix,
-                    catalog_dest.as_deref(),
-                    name,
+                    StoreContext {
+                        home: &home,
+                        crow: &crow,
+                        pins: &pins,
+                        catalog: &catalog,
+                    },
+                    ReceiveCliRequest {
+                        peer: &peer,
+                        arg: &cap_or_prefix,
+                        dest: catalog_dest.as_deref(),
+                        name,
+                    },
                 ),
                 Command::Serve { .. }
                 | Command::Peers { .. }
@@ -1043,25 +1062,29 @@ struct ShareRequest<'a> {
     name: Option<String>,
 }
 
-fn cmd_share(
-    home: &Path,
-    crow: &Crow<FsStore>,
-    pins: &PinIndex,
-    catalog: &CatalogIndex,
-    identity: &Identity,
-    arg: &str,
+struct ShareCliRequest<'a> {
+    arg: &'a str,
     name: Option<String>,
     plain: bool,
+}
+
+fn cmd_share(
+    ctx: StoreContext<'_>,
+    identity: &Identity,
+    request: ShareCliRequest<'_>,
 ) -> DynResult<()> {
     let report = share_target(
-        home,
-        crow,
-        pins,
-        catalog,
+        ctx.home,
+        ctx.crow,
+        ctx.pins,
+        ctx.catalog,
         identity,
-        ShareRequest { arg, name },
+        ShareRequest {
+            arg: request.arg,
+            name: request.name,
+        },
     )?;
-    if plain {
+    if request.plain {
         println!("{}", report.cap.encode());
         return Ok(());
     }
@@ -2992,21 +3015,35 @@ fn cmd_fetch(
     }
 }
 
-fn cmd_receive(
-    home: &Path,
-    crow: &Crow<FsStore>,
-    pins: &PinIndex,
-    catalog: &CatalogIndex,
-    peer: &str,
-    arg: &str,
+struct ReceiveCliRequest<'a> {
+    peer: &'a str,
+    arg: &'a str,
+    dest: Option<&'a str>,
+    name: Option<String>,
+}
+
+fn cmd_receive(ctx: StoreContext<'_>, request: ReceiveCliRequest<'_>) -> DynResult<()> {
+    let cap = resolve_cap(ctx.pins, request.arg)?;
+    cmd_fetch(
+        ctx.home,
+        ctx.crow,
+        ctx.pins,
+        request.peer,
+        request.arg,
+        request.name.clone(),
+    )?;
+
+    receive_after_fetch(ctx, &cap, request.dest, request.name)
+}
+
+fn receive_after_fetch(
+    ctx: StoreContext<'_>,
+    cap: &Cap,
     dest: Option<&str>,
     name: Option<String>,
 ) -> DynResult<()> {
-    let cap = resolve_cap(pins, arg)?;
-    cmd_fetch(home, crow, pins, peer, arg, name.clone())?;
-
     if let Some(dest) = dest {
-        match catalog_received_cap(crow, pins, catalog, &cap, dest, name)? {
+        match catalog_received_cap(ctx.crow, ctx.pins, ctx.catalog, cap, dest, name)? {
             ReceiveCatalogReport::File { path } => println!("cataloged     {path}"),
             ReceiveCatalogReport::Directory {
                 path,
@@ -3021,9 +3058,9 @@ fn cmd_receive(
             ),
         }
     } else {
-        match crow.open_manifest_kind(&cap)? {
+        match ctx.crow.open_manifest_kind(cap)? {
             ManifestKind::File(_) => {
-                let suggested_name = receive_pin_name(pins, &cap, None)?;
+                let suggested_name = receive_pin_name(ctx.pins, cap, None)?;
                 let suffix = suggested_name
                     .map(|name| format!(" /path/{name}"))
                     .unwrap_or_else(|| " /path/name".into());
