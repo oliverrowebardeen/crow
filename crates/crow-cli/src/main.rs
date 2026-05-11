@@ -18,6 +18,7 @@ use crow_net::{
     Client, ClusterToken, DEFAULT_BIND_ADDR, Discovery, LocalAdvert, PeerInfo, PeerSnapshot,
     SelfInfo, TokenStore, default_friendly_name, peer_snapshot,
 };
+use regex::Regex;
 
 #[derive(Parser)]
 #[command(
@@ -204,6 +205,24 @@ enum Command {
     Find {
         /// Basename glob pattern. Slash-separated path globs are not supported.
         pattern: String,
+    },
+    /// Search file contents with a regex.
+    #[command(
+        long_about = "Resolve a catalog file, catalog directory, full crow1… capability, \
+                      or pinned hash prefix; reconstruct file bytes; and print matching \
+                      lines as TARGET:LINE:TEXT. Directory targets recurse through \
+                      cataloged files. This decrypts and reads file contents, so use \
+                      `crow find` for cheap name-only searches.\n\
+                      \n\
+                      Examples:\n  \
+                      crow grep TODO /docs\n  \
+                      crow grep '^version =' /configs/app.toml"
+    )]
+    Grep {
+        /// Rust regex pattern to search for.
+        pattern: String,
+        /// Catalog path, full bech32m capability, or pinned hash prefix.
+        cap_or_prefix: String,
     },
     /// Summarize logical and local stored size for a catalog path.
     #[command(
@@ -578,6 +597,10 @@ fn run(cli: Cli) -> DynResult<()> {
                 } => cmd_ls(&crow, &pins, &catalog, path.as_deref(), long, pins_only),
                 Command::Tree { path } => cmd_tree(&catalog, path.as_deref()),
                 Command::Find { pattern } => cmd_find(&catalog, &pattern),
+                Command::Grep {
+                    pattern,
+                    cap_or_prefix,
+                } => cmd_grep(&crow, &pins, &catalog, &pattern, &cap_or_prefix),
                 Command::Du { path } => cmd_du(&crow, &catalog, path.as_deref()),
                 Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
                 Command::PutDir { source, dest, yes } => cmd_put_dir(
@@ -1008,6 +1031,127 @@ fn simple_glob_matches(pattern: &str, text: &str) -> bool {
         }
     }
     dp[pattern.len()][text.len()]
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GrepMatch {
+    display: String,
+    line: usize,
+    text: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GrepReport {
+    matches: Vec<GrepMatch>,
+    errors: Vec<String>,
+}
+
+struct GrepTarget {
+    display: String,
+    cap: Cap,
+}
+
+fn cmd_grep(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    pattern: &str,
+    arg: &str,
+) -> DynResult<()> {
+    let report = grep_report(crow, pins, catalog, pattern, arg)?;
+    for hit in &report.matches {
+        println!("{}:{}:{}", hit.display, hit.line, hit.text);
+    }
+    for error in &report.errors {
+        eprintln!("crow grep: {error}");
+    }
+    if report.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("grep failed for {} file(s)", report.errors.len()).into())
+    }
+}
+
+fn grep_report(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    pattern: &str,
+    arg: &str,
+) -> DynResult<GrepReport> {
+    let regex = Regex::new(pattern)?;
+    let targets = grep_targets(catalog, pins, arg)?;
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+
+    for target in targets {
+        let bytes = match grep_file_bytes(crow, &target.cap) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                errors.push(format!("{}: {e}", target.display));
+                continue;
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for (idx, line) in text.lines().enumerate() {
+            if regex.is_match(line) {
+                matches.push(GrepMatch {
+                    display: target.display.clone(),
+                    line: idx + 1,
+                    text: line.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(GrepReport { matches, errors })
+}
+
+fn grep_targets(catalog: &CatalogIndex, pins: &PinIndex, arg: &str) -> DynResult<Vec<GrepTarget>> {
+    let raw = arg.trim();
+    let view = catalog.view()?;
+    if !raw.starts_with("crow1") {
+        if let Ok(path) = CatalogPath::normalize(raw) {
+            if let Some(entry) = view.get(&path) {
+                return match &entry.kind {
+                    EntryKind::Dir => Ok(catalog_subtree_entries(&view, &path)
+                        .into_iter()
+                        .filter_map(|entry| match &entry.kind {
+                            EntryKind::File { cap, .. } => Some(GrepTarget {
+                                display: entry.path.to_string(),
+                                cap: cap.clone(),
+                            }),
+                            EntryKind::Dir => None,
+                        })
+                        .collect()),
+                    EntryKind::File { cap, .. } => Ok(vec![GrepTarget {
+                        display: path.to_string(),
+                        cap: cap.clone(),
+                    }]),
+                };
+            }
+            if raw.starts_with('/') {
+                return Err(format!("catalog path not found: {path}").into());
+            }
+        }
+    }
+
+    let target = resolve_file_ref(catalog, pins, raw)?;
+    let display = target
+        .path
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| target.cap.manifest_hash.to_string()[..12].to_string());
+    Ok(vec![GrepTarget {
+        display,
+        cap: target.cap,
+    }])
+}
+
+fn grep_file_bytes(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<Vec<u8>> {
+    match crow.open_manifest_kind(cap)? {
+        ManifestKind::File(_) => Ok(crow.get_bytes(cap)?),
+        ManifestKind::Directory(_) => Err("is a directory snapshot".into()),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3474,6 +3618,115 @@ mod tests {
         assert!(simple_glob_matches("report-??.pdf", "report-01.pdf"));
         assert!(!simple_glob_matches("report-??.pdf", "report-001.pdf"));
         assert!(!simple_glob_matches("*.md", "notes.MD"));
+    }
+
+    #[test]
+    fn grep_searches_single_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"alpha\nTODO one\nbeta\n");
+        catalog
+            .put_file("/notes.txt", cap, Some("notes.txt".into()))
+            .unwrap();
+
+        let report = grep_report(&crow, &pins, &catalog, "TODO", "/notes.txt").unwrap();
+
+        assert_eq!(
+            report,
+            GrepReport {
+                matches: vec![GrepMatch {
+                    display: "/notes.txt".into(),
+                    line: 2,
+                    text: "TODO one".into(),
+                }],
+                errors: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn grep_recurses_catalog_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let a = stored_cap(&crow, b"TODO root\n");
+        let b = stored_cap(&crow, b"skip\nTODO nested\n");
+        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog
+            .put_file("/docs/a.txt", a, Some("a.txt".into()))
+            .unwrap();
+        catalog
+            .put_file("/docs/nested/b.txt", b, Some("b.txt".into()))
+            .unwrap();
+
+        let report = grep_report(&crow, &pins, &catalog, "TODO", "/docs").unwrap();
+        let displays = report
+            .matches
+            .iter()
+            .map(|hit| (hit.display.as_str(), hit.line, hit.text.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            displays,
+            vec![
+                ("/docs/a.txt", 1, "TODO root"),
+                ("/docs/nested/b.txt", 2, "TODO nested"),
+            ]
+        );
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn grep_no_matches_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"nothing here\n");
+        catalog
+            .put_file("/notes.txt", cap, Some("notes.txt".into()))
+            .unwrap();
+
+        let report = grep_report(&crow, &pins, &catalog, "TODO", "/notes.txt").unwrap();
+
+        assert!(report.matches.is_empty());
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn grep_invalid_regex_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+
+        let err = grep_report(&crow, &pins, &catalog, "[", "/notes.txt").unwrap_err();
+
+        assert!(err.to_string().contains("regex parse error"));
+    }
+
+    #[test]
+    fn grep_reports_missing_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        catalog
+            .put_file(
+                "/missing.txt",
+                cap_with_hash_byte(0x51),
+                Some("missing.txt".into()),
+            )
+            .unwrap();
+
+        let report = grep_report(&crow, &pins, &catalog, "TODO", "/missing.txt").unwrap();
+
+        assert!(report.matches.is_empty());
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("/missing.txt"));
     }
 
     #[test]

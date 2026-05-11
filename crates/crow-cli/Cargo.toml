@@ -15,6 +15,7 @@ path = "src/main.rs"
 crow = { path = "../crow" }
 crow-net = { path = "../crow-net" }
 clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 
