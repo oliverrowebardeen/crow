@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -91,7 +91,7 @@ impl std::fmt::Display for CatalogPath {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEvent {
     pub event_id: String,
     pub device_id: String,
@@ -100,7 +100,7 @@ pub struct CatalogEvent {
     pub op: CatalogOp,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CatalogOp {
     Mkdir {
         path: String,
@@ -330,6 +330,23 @@ impl CatalogIndex {
         Ok(out)
     }
 
+    pub fn merge_events(&self, events: impl IntoIterator<Item = CatalogEvent>) -> Result<usize> {
+        let mut known: HashSet<String> = self
+            .load_events()?
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect();
+        let mut added = 0usize;
+        for event in events {
+            validate_event(&event)?;
+            if known.insert(event.event_id.clone()) {
+                self.append_event(&event)?;
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
     pub fn mkdir(&self, path: &str, parents: bool) -> Result<Vec<CatalogEvent>> {
         let target = CatalogPath::normalize(path)?;
         if target == CatalogPath::root() {
@@ -405,6 +422,11 @@ impl CatalogIndex {
             created_at: unix_now(),
             op,
         };
+        self.append_event(&event)?;
+        Ok(event)
+    }
+
+    fn append_event(&self, event: &CatalogEvent) -> Result<()> {
         if let Some(parent) = self.events_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -412,10 +434,10 @@ impl CatalogIndex {
             .create(true)
             .append(true)
             .open(&self.events_path)?;
-        serde_json::to_writer(&mut f, &event)
+        serde_json::to_writer(&mut f, event)
             .map_err(|e| Error::Catalog(format!("event serialize: {e}")))?;
         f.write_all(b"\n")?;
-        Ok(event)
+        Ok(())
     }
 
     fn next_seq(&self) -> Result<u64> {
@@ -441,6 +463,30 @@ fn ensure_parent_exists(view: &CatalogView, path: &CatalogPath) -> Result<()> {
         ))),
         None => Err(Error::Catalog(format!("parent {parent} does not exist"))),
     }
+}
+
+fn validate_event(event: &CatalogEvent) -> Result<()> {
+    if event.event_id.trim().is_empty() {
+        return Err(Error::Catalog("catalog event id must not be empty".into()));
+    }
+    parse_device_id(&event.device_id)?;
+    if event.seq == 0 {
+        return Err(Error::Catalog("catalog event seq must be non-zero".into()));
+    }
+    match &event.op {
+        CatalogOp::Mkdir { path } | CatalogOp::Remove { path } => {
+            CatalogPath::normalize(path)?;
+        }
+        CatalogOp::PutFile { path, cap, .. } => {
+            CatalogPath::normalize(path)?;
+            Cap::decode(cap)?;
+        }
+        CatalogOp::Move { from, to } => {
+            CatalogPath::normalize(from)?;
+            CatalogPath::normalize(to)?;
+        }
+    }
+    Ok(())
 }
 
 fn missing_dirs(
@@ -516,6 +562,16 @@ mod tests {
             ManifestHash::from_bytes([b; 32]),
             ManifestKey::from_bytes([b; 32]),
         )
+    }
+
+    fn remote_event(device_id: &str, seq: u64, created_at: u64, op: CatalogOp) -> CatalogEvent {
+        CatalogEvent {
+            event_id: format!("{device_id}:{seq}"),
+            device_id: device_id.into(),
+            seq,
+            created_at,
+            op,
+        }
     }
 
     #[test]
@@ -641,6 +697,117 @@ mod tests {
         let caps = catalog.view().unwrap().file_caps();
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].manifest_hash, cap.manifest_hash);
+    }
+
+    #[test]
+    fn merge_events_imports_remote_events_once() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let device = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let cap = cap_with_hash_byte(5);
+        let events = vec![
+            remote_event(
+                device,
+                1,
+                1,
+                CatalogOp::Mkdir {
+                    path: "/docs".into(),
+                },
+            ),
+            remote_event(
+                device,
+                2,
+                2,
+                CatalogOp::PutFile {
+                    path: "/docs/report.pdf".into(),
+                    cap: cap.encode(),
+                    name: Some("report.pdf".into()),
+                },
+            ),
+        ];
+
+        assert_eq!(catalog.merge_events(events.clone()).unwrap(), 2);
+        assert_eq!(catalog.merge_events(events).unwrap(), 0);
+
+        let view = catalog.view().unwrap();
+        assert!(
+            view.get(&CatalogPath::normalize("/docs").unwrap())
+                .is_some()
+        );
+        assert_eq!(
+            view.get(&CatalogPath::normalize("/docs/report.pdf").unwrap())
+                .unwrap()
+                .cap()
+                .map(|cap| cap.manifest_hash),
+            Some(cap.manifest_hash)
+        );
+        assert_eq!(catalog.load_events().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn merge_events_rejects_invalid_remote_event() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let device = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let event = remote_event(
+            device,
+            1,
+            1,
+            CatalogOp::PutFile {
+                path: "/bad".into(),
+                cap: "not-a-cap".into(),
+                name: None,
+            },
+        );
+
+        let err = catalog.merge_events(vec![event]).unwrap_err();
+
+        assert!(err.to_string().contains("invalid"));
+        assert!(catalog.load_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_events_replays_conflicts_deterministically() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let cap_a = cap_with_hash_byte(6);
+        let cap_b = cap_with_hash_byte(7);
+
+        catalog
+            .merge_events(vec![
+                remote_event(
+                    a,
+                    1,
+                    1,
+                    CatalogOp::PutFile {
+                        path: "/same.txt".into(),
+                        cap: cap_a.encode(),
+                        name: Some("a".into()),
+                    },
+                ),
+                remote_event(
+                    b,
+                    1,
+                    1,
+                    CatalogOp::PutFile {
+                        path: "/same.txt".into(),
+                        cap: cap_b.encode(),
+                        name: Some("b".into()),
+                    },
+                ),
+            ])
+            .unwrap();
+
+        let view = catalog.view().unwrap();
+        assert_eq!(
+            view.get(&CatalogPath::normalize("/same.txt").unwrap())
+                .unwrap()
+                .cap()
+                .map(|cap| cap.manifest_hash),
+            Some(cap_b.manifest_hash)
+        );
     }
 
     #[test]
