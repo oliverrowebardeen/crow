@@ -126,6 +126,21 @@ enum Command {
         /// Output path. "-" writes to stdout.
         out: String,
     },
+    /// Print a file's bytes to stdout.
+    #[command(
+        long_about = "Resolve a local catalog path, full crow1… capability, or pinned \
+                      hash prefix; reconstruct the file; and write raw bytes to \
+                      stdout. This is intentionally Unix-like and does not guard \
+                      against binary or large output.\n\
+                      \n\
+                      Examples:\n  \
+                      crow cat /docs/notes.md\n  \
+                      crow cat /docs/notes.md | grep TODO"
+    )]
+    Cat {
+        /// Catalog path, full bech32m capability (`crow1…`), or hex prefix.
+        cap_or_prefix: String,
+    },
     /// Print metadata for a catalog path, capability, or hash prefix.
     #[command(
         long_about = "Decrypt and inspect the manifest behind a capability. Shows the \
@@ -527,6 +542,7 @@ fn run(cli: Cli) -> DynResult<()> {
                 Command::Get { cap_or_prefix, out } => {
                     cmd_get(&crow, &pins, &catalog, &cap_or_prefix, &out)
                 }
+                Command::Cat { cap_or_prefix } => cmd_cat(&crow, &pins, &catalog, &cap_or_prefix),
                 Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &catalog, &cap_or_prefix),
                 Command::Ls {
                     path,
@@ -650,6 +666,30 @@ fn cmd_get(
     let bytes = crow.get_bytes(&cap)?;
     write_all(out, &bytes)?;
     Ok(())
+}
+
+fn cmd_cat(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: &str,
+) -> DynResult<()> {
+    let bytes = cat_bytes(crow, pins, catalog, arg)?;
+    io::stdout().lock().write_all(&bytes)?;
+    Ok(())
+}
+
+fn cat_bytes(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: &str,
+) -> DynResult<Vec<u8>> {
+    let target = resolve_file_ref(catalog, pins, arg)?;
+    match crow.open_manifest_kind(&target.cap)? {
+        ManifestKind::File(_) => Ok(crow.get_bytes(&target.cap)?),
+        ManifestKind::Directory(_) => Err(format!("{} is a directory", arg.trim()).into()),
+    }
 }
 
 fn cmd_info(
@@ -3280,6 +3320,58 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("catalog path not found"));
+    }
+
+    #[test]
+    fn cat_reads_catalog_path_and_full_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"hello from cat\n");
+        catalog.mkdir("/docs", false).unwrap();
+        catalog
+            .put_file("/docs/note.txt", cap.clone(), Some("note.txt".into()))
+            .unwrap();
+
+        assert_eq!(
+            cat_bytes(&crow, &pins, &catalog, "/docs/note.txt").unwrap(),
+            b"hello from cat\n"
+        );
+        assert_eq!(
+            cat_bytes(&crow, &pins, &catalog, &cap.encode()).unwrap(),
+            b"hello from cat\n"
+        );
+    }
+
+    #[test]
+    fn cat_reads_pinned_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"prefix bytes");
+        pins.add(cap.clone(), Some("prefix.txt".into()), None)
+            .unwrap();
+        let prefix = &cap.manifest_hash.to_string()[..8];
+
+        assert_eq!(
+            cat_bytes(&crow, &pins, &catalog, prefix).unwrap(),
+            b"prefix bytes"
+        );
+    }
+
+    #[test]
+    fn cat_rejects_directories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        catalog.mkdir("/docs", false).unwrap();
+
+        let err = cat_bytes(&crow, &pins, &catalog, "/docs").unwrap_err();
+
+        assert!(err.to_string().contains("is a directory"));
     }
 
     #[test]
