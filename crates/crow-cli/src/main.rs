@@ -383,6 +383,24 @@ enum Command {
         /// Destination catalog path, or existing directory.
         to: String,
     },
+    /// Copy a file reference to another catalog path.
+    #[command(
+        long_about = "Create another local catalog entry pointing at the same file cap. \
+                      This is metadata-only: encrypted chunks are not duplicated. The \
+                      destination must be a catalog path, and existing entries are \
+                      never overwritten.\n\
+                      \n\
+                      Examples:\n  \
+                      crow cp /docs/report.pdf /archive/report.pdf\n  \
+                      crow cp /docs/report.pdf /archive/\n  \
+                      crow cp <prefix> /imports/from-friend.pdf"
+    )]
+    Cp {
+        /// Source catalog path, full bech32m capability, or pinned hash prefix.
+        src: String,
+        /// Destination catalog path, or existing directory.
+        dst: String,
+    },
     /// Sweep every chunk and manifest not referenced by any pin or catalog path.
     #[command(
         long_about = "Walk every chunk and manifest in the store; delete anything not \
@@ -586,6 +604,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     dry_run,
                 } => cmd_rm(&crow, &pins, &catalog, &cap_or_prefix, dry_run),
                 Command::Mv { from, to } => cmd_mv(&catalog, &from, &to),
+                Command::Cp { src, dst } => cmd_cp(&pins, &catalog, &src, &dst),
                 Command::Gc { dry_run } => cmd_gc(&crow, &pins, &catalog, dry_run),
                 Command::Stat => cmd_stat(&crow, &pins, &catalog),
                 Command::Fetch {
@@ -1606,6 +1625,63 @@ fn cmd_mv(catalog: &CatalogIndex, from: &str, to: &str) -> DynResult<()> {
     catalog.move_path(from.as_str(), to.as_str())?;
     println!("moved {from} -> {to}");
     Ok(())
+}
+
+fn cmd_cp(pins: &PinIndex, catalog: &CatalogIndex, src: &str, dst: &str) -> DynResult<()> {
+    let source = resolve_file_ref(catalog, pins, src)?;
+    let view = catalog.view()?;
+    let dst = resolve_copy_destination(pins, &view, &source, dst)?;
+
+    if view.get(&dst).is_some() {
+        return Err(format!("destination already exists: {dst}").into());
+    }
+    if let Some(parent) = dst.parent() {
+        match view.get(&parent) {
+            Some(entry) if entry.is_dir() => {}
+            Some(_) => return Err(format!("destination parent is a file: {parent}").into()),
+            None => return Err(format!("destination parent does not exist: {parent}").into()),
+        }
+    }
+
+    let name = dst.file_name().map(str::to_string);
+    catalog.put_file(dst.as_str(), source.cap, name)?;
+    println!("copied {} -> {dst}", src.trim());
+    Ok(())
+}
+
+fn resolve_copy_destination(
+    pins: &PinIndex,
+    view: &CatalogView,
+    source: &ResolvedFile,
+    dst: &str,
+) -> DynResult<CatalogPath> {
+    let raw_dst = dst.trim();
+    let mut path = CatalogPath::normalize(raw_dst)?;
+    let dst_is_dir = raw_dst.ends_with('/') || view.get(&path).is_some_and(|entry| entry.is_dir());
+    if dst_is_dir {
+        let name = copy_source_name(pins, source)?;
+        path = join_catalog_path(&path, &name)?;
+    }
+    Ok(path)
+}
+
+fn copy_source_name(pins: &PinIndex, source: &ResolvedFile) -> DynResult<String> {
+    if let Some(path) = &source.path {
+        if let Some(name) = path.file_name() {
+            return Ok(name.to_string());
+        }
+    }
+
+    if let Some(pin) = pins.get(source.cap.manifest_hash.inner())? {
+        if let Some(name) = pin.name {
+            return Ok(name);
+        }
+    }
+
+    Err(
+        "destination is a directory; cap sources need a pinned name or full destination path"
+            .into(),
+    )
 }
 
 fn cmd_gc(
@@ -3372,6 +3448,107 @@ mod tests {
         let err = cat_bytes(&crow, &pins, &catalog, "/docs").unwrap_err();
 
         assert!(err.to_string().contains("is a directory"));
+    }
+
+    #[test]
+    fn cp_copies_catalog_file_to_new_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0x41);
+        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/archive", false).unwrap();
+        catalog
+            .put_file("/docs/a.txt", cap.clone(), Some("a.txt".into()))
+            .unwrap();
+
+        cmd_cp(&pins, &catalog, "/docs/a.txt", "/archive/a-copy.txt").unwrap();
+
+        let view = catalog.view().unwrap();
+        let source = view
+            .get(&CatalogPath::normalize("/docs/a.txt").unwrap())
+            .unwrap();
+        let copy = view
+            .get(&CatalogPath::normalize("/archive/a-copy.txt").unwrap())
+            .unwrap();
+        assert_eq!(source.cap().map(Cap::encode), Some(cap.encode()));
+        assert_eq!(copy.cap().map(Cap::encode), Some(cap.encode()));
+        assert!(matches!(
+            &copy.kind,
+            EntryKind::File { name, .. } if name.as_deref() == Some("a-copy.txt")
+        ));
+    }
+
+    #[test]
+    fn cp_copies_into_existing_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0x42);
+        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/archive", false).unwrap();
+        catalog
+            .put_file("/docs/report.pdf", cap.clone(), Some("report.pdf".into()))
+            .unwrap();
+
+        cmd_cp(&pins, &catalog, "/docs/report.pdf", "/archive/").unwrap();
+
+        let view = catalog.view().unwrap();
+        let copy = view
+            .get(&CatalogPath::normalize("/archive/report.pdf").unwrap())
+            .unwrap();
+        assert_eq!(copy.cap().map(Cap::encode), Some(cap.encode()));
+        assert!(matches!(
+            &copy.kind,
+            EntryKind::File { name, .. } if name.as_deref() == Some("report.pdf")
+        ));
+    }
+
+    #[test]
+    fn cp_uses_pin_name_for_cap_source_into_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0x43);
+        pins.add(cap.clone(), Some("friend.txt".into()), None)
+            .unwrap();
+        catalog.mkdir("/imports", false).unwrap();
+        let prefix = &cap.manifest_hash.to_string()[..8];
+
+        cmd_cp(&pins, &catalog, prefix, "/imports/").unwrap();
+
+        let view = catalog.view().unwrap();
+        let copy = view
+            .get(&CatalogPath::normalize("/imports/friend.txt").unwrap())
+            .unwrap();
+        assert_eq!(copy.cap().map(Cap::encode), Some(cap.encode()));
+        assert!(matches!(
+            &copy.kind,
+            EntryKind::File { name, .. } if name.as_deref() == Some("friend.txt")
+        ));
+    }
+
+    #[test]
+    fn cp_refuses_overwrite_and_directory_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0x44);
+        catalog.mkdir("/docs", false).unwrap();
+        catalog
+            .put_file("/docs/source.txt", cap.clone(), Some("source.txt".into()))
+            .unwrap();
+        catalog
+            .put_file("/docs/existing.txt", cap, Some("existing.txt".into()))
+            .unwrap();
+
+        let overwrite = cmd_cp(&pins, &catalog, "/docs/source.txt", "/docs/existing.txt")
+            .expect_err("expected overwrite error");
+        assert!(overwrite.to_string().contains("destination already exists"));
+
+        let dir_source =
+            cmd_cp(&pins, &catalog, "/docs", "/copy").expect_err("expected directory error");
+        assert!(dir_source.to_string().contains("is a directory"));
     }
 
     #[test]
