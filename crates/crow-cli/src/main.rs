@@ -175,6 +175,21 @@ enum Command {
         /// Optional catalog path to use as the tree root.
         path: Option<String>,
     },
+    /// Find catalog entries by basename glob.
+    #[command(
+        long_about = "Search local catalog file and directory names with a simple \
+                      basename glob. Supports `*` for any sequence and `?` for one \
+                      character. Matching is case-sensitive and catalog-only; Crow \
+                      does not decrypt manifests or walk chunks.\n\
+                      \n\
+                      Examples:\n  \
+                      crow find '*.md'\n  \
+                      crow find 'report-??.pdf'"
+    )]
+    Find {
+        /// Basename glob pattern. Slash-separated path globs are not supported.
+        pattern: String,
+    },
     /// Create a local catalog directory.
     #[command(
         long_about = "Create a local catalog directory. Directories organize file caps \
@@ -504,6 +519,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     pins: pins_only,
                 } => cmd_ls(&crow, &pins, &catalog, path.as_deref(), long, pins_only),
                 Command::Tree { path } => cmd_tree(&catalog, path.as_deref()),
+                Command::Find { pattern } => cmd_find(&catalog, &pattern),
                 Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
                 Command::PutDir { source, dest, yes } => cmd_put_dir(
                     &crow,
@@ -849,6 +865,63 @@ fn catalog_tree_label(entry: &CatalogEntry, is_root: bool) -> String {
             }
         }
     }
+}
+
+fn cmd_find(catalog: &CatalogIndex, pattern: &str) -> DynResult<()> {
+    let view = catalog.view()?;
+    let matches = catalog_find_matches(&view, pattern)?;
+    for path in matches {
+        println!("{path}");
+    }
+    Ok(())
+}
+
+fn catalog_find_matches(view: &CatalogView, pattern: &str) -> DynResult<Vec<CatalogPath>> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Err("find pattern must not be empty".into());
+    }
+    if pattern.contains('/') {
+        return Err("crow find matches basenames only; omit '/' from the pattern".into());
+    }
+
+    let root = CatalogPath::root();
+    let mut stack = view.list(&root);
+    let mut out = Vec::new();
+    while let Some(entry) = stack.pop() {
+        if let Some(name) = entry.path.file_name()
+            && simple_glob_matches(pattern, name)
+        {
+            out.push(entry.path.clone());
+        }
+        if entry.is_dir() {
+            stack.extend(view.list(&entry.path));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn simple_glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut dp = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=pattern.len() {
+        if pattern[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=pattern.len() {
+        for j in 1..=text.len() {
+            dp[i][j] = match pattern[i - 1] {
+                '*' => dp[i - 1][j] || dp[i][j - 1],
+                '?' => dp[i - 1][j - 1],
+                c => c == text[j - 1] && dp[i - 1][j - 1],
+            };
+        }
+    }
+    dp[pattern.len()][text.len()]
 }
 
 fn pin_listing_metadata(
@@ -2910,6 +2983,92 @@ mod tests {
             catalog_tree_lines(&view, &CatalogPath::normalize("/missing").unwrap()).unwrap_err();
 
         assert!(err.to_string().contains("catalog path not found"));
+    }
+
+    #[test]
+    fn find_matches_catalog_basenames() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs/projects", true).unwrap();
+        catalog
+            .put_file(
+                "/docs/notes.md",
+                cap_with_hash_byte(0x44),
+                Some("notes.md".into()),
+            )
+            .unwrap();
+        catalog
+            .put_file(
+                "/docs/projects/readme.md",
+                cap_with_hash_byte(0x45),
+                Some("readme.md".into()),
+            )
+            .unwrap();
+        catalog
+            .put_file(
+                "/docs/projects/report-01.pdf",
+                cap_with_hash_byte(0x46),
+                Some("report-01.pdf".into()),
+            )
+            .unwrap();
+
+        let matches = catalog_find_matches(&catalog.view().unwrap(), "*.md").unwrap();
+
+        assert_eq!(
+            matches.iter().map(CatalogPath::as_str).collect::<Vec<_>>(),
+            vec!["/docs/notes.md", "/docs/projects/readme.md"]
+        );
+    }
+
+    #[test]
+    fn find_matches_question_mark_and_directories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/dogs", false).unwrap();
+        catalog.mkdir("/docks", false).unwrap();
+        catalog
+            .put_file(
+                "/docs/report-01.pdf",
+                cap_with_hash_byte(0x47),
+                Some("report-01.pdf".into()),
+            )
+            .unwrap();
+
+        let dir_matches = catalog_find_matches(&catalog.view().unwrap(), "do?s").unwrap();
+        let file_matches = catalog_find_matches(&catalog.view().unwrap(), "report-??.pdf").unwrap();
+
+        assert_eq!(
+            dir_matches
+                .iter()
+                .map(CatalogPath::as_str)
+                .collect::<Vec<_>>(),
+            vec!["/docs", "/dogs"]
+        );
+        assert_eq!(
+            file_matches
+                .iter()
+                .map(CatalogPath::as_str)
+                .collect::<Vec<_>>(),
+            vec!["/docs/report-01.pdf"]
+        );
+    }
+
+    #[test]
+    fn find_rejects_path_patterns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let err = catalog_find_matches(&catalog.view().unwrap(), "docs/*.md").unwrap_err();
+
+        assert!(err.to_string().contains("basenames only"));
+    }
+
+    #[test]
+    fn simple_glob_matching_supports_star_and_question_mark() {
+        assert!(simple_glob_matches("*.md", "notes.md"));
+        assert!(simple_glob_matches("report-??.pdf", "report-01.pdf"));
+        assert!(!simple_glob_matches("report-??.pdf", "report-001.pdf"));
+        assert!(!simple_glob_matches("*.md", "notes.MD"));
     }
 
     #[test]
