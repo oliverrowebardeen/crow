@@ -2776,12 +2776,23 @@ fn resolve_peer(home: &Path, arg: &str) -> DynResult<Vec<SocketAddr>> {
         n => {
             let mut msg = format!("ambiguous peer '{arg}' ({n} matches):");
             for p in &candidates {
-                let name = p.friendly_name.as_deref().unwrap_or("(unnamed)");
-                msg.push_str(&format!("\n  {} {name}", p.node_id.short()));
+                msg.push_str("\n  ");
+                msg.push_str(&format_peer_candidate(p));
             }
+            msg.push_str("\nuse a longer node-id prefix or one of the listed IP:port addresses");
             Err(msg.into())
         }
     }
+}
+
+fn format_peer_candidate(peer: &PeerInfo) -> String {
+    let name = peer.friendly_name.as_deref().unwrap_or("(unnamed)");
+    let address = peer
+        .addresses
+        .first()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "?".into());
+    format!("{} {name} {address}", peer.node_id.short())
 }
 
 fn humanize_age(unix: u64) -> String {
@@ -4131,6 +4142,47 @@ mod tests {
             addresses
         );
         assert_eq!(resolve_peer(tmp.path(), "laptop").unwrap(), addresses);
+    }
+
+    #[test]
+    fn resolve_peer_ambiguous_name_lists_node_prefixes_and_addresses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let peer_a = Identity::random();
+        let peer_b = Identity::random();
+        let self_id = Identity::random();
+        let snap = PeerSnapshot {
+            snapshot_at: peer_snapshot::now_unix(),
+            self_info: SelfInfo {
+                node_id: self_id.node_id(),
+                friendly_name: Some("self".into()),
+                address: "127.0.0.1:7070".parse().unwrap(),
+            },
+            peers: vec![
+                PeerInfo {
+                    node_id: peer_a.node_id(),
+                    friendly_name: Some("laptop".into()),
+                    addresses: vec!["192.168.1.10:7070".parse().unwrap()],
+                    last_seen_unix: peer_snapshot::now_unix(),
+                },
+                PeerInfo {
+                    node_id: peer_b.node_id(),
+                    friendly_name: Some("laptop".into()),
+                    addresses: vec!["192.168.1.11:7070".parse().unwrap()],
+                    last_seen_unix: peer_snapshot::now_unix(),
+                },
+            ],
+        };
+        peer_snapshot::save(&peer_snapshot::snapshot_path(tmp.path()), &snap).unwrap();
+
+        let err = resolve_peer(tmp.path(), "laptop").unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("ambiguous peer 'laptop'"));
+        assert!(msg.contains(&peer_a.node_id().short()));
+        assert!(msg.contains(&peer_b.node_id().short()));
+        assert!(msg.contains("192.168.1.10:7070"));
+        assert!(msg.contains("192.168.1.11:7070"));
+        assert!(msg.contains("use a longer node-id prefix"));
     }
 
     #[test]
