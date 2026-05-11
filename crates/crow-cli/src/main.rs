@@ -143,6 +143,20 @@ enum Command {
         /// Catalog path, full bech32m capability (`crow1…`), or hex prefix.
         cap_or_prefix: String,
     },
+    /// Print the full capability for a file reference.
+    #[command(
+        long_about = "Resolve a catalog file path, full crow1… capability, or pinned \
+                      hash prefix and print the full crow1… cap only. This is the \
+                      low-noise command for copy/paste and scripts.\n\
+                      \n\
+                      Catalog directories are mutable local organization and do not \
+                      have stable caps. Use `crow share /dir` or `crow cap-dir /dir` \
+                      to create an immutable directory snapshot cap."
+    )]
+    Cap {
+        /// Catalog path, full bech32m capability (`crow1…`), or pinned hash prefix.
+        cap_or_prefix: String,
+    },
     /// Print metadata for a catalog path, capability, or hash prefix.
     #[command(
         long_about = "Decrypt and inspect the manifest behind a capability. Shows the \
@@ -742,6 +756,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     cmd_get(&crow, &pins, &catalog, &cap_or_prefix, &out)
                 }
                 Command::Cat { cap_or_prefix } => cmd_cat(&crow, &pins, &catalog, &cap_or_prefix),
+                Command::Cap { cap_or_prefix } => cmd_cap(&pins, &catalog, &cap_or_prefix),
                 Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &catalog, &cap_or_prefix),
                 Command::Ls {
                     path,
@@ -900,6 +915,34 @@ fn cat_bytes(
         ManifestKind::File(_) => Ok(crow.get_bytes(&target.cap)?),
         ManifestKind::Directory(_) => Err(format!("{} is a directory", arg.trim()).into()),
     }
+}
+
+fn cmd_cap(pins: &PinIndex, catalog: &CatalogIndex, arg: &str) -> DynResult<()> {
+    println!("{}", cap_for_target(pins, catalog, arg)?.encode());
+    Ok(())
+}
+
+fn cap_for_target(pins: &PinIndex, catalog: &CatalogIndex, arg: &str) -> DynResult<Cap> {
+    let raw = arg.trim();
+    if !raw.starts_with("crow1") {
+        if let Ok(path) = CatalogPath::normalize(raw) {
+            let view = catalog.view()?;
+            if let Some(entry) = view.get(&path) {
+                return match &entry.kind {
+                    EntryKind::File { cap, .. } => Ok(cap.clone()),
+                    EntryKind::Dir => Err(format!(
+                        "{path} is a catalog directory; use `crow share {path}` or `crow cap-dir {path}` to create an immutable directory snapshot cap"
+                    )
+                    .into()),
+                };
+            }
+            if raw.starts_with('/') {
+                return Err(format!("catalog path not found: {path}").into());
+            }
+        }
+    }
+
+    Ok(resolve_file_ref(catalog, pins, raw)?.cap)
 }
 
 fn cmd_info(
@@ -4268,6 +4311,52 @@ mod tests {
         let err = cat_bytes(&crow, &pins, &catalog, "/docs").unwrap_err();
 
         assert!(err.to_string().contains("is a directory"));
+    }
+
+    #[test]
+    fn cap_resolves_catalog_file_full_cap_and_pinned_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let cap = cap_with_hash_byte(0x61);
+        catalog
+            .put_file("/note.txt", cap.clone(), Some("note.txt".into()))
+            .unwrap();
+        pins.add(cap.clone(), Some("note.txt".into()), None)
+            .unwrap();
+        let prefix = &cap.manifest_hash.to_string()[..8];
+
+        assert_eq!(
+            cap_for_target(&pins, &catalog, "/note.txt")
+                .unwrap()
+                .encode(),
+            cap.encode()
+        );
+        assert_eq!(
+            cap_for_target(&pins, &catalog, &cap.encode())
+                .unwrap()
+                .encode(),
+            cap.encode()
+        );
+        assert_eq!(
+            cap_for_target(&pins, &catalog, prefix).unwrap().encode(),
+            cap.encode()
+        );
+    }
+
+    #[test]
+    fn cap_rejects_catalog_directories_and_missing_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs", false).unwrap();
+
+        let dir_err = cap_for_target(&pins, &catalog, "/docs").unwrap_err();
+        let missing_err = cap_for_target(&pins, &catalog, "/missing.txt").unwrap_err();
+
+        assert!(dir_err.to_string().contains("catalog directory"));
+        assert!(dir_err.to_string().contains("crow share /docs"));
+        assert!(missing_err.to_string().contains("catalog path not found"));
     }
 
     #[test]
