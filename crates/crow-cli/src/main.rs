@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use crow::{
-    Cap, CatalogEntry, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
+    Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
     ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, NodeId,
     PinIndex, PinRecord, SignatureStatus, compute_live_set, compute_live_set_from_roots,
@@ -536,6 +536,21 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Pull catalog metadata from a trusted peer.
+    #[command(
+        long_about = "Connect to a trusted Crow peer, pull its catalog event log, \
+                      merge any new path metadata locally, and report what changed. \
+                      A later phase of this command also fetches missing objects so \
+                      synced paths are locally reconstructable.\n\
+                      \n\
+                      Examples:\n  \
+                      crow sync laptop\n  \
+                      crow sync 192.168.1.42:7070"
+    )]
+    Sync {
+        /// Peer: IP:port, node-id hex prefix, or friendly name.
+        peer: String,
+    },
     /// Fetch a cap from a peer, then optionally catalog it.
     #[command(
         long_about = "Receive a shared cap from a trusted peer. This wraps `crow fetch` \
@@ -892,6 +907,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
+                Command::Sync { peer } => cmd_sync_metadata(&home, &catalog, &peer),
                 Command::Receive {
                     peer,
                     cap_or_prefix,
@@ -2846,6 +2862,7 @@ fn cmd_serve(
 ) -> DynResult<()> {
     let token = load_token(home)?;
     let identity = Identity::load_or_create(home)?;
+    let catalog = CatalogIndex::open(home)?;
     let node_id = identity.node_id();
     let friendly_name = resolve_serve_name(home, name_override)?;
     let root = store.root().display().to_string();
@@ -2854,6 +2871,7 @@ fn cmd_serve(
     let rt = runtime()?;
     rt.block_on(serve_loop(
         store,
+        catalog,
         token,
         bind,
         node_id,
@@ -2865,6 +2883,7 @@ fn cmd_serve(
 
 async fn serve_loop(
     store: FsStore,
+    catalog: CatalogIndex,
     token: ClusterToken,
     bind: SocketAddr,
     node_id: NodeId,
@@ -2872,7 +2891,7 @@ async fn serve_loop(
     root: String,
     snapshot_path: PathBuf,
 ) -> DynResult<()> {
-    let server = crow_net::serve(store, token, bind).await?;
+    let server = crow_net::serve_with_catalog(store, catalog, token, bind).await?;
     let actual_addr = server.local_addr();
 
     let advert = LocalAdvert {
@@ -3013,6 +3032,47 @@ fn cmd_fetch(
             Err(format!("fetch incomplete: {e}").into())
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SyncCatalogReport {
+    remote_events: usize,
+    new_events: usize,
+    local_events: usize,
+    catalog_files: usize,
+}
+
+fn cmd_sync_metadata(home: &Path, catalog: &CatalogIndex, peer: &str) -> DynResult<()> {
+    let token = load_token(home)?;
+    let socket_addrs = resolve_peer(home, peer)?;
+    let rt = runtime()?;
+    let (socket_addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
+    let remote_events = rt.block_on(client.catalog_events(token))?;
+    let report = sync_catalog_events(catalog, remote_events)?;
+
+    println!("peer          {socket_addr}");
+    println!("remote events {}", report.remote_events);
+    println!("new events    {}", report.new_events);
+    println!("local events  {}", report.local_events);
+    println!("catalog files {}", report.catalog_files);
+    println!("status        catalog synced");
+    Ok(())
+}
+
+fn sync_catalog_events(
+    catalog: &CatalogIndex,
+    remote_events: Vec<CatalogEvent>,
+) -> DynResult<SyncCatalogReport> {
+    let remote_count = remote_events.len();
+    let new_events = catalog.merge_events(remote_events)?;
+    let local_events = catalog.load_events()?.len();
+    let catalog_files = catalog.view()?.files().len();
+    Ok(SyncCatalogReport {
+        remote_events: remote_count,
+        new_events,
+        local_events,
+        catalog_files,
+    })
 }
 
 struct ReceiveCliRequest<'a> {
@@ -4223,6 +4283,65 @@ mod tests {
         assert!(msg.contains("192.168.1.10:7070"));
         assert!(msg.contains("192.168.1.11:7070"));
         assert!(msg.contains("use a longer node-id prefix"));
+    }
+
+    #[test]
+    fn sync_catalog_events_imports_remote_catalog_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let device = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let cap = cap_with_hash_byte(0x63);
+        let remote_events = vec![
+            CatalogEvent {
+                event_id: format!("{device}:1"),
+                device_id: device.into(),
+                seq: 1,
+                created_at: 1,
+                op: crow::CatalogOp::Mkdir {
+                    path: "/docs".into(),
+                },
+            },
+            CatalogEvent {
+                event_id: format!("{device}:2"),
+                device_id: device.into(),
+                seq: 2,
+                created_at: 2,
+                op: crow::CatalogOp::PutFile {
+                    path: "/docs/report.pdf".into(),
+                    cap: cap.encode(),
+                    name: Some("report.pdf".into()),
+                },
+            },
+        ];
+
+        let first = sync_catalog_events(&catalog, remote_events.clone()).unwrap();
+        let second = sync_catalog_events(&catalog, remote_events).unwrap();
+
+        assert_eq!(
+            first,
+            SyncCatalogReport {
+                remote_events: 2,
+                new_events: 2,
+                local_events: 2,
+                catalog_files: 1,
+            }
+        );
+        assert_eq!(
+            second,
+            SyncCatalogReport {
+                remote_events: 2,
+                new_events: 0,
+                local_events: 2,
+                catalog_files: 1,
+            }
+        );
+        assert!(
+            catalog
+                .view()
+                .unwrap()
+                .get(&CatalogPath::normalize("/docs/report.pdf").unwrap())
+                .is_some()
+        );
     }
 
     #[test]
