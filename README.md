@@ -481,29 +481,30 @@ Turn the single personal catalog into explicit named spaces and start making sto
 
 9. **Named nests.** Add commands for multiple encrypted vaults, e.g. `crow nest create personal`, `crow nest use personal`, `crow nest devices`, and `crow nest status`. Each nest owns its catalog, trusted device set, keys, and policy.
 10. **Pin, cache, mirror, evict.** Make byte placement explicit: pin a path on this device, mirror a whole nest on an anchor device, cache recently opened files, and evict local chunks only when Crow can prove the nest still has enough copies elsewhere.
-11. **Replication policy.** Move beyond "sync everything here" by tracking how many independent devices should hold each file or shard. Initial policy can be replica-based; later policy can place erasure-coded shards across devices to save space compared with full replication.
-12. **Shard placement scheduler.** Use device role, free space, uptime, network quality, battery, and trust level to decide where encrypted shares should live. The user-facing state should stay simple: safe, at risk, available now, or needs another device online.
+11. **Prime and drain.** Add operational commands for temporary device availability. `crow prime [path]` means "this device is online; make it useful now" by pulling hot shards/cache for the current nest or subtree and letting the device count toward near-term availability. `crow drain [path]` means "this device is leaving" by moving hot shard responsibility elsewhere, verifying the nest is still healthy, then deleting only temporary local shards that are safe to remove. These commands improve laptop/airport/offline workflows, but correctness must not depend on people remembering to run `drain`; background health checks still have to repair after sudden sleep, crash, or network loss.
+12. **Replication policy.** Move beyond "sync everything here" by tracking how many independent devices should hold each file or shard. Initial policy can be replica-based; later policy can place erasure-coded shards across devices to save space compared with full replication.
+13. **Shard placement scheduler.** Use device role, free space, uptime, network quality, battery, and trust level to decide where encrypted shares should live. The user-facing state should stay simple: safe, at risk, available now, or needs another device online.
 
 ### Phase 3 — internet, mesh, and friend testing
 
 Make a nest usable when devices are not on the same Wi-Fi, and make it possible to test with trusted
 friends without giving them the full personal-cluster token.
 
-13. **Internet reachability.** Add NAT traversal plus a small zero-knowledge relay for devices on different networks. Relays should see only opaque ciphertext and routing metadata, never cap keys or plaintext.
-14. **Stable device addressing.** Keep mDNS as LAN convenience, but make device identity cryptographic and routable across LAN, internet relay, and mesh transports. Friendly names remain local labels, not authorization.
-15. **Crow-native sharing flow.** Add offer/inbox/accept semantics so a friend or teammate can receive an encrypted share invitation through Crow instead of a separate chat app. The durable version uses recipient pubkeys, explicit per-cap access lists, optional expiry, and pull-through from your devices or a relay.
-16. **Friend backup / scoped storage.** Let a trusted friend hold encrypted backup shards for a specific nest or path without gaining access to the whole nest. This is the safe path for real-world testing with friends before broader public infrastructure exists.
-17. **Mesh transport.** Run the same chunk-fetch protocol over mesh-friendly links such as Wi-Fi Direct, BLE, LoRa, or community mesh networks. Mesh is slower and intermittent, so it should be treated as another route for catalog sync and shard fetch, not a separate product mode.
+14. **Internet reachability.** Add NAT traversal plus a small zero-knowledge relay for devices on different networks. Relays should see only opaque ciphertext and routing metadata, never cap keys or plaintext.
+15. **Stable device addressing.** Keep mDNS as LAN convenience, but make device identity cryptographic and routable across LAN, internet relay, and mesh transports. Friendly names remain local labels, not authorization.
+16. **Crow-native sharing flow.** Add offer/inbox/accept semantics so a friend or teammate can receive an encrypted share invitation through Crow instead of a separate chat app. The durable version uses recipient pubkeys, explicit per-cap access lists, optional expiry, and pull-through from your devices or a relay.
+17. **Friend backup / scoped storage.** Let a trusted friend hold encrypted backup shards for a specific nest or path without gaining access to the whole nest. This is the safe path for real-world testing with friends before broader public infrastructure exists.
+18. **Mesh transport.** Run the same chunk-fetch protocol over mesh-friendly links such as Wi-Fi Direct, BLE, LoRa, or community mesh networks. Mesh is slower and intermittent, so it should be treated as another route for catalog sync and shard fetch, not a separate product mode.
 
 ### Phase 4 — adapters and shared workspaces
 
 Make Crow useful to more than one local user or process without changing the core storage model.
 
-18. **Local HTTP API.** Expose put/get/list/pin/catalog/fetch operations from `crow serve` over a local API so tools in any language can use Crow without shelling out.
-19. **MCP server proof.** Provide a small MCP server that lets AI tools store and retrieve caps, read catalog resources, and publish signed context/artifact bundles. Crow should be the substrate under agents, not the agent runner.
-20. **Workspace object.** Add a signed workspace manifest/event log that names members, roles, trusted devices, and replication policy. Start local-first and single-team; avoid SaaS admin surfaces until the protocol shape is proven.
-21. **CI and SDK ergonomics.** Fast install path, Docker image, Python SDK first, then JS/TS. The first target is ephemeral jobs and agents that need to publish or fetch durable signed artifacts.
-22. **Streaming and resume.** Replace all large-object paths that require whole-file `Vec<u8>` buffering with streaming APIs and resumable transfer so build artifacts, datasets, and model files are realistic.
+19. **Local HTTP API.** Expose put/get/list/pin/catalog/fetch operations from `crow serve` over a local API so tools in any language can use Crow without shelling out.
+20. **MCP server proof.** Provide a small MCP server that lets AI tools store and retrieve caps, read catalog resources, and publish signed context/artifact bundles. Crow should be the substrate under agents, not the agent runner.
+21. **Workspace object.** Add a signed workspace manifest/event log that names members, roles, trusted devices, and replication policy. Start local-first and single-team; avoid SaaS admin surfaces until the protocol shape is proven.
+22. **CI and SDK ergonomics.** Fast install path, Docker image, Python SDK first, then JS/TS. The first target is ephemeral jobs and agents that need to publish or fetch durable signed artifacts.
+23. **Streaming and resume.** Replace all large-object paths that require whole-file `Vec<u8>` buffering with streaming APIs and resumable transfer so build artifacts, datasets, and model files are realistic.
 
 ### Not yet on the roadmap
 
