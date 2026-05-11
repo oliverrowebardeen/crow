@@ -533,6 +533,28 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Fetch a cap from a peer, then optionally catalog it.
+    #[command(
+        long_about = "Receive a shared cap from a trusted peer. This wraps `crow fetch` \
+                      and, if CATALOG_DEST is supplied, records the fetched file or \
+                      directory snapshot in the local catalog.\n\
+                      \n\
+                      Examples:\n  \
+                      crow receive laptop crow1qyq... /docs/report.pdf\n  \
+                      crow receive laptop crow1qyq... /imports/docs\n  \
+                      crow receive 192.168.1.42:7070 crow1qyq... --name report.pdf"
+    )]
+    Receive {
+        /// Peer: IP:port, node-id hex prefix, or friendly name.
+        peer: String,
+        /// Full bech32m capability (`crow1…`) or hex prefix of a pinned manifest.
+        cap_or_prefix: String,
+        /// Optional catalog destination path.
+        catalog_dest: Option<String>,
+        /// Friendly name for the local pin and directory destination inference.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// List discovered LAN peers from the most recent `crow serve` snapshot.
     #[command(
         long_about = "Read <home>/peers.json — the snapshot a running `crow serve` \
@@ -852,6 +874,21 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
+                Command::Receive {
+                    peer,
+                    cap_or_prefix,
+                    catalog_dest,
+                    name,
+                } => cmd_receive(
+                    &home,
+                    &crow,
+                    &pins,
+                    &catalog,
+                    &peer,
+                    &cap_or_prefix,
+                    catalog_dest.as_deref(),
+                    name,
+                ),
                 Command::Serve { .. }
                 | Command::Peers { .. }
                 | Command::Device { .. }
@@ -1764,7 +1801,32 @@ fn cmd_add_dir(
     dest: &str,
 ) -> DynResult<()> {
     let cap = resolve_cap(pins, arg)?;
-    let manifest = crow.open_directory_manifest(&cap)?;
+    let report = add_directory_cap_to_catalog(crow, catalog, &cap, dest)?;
+    println!(
+        "added directory snapshot at {} ({} file{} / {} director{})",
+        report.path,
+        report.files,
+        if report.files == 1 { "" } else { "s" },
+        report.directories,
+        if report.directories == 1 { "y" } else { "ies" },
+    );
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DirectoryImportReport {
+    path: CatalogPath,
+    files: usize,
+    directories: usize,
+}
+
+fn add_directory_cap_to_catalog(
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    cap: &Cap,
+    dest: &str,
+) -> DynResult<DirectoryImportReport> {
+    let manifest = crow.open_directory_manifest(cap)?;
     let dest = CatalogPath::normalize(dest)?;
     if dest.as_str() == "/" {
         return Err("refusing to add a directory snapshot at catalog root".into());
@@ -1792,18 +1854,11 @@ fn cmd_add_dir(
         }
     }
 
-    println!(
-        "added directory snapshot at {dest} ({} file{} / {} director{})",
-        manifest.file_count(),
-        if manifest.file_count() == 1 { "" } else { "s" },
-        manifest.dir_count(),
-        if manifest.dir_count() == 1 {
-            "y"
-        } else {
-            "ies"
-        },
-    );
-    Ok(())
+    Ok(DirectoryImportReport {
+        path: dest,
+        files: manifest.file_count(),
+        directories: manifest.dir_count(),
+    })
 }
 
 fn cmd_get_dir(
@@ -2921,6 +2976,153 @@ fn cmd_fetch(
             Err(format!("fetch incomplete: {e}").into())
         }
     }
+}
+
+fn cmd_receive(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    peer: &str,
+    arg: &str,
+    dest: Option<&str>,
+    name: Option<String>,
+) -> DynResult<()> {
+    let cap = resolve_cap(pins, arg)?;
+    cmd_fetch(home, crow, pins, peer, arg, name.clone())?;
+
+    if let Some(dest) = dest {
+        match catalog_received_cap(crow, pins, catalog, &cap, dest, name)? {
+            ReceiveCatalogReport::File { path } => println!("cataloged     {path}"),
+            ReceiveCatalogReport::Directory {
+                path,
+                files,
+                directories,
+            } => println!(
+                "cataloged     {path} ({} file{} / {} director{})",
+                files,
+                if files == 1 { "" } else { "s" },
+                directories,
+                if directories == 1 { "y" } else { "ies" },
+            ),
+        }
+    } else {
+        match crow.open_manifest_kind(&cap)? {
+            ManifestKind::File(_) => {
+                let suggested_name = receive_pin_name(pins, &cap, None)?;
+                let suffix = suggested_name
+                    .map(|name| format!(" /path/{name}"))
+                    .unwrap_or_else(|| " /path/name".into());
+                println!(
+                    "next          crow receive <peer> {}{}",
+                    cap.encode(),
+                    suffix
+                );
+            }
+            ManifestKind::Directory(_) => {
+                println!(
+                    "next          crow receive <peer> {} /imports/name",
+                    cap.encode()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiveCatalogReport {
+    File {
+        path: CatalogPath,
+    },
+    Directory {
+        path: CatalogPath,
+        files: usize,
+        directories: usize,
+    },
+}
+
+fn catalog_received_cap(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    cap: &Cap,
+    dest: &str,
+    name: Option<String>,
+) -> DynResult<ReceiveCatalogReport> {
+    match crow.open_manifest_kind(cap)? {
+        ManifestKind::File(_) => {
+            let path = receive_file_destination(pins, catalog, cap, dest, name)?;
+            catalog.put_file(
+                path.as_str(),
+                cap.clone(),
+                path.file_name().map(str::to_string),
+            )?;
+            Ok(ReceiveCatalogReport::File { path })
+        }
+        ManifestKind::Directory(_) => {
+            let report = add_directory_cap_to_catalog(crow, catalog, cap, dest)?;
+            Ok(ReceiveCatalogReport::Directory {
+                path: report.path,
+                files: report.files,
+                directories: report.directories,
+            })
+        }
+    }
+}
+
+fn receive_file_destination(
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    cap: &Cap,
+    dest: &str,
+    name: Option<String>,
+) -> DynResult<CatalogPath> {
+    let raw_dest = dest.trim();
+    let view = catalog.view()?;
+    let mut path = CatalogPath::normalize(raw_dest)?;
+    let dest_is_dir =
+        raw_dest.ends_with('/') || view.get(&path).is_some_and(|entry| entry.is_dir());
+    if dest_is_dir {
+        let file_name = receive_pin_name(pins, cap, name)?
+            .ok_or("destination is a directory; pass --name or a full catalog destination path")?;
+        let file_name = validate_catalog_basename(&file_name)?;
+        path = join_catalog_path(&path, &file_name)?;
+    }
+
+    if view.get(&path).is_some() {
+        return Err(format!("destination already exists: {path}").into());
+    }
+    if let Some(parent) = path.parent() {
+        match view.get(&parent) {
+            Some(entry) if entry.is_dir() => {}
+            Some(_) => return Err(format!("destination parent is a file: {parent}").into()),
+            None => {
+                catalog.mkdir(parent.as_str(), true)?;
+            }
+        }
+    }
+
+    Ok(path)
+}
+
+fn validate_catalog_basename(name: &str) -> DynResult<String> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err("catalog file name must be a single path segment".into());
+    }
+    Ok(name.to_string())
+}
+
+fn receive_pin_name(
+    pins: &PinIndex,
+    cap: &Cap,
+    requested_name: Option<String>,
+) -> DynResult<Option<String>> {
+    if requested_name.is_some() {
+        return Ok(requested_name);
+    }
+    Ok(pins.get(cap.manifest_hash.inner())?.and_then(|r| r.name))
 }
 
 fn fetch_pin_metadata(
@@ -4615,6 +4817,139 @@ mod tests {
             .unwrap()
             .expect("directory snapshot should be pinned");
         assert_eq!(pin.name.as_deref(), Some("docs shared"));
+    }
+
+    #[test]
+    fn receive_catalogs_file_to_explicit_path_and_creates_parents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"received");
+
+        let report =
+            catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/report.txt", None).unwrap();
+
+        assert_eq!(
+            report,
+            ReceiveCatalogReport::File {
+                path: CatalogPath::normalize("/inbox/report.txt").unwrap()
+            }
+        );
+        let view = catalog.view().unwrap();
+        assert!(
+            view.get(&CatalogPath::normalize("/inbox").unwrap())
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(
+            view.get(&CatalogPath::normalize("/inbox/report.txt").unwrap())
+                .unwrap()
+                .cap()
+                .map(Cap::encode),
+            Some(cap.encode())
+        );
+    }
+
+    #[test]
+    fn receive_catalogs_file_into_directory_from_pin_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"received");
+        pins.add(cap.clone(), Some("report.txt".into()), None)
+            .unwrap();
+        catalog.mkdir("/inbox", false).unwrap();
+
+        let report = catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/", None).unwrap();
+
+        assert_eq!(
+            report,
+            ReceiveCatalogReport::File {
+                path: CatalogPath::normalize("/inbox/report.txt").unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn receive_rejects_directory_destination_without_name_and_overwrites() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"received");
+        catalog.mkdir("/inbox", false).unwrap();
+        catalog
+            .put_file(
+                "/inbox/existing.txt",
+                cap.clone(),
+                Some("existing.txt".into()),
+            )
+            .unwrap();
+
+        let no_name =
+            catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/", None).unwrap_err();
+        let overwrite =
+            catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/existing.txt", None)
+                .unwrap_err();
+
+        assert!(no_name.to_string().contains("pass --name"));
+        assert!(overwrite.to_string().contains("destination already exists"));
+    }
+
+    #[test]
+    fn receive_rejects_bad_inferred_file_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"received");
+        pins.add(cap.clone(), Some("bad/name.txt".into()), None)
+            .unwrap();
+        catalog.mkdir("/inbox", false).unwrap();
+
+        let err = catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/", None).unwrap_err();
+
+        assert!(err.to_string().contains("single path segment"));
+    }
+
+    #[test]
+    fn receive_imports_directory_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let identity = Identity::random();
+        let child = stored_cap(&crow, b"child");
+        let manifest = DirectoryManifest::new(
+            unix_now(),
+            vec![
+                DirectoryEntry::dir("nested"),
+                DirectoryEntry::file("nested/file.txt", child, Some("file.txt".into())),
+            ],
+        )
+        .unwrap();
+        let dir_cap = crow.put_directory_manifest(&manifest, &identity).unwrap();
+
+        let report =
+            catalog_received_cap(&crow, &pins, &catalog, &dir_cap, "/imports/docs", None).unwrap();
+
+        assert_eq!(
+            report,
+            ReceiveCatalogReport::Directory {
+                path: CatalogPath::normalize("/imports/docs").unwrap(),
+                files: 1,
+                directories: 1
+            }
+        );
+        assert!(
+            catalog
+                .view()
+                .unwrap()
+                .get(&CatalogPath::normalize("/imports/docs/nested/file.txt").unwrap())
+                .is_some()
+        );
     }
 
     #[test]
