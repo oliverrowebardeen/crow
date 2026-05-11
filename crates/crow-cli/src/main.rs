@@ -416,13 +416,22 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show storage stats.
+    /// Show storage stats or detailed metadata for one target.
     #[command(
-        long_about = "Print the storage path, total manifest and chunk counts and \
-                      sizes, the number of pins, and how much would be freed by `crow \
-                      gc` (unreferenced manifests + chunks)."
+        long_about = "With no argument, print the storage path, object counts, pin \
+                      count, catalog file count, and how much would be freed by `crow \
+                      gc`. With a catalog path, capability, or hash prefix, print \
+                      detailed metadata for that one file, directory, or cap.\n\
+                      \n\
+                      Examples:\n  \
+                      crow stat\n  \
+                      crow stat /docs/report.pdf\n  \
+                      crow stat <prefix>"
     )]
-    Stat,
+    Stat {
+        /// Optional catalog path, full bech32m capability, or pinned hash prefix.
+        cap_or_prefix: Option<String>,
+    },
     /// Serve local manifests and chunks to trusted cluster devices.
     #[command(
         long_about = "Start a long-running QUIC server that serves encrypted manifests \
@@ -606,7 +615,9 @@ fn run(cli: Cli) -> DynResult<()> {
                 Command::Mv { from, to } => cmd_mv(&catalog, &from, &to),
                 Command::Cp { src, dst } => cmd_cp(&pins, &catalog, &src, &dst),
                 Command::Gc { dry_run } => cmd_gc(&crow, &pins, &catalog, dry_run),
-                Command::Stat => cmd_stat(&crow, &pins, &catalog),
+                Command::Stat { cap_or_prefix } => {
+                    cmd_stat(&crow, &pins, &catalog, cap_or_prefix.as_deref())
+                }
                 Command::Fetch {
                     peer,
                     cap_or_prefix,
@@ -1721,7 +1732,27 @@ fn cmd_gc(
     Ok(())
 }
 
-fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex, catalog: &CatalogIndex) -> DynResult<()> {
+fn cmd_stat(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: Option<&str>,
+) -> DynResult<()> {
+    let lines = match arg {
+        Some(arg) => stat_lines(crow, pins, catalog, arg)?,
+        None => store_stat_lines(crow, pins, catalog)?,
+    };
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn store_stat_lines(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+) -> DynResult<Vec<String>> {
     let manifests = crow.store().list(Namespace::Manifests)?;
     let chunks = crow.store().list(Namespace::Chunks)?;
     let manifest_bytes: u64 = manifests
@@ -1765,24 +1796,139 @@ fn cmd_stat(crow: &Crow<FsStore>, pins: &PinIndex, catalog: &CatalogIndex) -> Dy
         }
     }
 
-    println!("store         {}", crow.store().root().display());
-    println!(
-        "manifests     {} files / {}",
-        manifests.len(),
-        format_size_u64(manifest_bytes)
-    );
-    println!(
-        "chunks        {} files / {}",
-        chunks.len(),
-        format_size_u64(chunk_bytes)
-    );
-    println!("pins          {}", pin_records.len());
-    println!("catalog files {}", catalog_files);
-    println!(
-        "unreferenced  {unref_manifests} manifests / {unref_chunks} chunks ({})",
-        format_size_u64(unref_bytes),
-    );
-    Ok(())
+    Ok(vec![
+        format!("store         {}", crow.store().root().display()),
+        format!(
+            "manifests     {} files / {}",
+            manifests.len(),
+            format_size_u64(manifest_bytes)
+        ),
+        format!(
+            "chunks        {} files / {}",
+            chunks.len(),
+            format_size_u64(chunk_bytes)
+        ),
+        format!("pins          {}", pin_records.len()),
+        format!("catalog files {}", catalog_files),
+        format!(
+            "unreferenced  {unref_manifests} manifests / {unref_chunks} chunks ({})",
+            format_size_u64(unref_bytes),
+        ),
+    ])
+}
+
+fn stat_lines(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    arg: &str,
+) -> DynResult<Vec<String>> {
+    let raw = arg.trim();
+    let view = catalog.view()?;
+    if !raw.starts_with("crow1") {
+        if let Ok(path) = CatalogPath::normalize(raw) {
+            if let Some(entry) = view.get(&path) {
+                return match &entry.kind {
+                    EntryKind::Dir => catalog_dir_stat_lines(crow, &view, &path),
+                    EntryKind::File { cap, .. } => cap_stat_lines(crow, pins, Some(&path), cap),
+                };
+            }
+            if raw.starts_with('/') {
+                return Err(format!("catalog path not found: {path}").into());
+            }
+        }
+    }
+
+    let target = resolve_file_ref(catalog, pins, raw)?;
+    cap_stat_lines(crow, pins, target.path.as_ref(), &target.cap)
+}
+
+fn catalog_dir_stat_lines(
+    crow: &Crow<FsStore>,
+    view: &CatalogView,
+    path: &CatalogPath,
+) -> DynResult<Vec<String>> {
+    let report = catalog_du_report(crow, view, path)?;
+    let size = if report.unknown_files == 0 {
+        format_size_u64(report.logical_bytes)
+    } else {
+        format!(
+            "unknown ({} missing file{})",
+            report.unknown_files,
+            if report.unknown_files == 1 { "" } else { "s" }
+        )
+    };
+
+    Ok(vec![
+        format!("path      {path}"),
+        "type      catalog directory".into(),
+        format!("files     {}", report.files),
+        format!("dirs      {}", report.directories),
+        format!("size      {size}"),
+        "cataloged yes".into(),
+    ])
+}
+
+fn cap_stat_lines(
+    crow: &Crow<FsStore>,
+    pins: &PinIndex,
+    path: Option<&CatalogPath>,
+    cap: &Cap,
+) -> DynResult<Vec<String>> {
+    let mut lines = Vec::new();
+    if let Some(path) = path {
+        lines.push(format!("path      {path}"));
+    }
+
+    match crow.open_manifest_kind(cap)? {
+        ManifestKind::File(manifest) => {
+            lines.push("type      file".into());
+            lines.push(format!("cap       {}", cap.encode()));
+            lines.push(format!("hash      {}", cap.manifest_hash));
+            lines.push(format!(
+                "size      {}",
+                format_size(manifest.file_size as usize)
+            ));
+            lines.push(format!("mime      {}", manifest.mime_type));
+            lines.push(format!(
+                "created   {}",
+                format_iso_timestamp(manifest.created_at)
+            ));
+            lines.push(format_signature_status(manifest.signature_status()?));
+        }
+        ManifestKind::Directory(manifest) => {
+            lines.push("type      directory snapshot".into());
+            lines.push(format!("cap       {}", cap.encode()));
+            lines.push(format!("hash      {}", cap.manifest_hash));
+            lines.push(format!("files     {}", manifest.file_count()));
+            lines.push(format!("dirs      {}", manifest.dir_count()));
+            match directory_logical_size(crow, &manifest)? {
+                Some(bytes) => lines.push(format!("size      {}", format_size_u64(bytes))),
+                None => lines.push("size      unknown (missing child manifests)".into()),
+            }
+            lines.push(format!(
+                "created   {}",
+                format_iso_timestamp(manifest.created_at)
+            ));
+            lines.push(format_signature_status(manifest.signature_status()?));
+        }
+    }
+
+    if let Some(rec) = pins.get(cap.manifest_hash.inner())? {
+        let name = rec.name.as_deref().unwrap_or("(unnamed)");
+        lines.push(format!(
+            "pinned    {} ({})",
+            format_iso_timestamp(rec.pinned_at),
+            name
+        ));
+    } else {
+        lines.push("pinned    no".into());
+    }
+    lines.push(format!(
+        "cataloged {}",
+        if path.is_some() { "yes" } else { "no" }
+    ));
+    Ok(lines)
 }
 
 fn cmd_peers(home: &Path, long: bool, json: bool) -> DynResult<()> {
@@ -3549,6 +3695,86 @@ mod tests {
         let dir_source =
             cmd_cp(&pins, &catalog, "/docs", "/copy").expect_err("expected directory error");
         assert!(dir_source.to_string().contains("is a directory"));
+    }
+
+    #[test]
+    fn stat_no_arg_reports_store_stats() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+
+        let lines = store_stat_lines(&crow, &pins, &catalog).unwrap();
+
+        assert!(lines.iter().any(|line| line.starts_with("store         ")));
+        assert!(lines.iter().any(|line| line == "pins          0"));
+        assert!(lines.iter().any(|line| line == "catalog files 0"));
+    }
+
+    #[test]
+    fn stat_catalog_file_includes_cap_pin_and_mime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"stat bytes");
+        pins.add(cap.clone(), Some("note.txt".into()), None)
+            .unwrap();
+        catalog.mkdir("/docs", false).unwrap();
+        catalog
+            .put_file("/docs/note.txt", cap.clone(), Some("note.txt".into()))
+            .unwrap();
+
+        let lines = stat_lines(&crow, &pins, &catalog, "/docs/note.txt").unwrap();
+
+        assert!(lines.contains(&"path      /docs/note.txt".into()));
+        assert!(lines.contains(&"type      file".into()));
+        assert!(lines.contains(&format!("cap       {}", cap.encode())));
+        assert!(lines.contains(&"mime      text/plain".into()));
+        assert!(lines.iter().any(|line| line.starts_with("pinned    ")));
+        assert!(lines.contains(&"cataloged yes".into()));
+    }
+
+    #[test]
+    fn stat_catalog_dir_summarizes_subtree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let a = stored_cap(&crow, b"abc");
+        let b = stored_cap(&crow, b"de");
+        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog
+            .put_file("/docs/a.txt", a, Some("a.txt".into()))
+            .unwrap();
+        catalog
+            .put_file("/docs/nested/b.txt", b, Some("b.txt".into()))
+            .unwrap();
+
+        let lines = stat_lines(&crow, &pins, &catalog, "/docs").unwrap();
+
+        assert!(lines.contains(&"path      /docs".into()));
+        assert!(lines.contains(&"type      catalog directory".into()));
+        assert!(lines.contains(&"files     2".into()));
+        assert!(lines.contains(&"dirs      1".into()));
+        assert!(lines.contains(&"size      5 B".into()));
+        assert!(lines.contains(&"cataloged yes".into()));
+    }
+
+    #[test]
+    fn stat_full_cap_reports_not_cataloged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = stored_cap(&crow, b"loose");
+
+        let lines = stat_lines(&crow, &pins, &catalog, &cap.encode()).unwrap();
+
+        assert!(lines.contains(&"type      file".into()));
+        assert!(lines.contains(&format!("cap       {}", cap.encode())));
+        assert!(lines.contains(&"pinned    no".into()));
+        assert!(lines.contains(&"cataloged no".into()));
     }
 
     #[test]
