@@ -160,6 +160,21 @@ enum Command {
         #[arg(long)]
         pins: bool,
     },
+    /// Show a hierarchical catalog tree.
+    #[command(
+        long_about = "Print a tree view of the local catalog. With no PATH, starts at \
+                      the catalog root. Directories are shown with a trailing slash. \
+                      This is catalog-only metadata; it does not decrypt manifests or \
+                      walk chunks.\n\
+                      \n\
+                      Examples:\n  \
+                      crow tree\n  \
+                      crow tree /docs"
+    )]
+    Tree {
+        /// Optional catalog path to use as the tree root.
+        path: Option<String>,
+    },
     /// Create a local catalog directory.
     #[command(
         long_about = "Create a local catalog directory. Directories organize file caps \
@@ -488,6 +503,7 @@ fn run(cli: Cli) -> DynResult<()> {
                     long,
                     pins: pins_only,
                 } => cmd_ls(&crow, &pins, &catalog, path.as_deref(), long, pins_only),
+                Command::Tree { path } => cmd_tree(&catalog, path.as_deref()),
                 Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
                 Command::PutDir { source, dest, yes } => cmd_put_dir(
                     &crow,
@@ -756,6 +772,83 @@ fn cmd_ls_pins(crow: &Crow<FsStore>, pins: &PinIndex, long: bool) -> DynResult<(
         }
     }
     Ok(())
+}
+
+fn cmd_tree(catalog: &CatalogIndex, path: Option<&str>) -> DynResult<()> {
+    let view = catalog.view()?;
+    let root = match path {
+        Some(path) => CatalogPath::normalize(path)?,
+        None => CatalogPath::root(),
+    };
+    for line in catalog_tree_lines(&view, &root)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn catalog_tree_lines(view: &CatalogView, root: &CatalogPath) -> DynResult<Vec<String>> {
+    let Some(entry) = view.get(root) else {
+        return Err(format!("catalog path not found: {root}").into());
+    };
+
+    let mut lines = vec![catalog_tree_label(entry, true)];
+    if entry.is_dir() {
+        append_catalog_tree_children(view, root, "", &mut lines);
+    }
+    Ok(lines)
+}
+
+fn append_catalog_tree_children(
+    view: &CatalogView,
+    parent: &CatalogPath,
+    prefix: &str,
+    lines: &mut Vec<String>,
+) {
+    let children = view.list(parent);
+    let count = children.len();
+    for (idx, child) in children.into_iter().enumerate() {
+        let is_last = idx + 1 == count;
+        let connector = if is_last { "`-- " } else { "|-- " };
+        lines.push(format!(
+            "{prefix}{connector}{}",
+            catalog_tree_label(child, false)
+        ));
+        if child.is_dir() {
+            let next_prefix = if is_last {
+                format!("{prefix}    ")
+            } else {
+                format!("{prefix}|   ")
+            };
+            append_catalog_tree_children(view, &child.path, &next_prefix, lines);
+        }
+    }
+}
+
+fn catalog_tree_label(entry: &CatalogEntry, is_root: bool) -> String {
+    match &entry.kind {
+        EntryKind::Dir => {
+            if is_root {
+                if entry.path.as_str() == "/" {
+                    "/".into()
+                } else {
+                    format!("{}/", entry.path)
+                }
+            } else {
+                format!("{}/", entry.path.file_name().unwrap_or(entry.path.as_str()))
+            }
+        }
+        EntryKind::File { .. } => {
+            if is_root {
+                entry.path.as_str().to_string()
+            } else {
+                entry
+                    .path
+                    .file_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| entry.path.as_str().to_string())
+            }
+        }
+    }
 }
 
 fn pin_listing_metadata(
@@ -2744,6 +2837,79 @@ mod tests {
             }),
             format!("signed    yes ({})", identity.node_id().short())
         );
+    }
+
+    #[test]
+    fn tree_renders_nested_catalog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs/projects", true).unwrap();
+        catalog.mkdir("/photos", false).unwrap();
+        catalog
+            .put_file(
+                "/docs/notes.md",
+                cap_with_hash_byte(0x41),
+                Some("notes.md".into()),
+            )
+            .unwrap();
+        catalog
+            .put_file(
+                "/docs/projects/crow.md",
+                cap_with_hash_byte(0x42),
+                Some("crow.md".into()),
+            )
+            .unwrap();
+
+        let root = CatalogPath::root();
+        let lines = catalog_tree_lines(&catalog.view().unwrap(), &root).unwrap();
+
+        assert_eq!(
+            lines,
+            vec![
+                "/",
+                "|-- docs/",
+                "|   |-- notes.md",
+                "|   `-- projects/",
+                "|       `-- crow.md",
+                "`-- photos/",
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_can_start_at_file_or_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs", false).unwrap();
+        catalog
+            .put_file(
+                "/docs/notes.md",
+                cap_with_hash_byte(0x43),
+                Some("notes.md".into()),
+            )
+            .unwrap();
+        let view = catalog.view().unwrap();
+
+        assert_eq!(
+            catalog_tree_lines(&view, &CatalogPath::normalize("/docs").unwrap()).unwrap(),
+            vec!["/docs/", "`-- notes.md"]
+        );
+        assert_eq!(
+            catalog_tree_lines(&view, &CatalogPath::normalize("/docs/notes.md").unwrap()).unwrap(),
+            vec!["/docs/notes.md"]
+        );
+    }
+
+    #[test]
+    fn tree_missing_path_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let view = catalog.view().unwrap();
+
+        let err =
+            catalog_tree_lines(&view, &CatalogPath::normalize("/missing").unwrap()).unwrap_err();
+
+        assert!(err.to_string().contains("catalog path not found"));
     }
 
     #[test]
