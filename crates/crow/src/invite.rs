@@ -1,26 +1,25 @@
 //! Bech32m-encoded nest invites.
 //!
-//! An [`Invite`] is a portable, signed bearer credential a nest Owner gives
-//! to a recipient. The recipient decodes it with [`Invite::decode`], checks
-//! [`Invite::verify`] (signature + expiry), and on `crow nest join` the
-//! granter's `invite_signature` is embedded in the resulting `MemberAdded`
-//! catalog event (Phase 3 commit 4). Any third device that later merges
-//! the membership event can re-derive the canonical grant bytes and
-//! re-verify the granter authorised the addition.
+//! An [`Invite`] is a portable, signed credential a nest Owner creates for a
+//! specific recipient device. The recipient decodes it with
+//! [`Invite::decode`], checks [`Invite::verify`] (signature + expiry), and on
+//! `crow nest join` the granter's member-grant signature is embedded in the
+//! resulting `MemberAdded` catalog event. Any third device that later merges
+//! the membership event can re-derive the canonical grant bytes and re-verify
+//! the granter authorised the addition.
 //!
 //! ## Wire shape
 //!
 //! - HRP: `crowinvite`
-//! - Payload: postcard-serialised [`Invite`] with `signature = [0; 64]`,
-//!   then bech32m-encoded.
-//! - The signed payload is the same as the wire payload (signature zeroed
-//!   during canonicalisation). Both encoder and verifier reconstruct the
-//!   identical bytes deterministically.
+//! - Payload: postcard-serialised [`Invite`], then bech32m-encoded.
+//! - `grant_signature` signs the recipient-specific member grant.
+//! - `signature` signs the invite payload with `signature` zeroed during
+//!   canonicalisation. Both encoder and verifier reconstruct the identical
+//!   bytes deterministically.
 //!
-//! Invites are bearer authority: anyone who reads the string can join.
-//! The mitigation is per-device identity binding once joined — the new
-//! member's Ed25519 key goes into the catalog event log, and revocation
-//! (Phase 5) is per-device.
+//! Invites are recipient-bound: the `member` field is the only device identity
+//! that can redeem the invite. The encoded string is still sensitive in
+//! transit, but a leaked invite cannot be used by a different device key.
 //!
 //! Bech32m's recommended QR-friendly length is 90 chars; Crow invites
 //! often exceed that because they carry bootstrap addresses. We document
@@ -65,6 +64,8 @@ pub struct Invite {
     /// Granter's Ed25519 identity. The catalog event log on the granter's
     /// device must already contain a `MemberAdded` for this NodeId.
     pub granter: NodeId,
+    /// Recipient device identity this invite is bound to.
+    pub member: NodeId,
     pub granted_role: NestRole,
     pub created_at: u64,
     /// Unix-seconds expiry. `0` means no expiry (use with caution).
@@ -72,6 +73,10 @@ pub struct Invite {
     /// Up to [`INVITE_MAX_BOOTSTRAP_ADDRS`] socket addresses for the
     /// recipient to try in order when first syncing.
     pub bootstrap_addresses: Vec<SocketAddr>,
+    /// Ed25519 signature by `granter` over
+    /// [`member_grant_canonical_bytes`] for
+    /// `(nest_id, granter, member, granted_role, created_at)`.
+    pub grant_signature: Signature,
     /// Ed25519 signature by `granter` over [`Invite::canonical_bytes`].
     pub signature: Signature,
 }
@@ -82,6 +87,7 @@ impl Invite {
         nest_id: NestId,
         nest_name: String,
         granter: NodeId,
+        member: NodeId,
         granted_role: NestRole,
         expires_at: u64,
         bootstrap_addresses: Vec<SocketAddr>,
@@ -91,10 +97,12 @@ impl Invite {
             nest_id,
             nest_name,
             granter,
+            member,
             granted_role,
             created_at: unix_now(),
             expires_at,
             bootstrap_addresses,
+            grant_signature: Signature([0u8; 64]),
             signature: Signature([0u8; 64]),
         }
     }
@@ -107,6 +115,7 @@ impl Invite {
                 "signing identity does not match Invite.granter".into(),
             ));
         }
+        self.grant_signature = self.sign_member_grant(identity, &self.member, self.created_at)?;
         self.signature = Signature([0u8; 64]);
         let payload = self.canonical_bytes()?;
         let sig: Ed25519Signature = identity.signing.sign(&payload);
@@ -145,6 +154,7 @@ impl Invite {
         granter_key
             .verify(&payload, &sig)
             .map_err(|_| Error::Invite("invalid signature".into()))?;
+        self.verify_member_grant()?;
         if self.expires_at != 0 && now > self.expires_at + INVITE_CLOCK_SKEW_SECS {
             return Err(Error::Invite(format!(
                 "invite expired {} seconds ago",
@@ -152,6 +162,24 @@ impl Invite {
             )));
         }
         Ok(self.granter)
+    }
+
+    /// Verify that `grant_signature` authorises exactly this invite's
+    /// recipient membership event.
+    pub fn verify_member_grant(&self) -> Result<()> {
+        let payload = member_grant_canonical_bytes(
+            &self.nest_id,
+            &self.granter,
+            &self.member,
+            self.granted_role,
+            self.created_at,
+        );
+        let granter_key = VerifyingKey::from_bytes(self.granter.as_bytes())
+            .map_err(|e| Error::Invite(format!("invalid granter pubkey: {e}")))?;
+        let sig = Ed25519Signature::from_bytes(&self.grant_signature.0);
+        granter_key
+            .verify(&payload, &sig)
+            .map_err(|_| Error::Invite("invalid member grant signature".into()))
     }
 
     /// Produce the granter's `MemberAdded.invite_signature` value: the
@@ -238,6 +266,7 @@ mod tests {
             NestId::from_bytes([0x11u8; 16]),
             "team".into(),
             identity.node_id(),
+            NodeId::from_bytes([0xAAu8; 32]),
             NestRole::Owner,
             expires_at,
             vec!["127.0.0.1:7070".parse().unwrap()],
@@ -256,6 +285,7 @@ mod tests {
         let decoded = Invite::decode(&encoded).unwrap();
         assert_eq!(decoded, invite);
         assert_eq!(decoded.verify().unwrap(), identity.node_id());
+        decoded.verify_member_grant().unwrap();
     }
 
     #[test]
@@ -281,6 +311,22 @@ mod tests {
         // signature.
         let mut bad = invite.clone();
         bad.nest_name = "evil".into();
+        let wire = postcard::to_allocvec(&bad).unwrap();
+        let bad_encoded =
+            bech32::encode::<Bech32m>(Hrp::parse(INVITE_HRP).unwrap(), &wire).unwrap();
+
+        let parsed = Invite::decode(&bad_encoded).unwrap();
+        let err = parsed.verify().unwrap_err();
+        assert!(matches!(err, Error::Invite(msg) if msg.contains("invalid signature")));
+    }
+
+    #[test]
+    fn decode_rejects_tampered_member_grant() {
+        let identity = Identity::random();
+        let invite = invite_for(&identity, 0);
+
+        let mut bad = invite.clone();
+        bad.member = NodeId::from_bytes([0xBBu8; 32]);
         let wire = postcard::to_allocvec(&bad).unwrap();
         let bad_encoded =
             bech32::encode::<Bech32m>(Hrp::parse(INVITE_HRP).unwrap(), &wire).unwrap();
@@ -348,6 +394,7 @@ mod tests {
             NestId::from_bytes([0u8; 16]),
             "n".into(),
             owner.node_id(),
+            NodeId::from_bytes([0xABu8; 32]),
             NestRole::Owner,
             0,
             vec![],

@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use crow::{
-    CatalogEvent, CatalogIndex, ChunkStore, FsStore, Hash, Identity, Namespace, NestId, NodeId,
-    Signature,
+    CatalogEvent, CatalogIndex, CatalogOp, ChunkStore, FsStore, Hash, Identity, Namespace, NestId,
+    NodeId, Signature,
 };
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
 use rand::RngCore;
@@ -218,6 +218,7 @@ pub enum Request {
         version: u16,
         nest_id: NestId,
         signer: NodeId,
+        membership_proof: Option<Box<CatalogEvent>>,
     },
     /// Step 2 of the handshake. Client signs
     /// `NEST_AUTH_DOMAIN_TAG || challenge || nest_id || signer` with
@@ -400,6 +401,7 @@ struct ConnState {
 struct PendingNestAuth {
     nest_id: NestId,
     signer: NodeId,
+    membership_proof: Option<CatalogEvent>,
     challenge: [u8; 32],
 }
 
@@ -455,12 +457,31 @@ impl Client {
         nest_id: NestId,
         identity: &Identity,
     ) -> Result<Self> {
+        Self::connect_for_nest_with_proof(peer, nest_id, identity, None).await
+    }
+
+    /// Open a nest-scoped connection with an optional local `MemberAdded`
+    /// proof. This lets a freshly joined invitee authenticate to the
+    /// inviter before the inviter has synced the invitee's membership event.
+    pub async fn connect_for_nest_with_proof(
+        peer: SocketAddr,
+        nest_id: NestId,
+        identity: &Identity,
+        membership_proof: Option<CatalogEvent>,
+    ) -> Result<Self> {
         let client = Self::connect(peer).await?;
-        client.nest_handshake(nest_id, identity).await?;
+        client
+            .nest_handshake(nest_id, identity, membership_proof)
+            .await?;
         Ok(client)
     }
 
-    async fn nest_handshake(&self, nest_id: NestId, identity: &Identity) -> Result<()> {
+    async fn nest_handshake(
+        &self,
+        nest_id: NestId,
+        identity: &Identity,
+        membership_proof: Option<CatalogEvent>,
+    ) -> Result<()> {
         let signer = identity.node_id();
         // Step 1: NestHello → NestChallenge.
         let challenge = match self
@@ -468,6 +489,7 @@ impl Client {
                 version: PROTOCOL_VERSION,
                 nest_id,
                 signer,
+                membership_proof: membership_proof.map(Box::new),
             })
             .await?
         {
@@ -712,8 +734,20 @@ async fn handle_request(
             },
         },
         Request::NestHello {
-            nest_id, signer, ..
-        } => handle_nest_hello(ctx, conn_state, nest_id, signer).await,
+            nest_id,
+            signer,
+            membership_proof,
+            ..
+        } => {
+            handle_nest_hello(
+                ctx,
+                conn_state,
+                nest_id,
+                signer,
+                membership_proof.map(|proof| *proof),
+            )
+            .await
+        }
         Request::NestAuthResponse { signature, .. } => {
             handle_nest_auth_response(ctx, conn_state, signature).await
         }
@@ -744,6 +778,7 @@ async fn handle_nest_hello(
     conn_state: &Arc<tokio::sync::Mutex<ConnState>>,
     nest_id: NestId,
     signer: NodeId,
+    membership_proof: Option<CatalogEvent>,
 ) -> Response {
     let Some(nest) = ctx.nest_serving.as_ref() else {
         return Response::NestUnauthorised;
@@ -757,6 +792,7 @@ async fn handle_nest_hello(
     state.pending = Some(PendingNestAuth {
         nest_id,
         signer,
+        membership_proof,
         challenge,
     });
     // A new handshake on the same connection invalidates any prior
@@ -797,16 +833,32 @@ async fn handle_nest_auth_response(
         return Response::NestUnauthorised;
     }
 
-    // Look up membership in the nest's catalog. Authorised iff the
-    // signer is a current, non-revoked member.
-    let view = match nest.catalog.view() {
-        Ok(v) => v,
+    // Look up membership in the nest's catalog. If this is the invitee's
+    // first contact, accept a valid signed MemberAdded proof and merge it
+    // before authorising the connection.
+    let mut is_member = match nest.catalog.view() {
+        Ok(view) => member_is_current(&view, pending.signer),
         Err(_) => return Response::NestUnauthorised,
     };
-    let is_member = view
-        .members()
-        .iter()
-        .any(|m| m.member == pending.signer && m.revoked_at.is_none());
+    if !is_member {
+        let Some(proof) = pending.membership_proof else {
+            return Response::NestUnauthorised;
+        };
+        if membership_proof_member(&proof) != Some(pending.signer) {
+            return Response::NestUnauthorised;
+        }
+        if nest
+            .catalog
+            .merge_events_from_peer_for_nest(&pending.nest_id, [proof])
+            .is_err()
+        {
+            return Response::NestUnauthorised;
+        }
+        is_member = match nest.catalog.view() {
+            Ok(view) => member_is_current(&view, pending.signer),
+            Err(_) => return Response::NestUnauthorised,
+        };
+    }
     if !is_member {
         return Response::NestUnauthorised;
     }
@@ -817,6 +869,19 @@ async fn handle_nest_auth_response(
         member: pending.signer,
     });
     Response::NestAuthorised
+}
+
+fn member_is_current(view: &crow::CatalogView, member: NodeId) -> bool {
+    view.members()
+        .iter()
+        .any(|m| m.member == member && m.revoked_at.is_none())
+}
+
+fn membership_proof_member(event: &CatalogEvent) -> Option<NodeId> {
+    match &event.op {
+        CatalogOp::MemberAdded { member, .. } => Some(*member),
+        _ => None,
+    }
 }
 
 async fn require_nest_auth(

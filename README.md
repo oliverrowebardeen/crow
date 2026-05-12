@@ -107,7 +107,7 @@ crow nest list
 crow nest current
 crow nest create <name>
 crow nest use <name-or-id-prefix>
-crow nest invite [--expires-in DUR]
+crow nest invite <recipient-node-id> [--expires-in DUR]
 crow nest join <crowinvite1…>
 ```
 
@@ -121,7 +121,7 @@ Catalog folders are mutable local organization. To share a folder, freeze it int
 
 Device names are local convenience metadata. `crow serve` advertises the saved name on LAN mDNS, but caps never contain device names, IP addresses, or other locators.
 
-Nests are named encrypted vaults on the local device. Each nest has its own catalog, pins, encrypted shares, and **member list** under `<home>/nests/<id>/`, so files in different nests can never see each other. Use `crow nest list` / `create` / `use` to switch between them and `--nest <name>` to target a non-active nest for a single command. Two devices in the same nest authenticate to each other via a signed-challenge handshake bound to each device's Ed25519 identity — there is no shared per-nest password to copy. The legacy `cluster-token` still works for any nest as a fallback, but new sharing should go through `crow nest invite` / `crow nest join`.
+Nests are named encrypted vaults on the local device. Each nest has its own catalog, pins, encrypted shares, and **member list** under `<home>/nests/<id>/`, so files in different nests can never see each other. Use `crow nest list` / `create` / `use` to switch between them and `--nest <name>` to target a non-active nest for a single command. Two devices in the same nest authenticate to each other via a signed-challenge handshake bound to each device's Ed25519 identity — there is no shared per-nest password to copy. The legacy `cluster-token` still works for any nest as a fallback, but new sharing should go through recipient-bound `crow nest invite <node-id>` / `crow nest join`.
 
 ### Walkthrough
 
@@ -265,21 +265,26 @@ crow nest create team
 crow nest use team
 crow put report.pdf /docs/
 
-# Hand the printed crowinvite1… to the other device (file, paste, QR — anything).
-INVITE=$(crow nest invite)
-crow serve
-
 # On phone (a fresh home):
 crow setup --name phone                   # phone has its own identity + token
+crow device                               # copy the full "node" value
+
+# On laptop:
+# Hand the printed crowinvite1… to the phone (file, paste, QR — anything).
+PHONE_NODE=0123...                        # paste the phone's full node id
+INVITE=$(crow nest invite "$PHONE_NODE")
+crow serve
+
+# On phone:
 crow nest join "$INVITE"
 crow nest use team
 crow sync laptop                          # auth mode: nest-scoped (signed challenge)
 crow get /docs/report.pdf report.pdf
 ```
 
-`crow nest invite` requires the local device to already be an Owner of the named nest. `--expires-in` accepts `s` / `m` / `h` / `d` / `w` units (default `7d`); pass `0` or `never` to disable expiry. `crow nest join` verifies the granter's signature, checks the expiry (with a 5-minute clock-skew window), and writes a signed `MemberAdded` event into the new nest's catalog. The invite string is bearer authority — treat it like a password in transit.
+`crow nest invite <recipient-node-id>` requires the local device to already be an Owner of the named nest. `--expires-in` accepts `s` / `m` / `h` / `d` / `w` units (default `7d`); pass `0` or `never` to disable expiry. `crow nest join` verifies the granter's signature, checks the expiry (with a 5-minute clock-skew window), confirms the invite is bound to this device's NodeId, and writes a signed `MemberAdded` event into the new nest's catalog. The invite string is still sensitive in transit, but it cannot be redeemed by a different device key.
 
-`crow sync` automatically prefers the nest-scoped path when the active nest has a `MemberAdded` event for the local identity, falling back to the legacy cluster-token path otherwise. The chosen mode is printed at the top of the sync report.
+`crow sync` automatically prefers the nest-scoped path when the active nest has a `MemberAdded` event for the local identity. A freshly joined invitee sends that signed membership proof during the first handshake so the inviter can authorize it before any prior sync. If nest-scoped authentication fails during a mixed-version or migrated-nest setup, `crow sync` falls back to the legacy cluster-token path. The chosen mode is printed at the top of the sync report.
 
 ### Two-device test
 
@@ -382,8 +387,8 @@ If two peers have the same friendly name, `crow receive laptop ...` or `crow syn
 - Capabilities are bearer tokens: anyone with a `crow1…` cap can decrypt the referenced file or directory snapshot if they can fetch enough encrypted shares.
 - Manifest signatures prove which Crow identity created a file or directory snapshot; they do not grant access or imply that the creator is trusted.
 - **Catalog events are signed** with the device identity (Ed25519). Replication between devices uses `merge_events_from_peer`, which rejects unsigned or tampered events; only cryptographically attributable changes propagate.
-- **Nest membership is per-device-identity-bound.** `crow nest invite` produces a signed bearer credential that the recipient redeems into a per-device `MemberAdded` catalog event. The QUIC handshake admits a peer iff that peer's signing key is a current member of the named nest — there is no per-nest shared secret on the wire.
-- Invite strings are bearer authority while in transit. Once redeemed, the new device's identity is independently recorded in the catalog, so a future Phase-5 revocation will be per-device rather than per-invite.
+- **Nest membership is per-device-identity-bound.** `crow nest invite <node-id>` produces a recipient-bound credential that the recipient redeems into a per-device `MemberAdded` catalog event. The first QUIC handshake can carry that signed membership proof so a newly joined device can bootstrap sync without copying the legacy cluster token. The daemon admits a peer iff that peer's signing key is a current member of the named nest or presents a valid grant from a current Owner.
+- Invite strings are recipient-bound but still sensitive while in transit. Once redeemed, the new device's identity is independently recorded in the catalog, so a future Phase-5 revocation will be per-device rather than per-invite.
 - The legacy personal-cluster token remains as an advanced LAN testing bridge for unscoped fetch. Treat it like a password for devices you own; for routine sharing, prefer `crow nest invite` / `crow nest join`.
 - `crow sync` gives a trusted personal device your catalog metadata and asks it for encrypted objects by hash. Do not use a shared cluster token with devices you do not control.
 - Device names and mDNS discovery are only convenience metadata. They are advertised only while `crow serve` runs, are not trusted for authorization, and are never embedded in caps.
@@ -631,10 +636,10 @@ Replace shared-token trust with explicit nest membership.
 
 1. **Signed catalog events — shipped.** Every `CatalogEvent` carries `signer: Option<NodeId>` and `signature: Option<Signature>`. The signing payload is the postcard encoding of the event with the signature field zeroed, mirroring the manifest pattern. `merge_events` accepts unsigned events on local replay (Phase-2 events on disk still load); `merge_events_from_peer` rejects them. Tampering invalidates the signature in both modes.
 2. **Member roles — Owner only.** `NestRole::Owner` is the only variant for now. Writer / Reader / Storage-only land in a follow-up phase when they have meaningful capability differences.
-3. **Device invites — shipped.** `crow nest invite` produces a signed `crowinvite1…` bech32m string with HRP `crowinvite`. `crow nest join <invite>` decodes, verifies the granter's signature and expiry, creates a local nest dir carrying the granter's `nest_id`, and writes a `MemberAdded` event into the catalog.
-4. **Scoped authorization — shipped.** QUIC gains a per-connection challenge-response handshake (`NestHello` → `NestChallenge` → `NestAuthResponse`). The server issues a fresh random 32-byte challenge per connection, the client signs a domain-tagged payload with its identity key, and the server admits the peer iff the signer is a current non-revoked member of the named nest. Subsequent `NestHave` / `NestGet` / `NestCatalogEvents` on the connection are gated on the per-connection auth flag. Wire protocol version bumps to 2.
+3. **Device invites — shipped.** `crow nest invite <recipient-node-id>` produces a signed `crowinvite1…` bech32m string with HRP `crowinvite`. `crow nest join <invite>` decodes, verifies the granter's invite signature, verifies the embedded member-grant signature over `(nest_id, granter, recipient, role, added_at)`, checks expiry, creates a local nest dir carrying the granter's `nest_id`, and writes a verifiable `MemberAdded` event into the catalog.
+4. **Scoped authorization — shipped.** QUIC gains a per-connection challenge-response handshake (`NestHello` → `NestChallenge` → `NestAuthResponse`). The server issues a fresh random 32-byte challenge per connection, the client signs a domain-tagged payload with its identity key, and the server admits the peer iff the signer is a current non-revoked member of the named nest or presents a valid signed `MemberAdded` proof from a current Owner. Subsequent `NestHave` / `NestGet` / `NestCatalogEvents` on the connection are gated on the per-connection auth flag. Wire protocol version bumps to 2.
 5. **Revocation shape — wire only.** `CatalogOp::MemberRevoked` and `MemberRecord::revoked_at` land for wire-format stability, but `CatalogView::members()` still returns revoked entries with `revoked_at` populated. CRDT merge semantics for revocation are deferred to Phase 5.
-6. **Compatibility bridge — shipped.** The `serve` daemon still accepts legacy `ClusterToken` Hello/Have/Get/CatalogEvents requests on the same endpoint. `crow sync` prefers nest-scoped auth when the local identity is a recognised member of the active nest and falls back to cluster-token auth otherwise; the chosen mode is printed in the sync report.
+6. **Compatibility bridge — shipped.** The `serve` daemon still accepts legacy `ClusterToken` Hello/Have/Get/CatalogEvents requests on the same endpoint. `crow sync` prefers nest-scoped auth when the local identity is a recognised member of the active nest and falls back to cluster-token auth when the nest-scoped handshake cannot authenticate; the chosen mode is printed in the sync report.
 
 Acceptance criteria: ✅ two devices can join the same nest without copying a raw shared cluster
 token (`two_devices_share_a_nest_without_cluster_token` integration test); catalog events show who

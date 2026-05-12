@@ -470,30 +470,42 @@ impl CatalogIndex {
         &self,
         events: impl IntoIterator<Item = CatalogEvent>,
     ) -> Result<usize> {
-        self.merge_events_with_origin(events, EventOrigin::Remote)
+        self.merge_events_with_origin(events, EventOrigin::Remote, None)
+    }
+
+    /// Merge nest-scoped events from a remote peer. In addition to outer
+    /// catalog-event signatures, membership operations are validated against
+    /// `nest_id` before being trusted.
+    pub fn merge_events_from_peer_for_nest(
+        &self,
+        nest_id: &NestId,
+        events: impl IntoIterator<Item = CatalogEvent>,
+    ) -> Result<usize> {
+        self.merge_events_with_origin(events, EventOrigin::Remote, Some(nest_id))
     }
 
     /// Local replay of events (e.g. import from another local file). Legacy
     /// unsigned events are tolerated; tampered signatures still reject.
     pub fn merge_events(&self, events: impl IntoIterator<Item = CatalogEvent>) -> Result<usize> {
-        self.merge_events_with_origin(events, EventOrigin::Local)
+        self.merge_events_with_origin(events, EventOrigin::Local, None)
     }
 
     fn merge_events_with_origin(
         &self,
         events: impl IntoIterator<Item = CatalogEvent>,
         origin: EventOrigin,
+        nest_id: Option<&NestId>,
     ) -> Result<usize> {
-        let mut known: HashSet<String> = self
-            .load_events()?
-            .into_iter()
-            .map(|event| event.event_id)
+        let mut replay_events = self.load_events()?;
+        let mut known: HashSet<String> = replay_events
+            .iter()
+            .map(|event| event.event_id.clone())
             .collect();
         let mut added = 0usize;
         for event in events {
             validate_event(&event)?;
-            match event.verify()? {
-                Some(_) => { /* signed + valid */ }
+            let signer = match event.verify()? {
+                Some(signer) => signer,
                 None => {
                     if origin == EventOrigin::Remote {
                         return Err(Error::Catalog(format!(
@@ -501,10 +513,15 @@ impl CatalogIndex {
                             event.event_id
                         )));
                     }
+                    NodeId::from_bytes([0u8; 32])
                 }
+            };
+            if origin == EventOrigin::Remote {
+                validate_remote_membership_event(&event, signer, nest_id, &replay_events)?;
             }
             if known.insert(event.event_id.clone()) {
                 self.append_event(&event)?;
+                replay_events.push(event);
                 added += 1;
             }
         }
@@ -787,6 +804,75 @@ fn validate_event(event: &CatalogEvent) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_remote_membership_event(
+    event: &CatalogEvent,
+    signer: NodeId,
+    nest_id: Option<&NestId>,
+    accepted_events: &[CatalogEvent],
+) -> Result<()> {
+    match &event.op {
+        CatalogOp::MemberAdded {
+            member, granter, ..
+        } => {
+            let nest_id = nest_id.ok_or_else(|| {
+                Error::Catalog("remote MemberAdded validation requires a nest id".into())
+            })?;
+            if signer != *member && signer != *granter {
+                return Err(Error::Catalog(
+                    "remote MemberAdded event signer must match member or granter".into(),
+                ));
+            }
+            verify_member_added_signature(event, nest_id)?;
+
+            let view = CatalogView::materialize(accepted_events.to_vec())?;
+            if granter == member {
+                validate_remote_self_grant(&view, member)
+            } else if view.members().iter().any(|m| {
+                m.member == *granter && matches!(m.role, NestRole::Owner) && m.revoked_at.is_none()
+            }) {
+                Ok(())
+            } else {
+                Err(Error::Catalog(format!(
+                    "remote MemberAdded granter {} is not a current Owner",
+                    granter.short()
+                )))
+            }
+        }
+        CatalogOp::MemberRevoked { .. } => {
+            let _ = nest_id.ok_or_else(|| {
+                Error::Catalog("remote MemberRevoked validation requires a nest id".into())
+            })?;
+            let view = CatalogView::materialize(accepted_events.to_vec())?;
+            if view.members().iter().any(|m| {
+                m.member == signer && matches!(m.role, NestRole::Owner) && m.revoked_at.is_none()
+            }) {
+                Ok(())
+            } else {
+                Err(Error::Catalog(format!(
+                    "remote MemberRevoked signer {} is not a current Owner",
+                    signer.short()
+                )))
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_remote_self_grant(view: &CatalogView, member: &NodeId) -> Result<()> {
+    let members = view.members();
+    let allowed = members.is_empty()
+        || members.iter().any(|m| m.member == *member)
+        || members.iter().any(|m| m.granter == *member);
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::Catalog(format!(
+            "remote MemberAdded self-grant for {} is not a founding grant",
+            member.short()
+        )))
+    }
 }
 
 /// Verify that a `MemberAdded` event's `invite_signature` is a valid
@@ -1304,6 +1390,91 @@ mod tests {
         let tmp_b = TempDir::new().unwrap();
         let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
         assert_eq!(catalog.merge_events_from_peer(vec![event]).unwrap(), 1);
+    }
+
+    #[test]
+    fn merge_from_peer_for_nest_validates_member_grants() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let identity_b = Identity::random();
+        let nest_id = NestId::random();
+        let source = CatalogIndex::open(tmp_a.path()).unwrap();
+        source
+            .ensure_founding_member(&nest_id, &identity_a)
+            .unwrap();
+        source
+            .append_member_added(&nest_id, &identity_a, identity_b.node_id(), NestRole::Owner)
+            .unwrap();
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let events = source.load_events().unwrap();
+        assert_eq!(
+            catalog
+                .merge_events_from_peer_for_nest(&nest_id, events)
+                .unwrap(),
+            2
+        );
+        let members = catalog.view().unwrap().members().to_vec();
+        assert!(members.iter().any(|m| m.member == identity_a.node_id()));
+        assert!(members.iter().any(|m| m.member == identity_b.node_id()));
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_member_added_without_nest_id() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let nest_id = NestId::random();
+        let source = CatalogIndex::open(tmp_a.path()).unwrap();
+        let event = source
+            .ensure_founding_member(&nest_id, &identity_a)
+            .unwrap()
+            .unwrap();
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let err = catalog.merge_events_from_peer(vec![event]).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a nest id"),
+            "expected nest-id validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_invalid_member_grant() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let identity_b = Identity::random();
+        let nest_id = NestId::random();
+        let source = CatalogIndex::open(tmp_a.path()).unwrap();
+        let founder = source
+            .ensure_founding_member(&nest_id, &identity_a)
+            .unwrap()
+            .unwrap();
+        let bad_member = signed_event(
+            &identity_b,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            1,
+            2,
+            CatalogOp::MemberAdded {
+                member: identity_b.node_id(),
+                granter: identity_a.node_id(),
+                role: NestRole::Owner,
+                added_at: 2,
+                invite_signature: Signature([0xAAu8; 64]),
+            },
+        );
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let err = catalog
+            .merge_events_from_peer_for_nest(&nest_id, vec![founder, bad_member])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid MemberAdded invite signature"),
+            "expected bad grant rejection, got: {err}"
+        );
     }
 
     #[test]

@@ -115,9 +115,20 @@ async fn connect_for_nest_retry(
     nest_id: NestId,
     identity: &Identity,
 ) -> crow_net::Result<Client> {
+    connect_for_nest_with_proof_retry(addr, nest_id, identity, None).await
+}
+
+async fn connect_for_nest_with_proof_retry(
+    addr: std::net::SocketAddr,
+    nest_id: NestId,
+    identity: &Identity,
+    membership_proof: Option<crow::CatalogEvent>,
+) -> crow_net::Result<Client> {
     let mut last_err = None;
     for _ in 0..50 {
-        match Client::connect_for_nest(addr, nest_id, identity).await {
+        match Client::connect_for_nest_with_proof(addr, nest_id, identity, membership_proof.clone())
+            .await
+        {
             Ok(client) => return Ok(client),
             Err(NetError::Unauthorized) => return Err(NetError::Unauthorized),
             Err(e) => {
@@ -234,6 +245,70 @@ async fn nest_scoped_get_rejected_for_non_member() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invitee_can_bootstrap_first_sync_with_membership_proof() {
+    let tmp_server = TempDir::new().unwrap();
+    let identity_a = Identity::load_or_create(tmp_server.path()).unwrap();
+    let nest_id = NestId::random();
+    let catalog_a = Arc::new(CatalogIndex::open(tmp_server.path()).unwrap());
+    catalog_a
+        .ensure_founding_member(&nest_id, &identity_a)
+        .unwrap();
+
+    let tmp_client = TempDir::new().unwrap();
+    let identity_b = Identity::load_or_create(tmp_client.path()).unwrap();
+    let mut invite = crow::Invite::new_unsigned(
+        nest_id,
+        "team".into(),
+        identity_a.node_id(),
+        identity_b.node_id(),
+        NestRole::Owner,
+        0,
+        vec![],
+    );
+    invite.sign(&identity_a).unwrap();
+    let catalog_b = CatalogIndex::open(tmp_client.path()).unwrap();
+    let proof = catalog_b
+        .append_member_added_with_signature(
+            &identity_b,
+            identity_b.node_id(),
+            identity_a.node_id(),
+            NestRole::Owner,
+            invite.created_at,
+            invite.grant_signature,
+        )
+        .unwrap();
+
+    let token = ClusterToken::random();
+    let server_store = FsStore::open(tmp_server.path()).unwrap();
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let serve_catalog = catalog_a.clone();
+    let handle = tokio::spawn(async move {
+        let mut config = ServeConfig::new(server_store, token, addr);
+        config.nest_serving = Some(NestServingConfig {
+            nest_id,
+            catalog: serve_catalog,
+        });
+        let _ = crow_net::serve_with_config(config).await;
+    });
+
+    let client = connect_for_nest_with_proof_retry(addr, nest_id, &identity_b, Some(proof.clone()))
+        .await
+        .expect("invitee proof should bootstrap nest auth");
+    let _ = client.nest_catalog_events().await.unwrap();
+
+    let members = catalog_a.view().unwrap().members().to_vec();
+    assert!(
+        members.iter().any(|m| m.member == identity_b.node_id()),
+        "server should merge the invitee proof during first handshake"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_token_mode_still_works_with_nest_serving() {
     // A daemon serving a nest still accepts legacy cluster-token requests
     // — the bridge that lets pre-Phase-3 callers keep working.
@@ -297,10 +372,9 @@ async fn two_devices_share_a_nest_without_cluster_token() {
     // Setup:
     // - Device A has nest "team", is its founding member, and has stored
     //   one file whose plaintext we'll later reconstruct on B.
-    // - Device B has its own identity; A has appended a MemberAdded for
-    //   B's pubkey to the catalog. (In real use this happens through
-    //   `crow nest invite` / `crow nest join`, but we exercise the
-    //   underlying catalog operations directly.)
+    // - Device B has its own identity and a locally-written MemberAdded
+    //   proof from a recipient-bound invite. A has not pre-populated B,
+    //   so the first handshake must bootstrap membership from that proof.
     // - Each device has a random cluster token; they are different.
     let tmp_a = TempDir::new().unwrap();
     let identity_a = Identity::load_or_create(tmp_a.path()).unwrap();
@@ -312,8 +386,26 @@ async fn two_devices_share_a_nest_without_cluster_token() {
 
     let tmp_b = TempDir::new().unwrap();
     let identity_b = Identity::load_or_create(tmp_b.path()).unwrap();
-    catalog_a
-        .append_member_added(&nest_id, &identity_a, identity_b.node_id(), NestRole::Owner)
+    let catalog_b = CatalogIndex::open(tmp_b.path()).unwrap();
+    let mut invite = crow::Invite::new_unsigned(
+        nest_id,
+        "team".into(),
+        identity_a.node_id(),
+        identity_b.node_id(),
+        NestRole::Owner,
+        0,
+        vec![],
+    );
+    invite.sign(&identity_a).unwrap();
+    let membership_proof = catalog_b
+        .append_member_added_with_signature(
+            &identity_b,
+            identity_b.node_id(),
+            identity_a.node_id(),
+            NestRole::Owner,
+            invite.created_at,
+            invite.grant_signature,
+        )
         .unwrap();
 
     // Put a file under A.
@@ -364,14 +456,16 @@ async fn two_devices_share_a_nest_without_cluster_token() {
 
     // B connects via the nest-scoped handshake, syncs the catalog, then
     // pulls the manifest + chunks. B holds token_b only, never token_a.
-    let client = connect_for_nest_retry(addr, nest_id, &identity_b)
-        .await
-        .expect("nest handshake should succeed for B");
+    let client =
+        connect_for_nest_with_proof_retry(addr, nest_id, &identity_b, Some(membership_proof))
+            .await
+            .expect("nest handshake should succeed for B");
 
-    let catalog_b = CatalogIndex::open(tmp_b.path()).unwrap();
     // Phase-3 invariant: peer events MUST be signed.
     let remote_events = client.nest_catalog_events().await.unwrap();
-    catalog_b.merge_events_from_peer(remote_events).unwrap();
+    catalog_b
+        .merge_events_from_peer_for_nest(&nest_id, remote_events)
+        .unwrap();
     let view = catalog_b.view().unwrap();
     assert!(
         view.get(&crow::CatalogPath::normalize("/docs/file.txt").unwrap())

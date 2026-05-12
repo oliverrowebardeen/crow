@@ -685,17 +685,18 @@ enum NestCommand {
         /// Nest name, full hex id, or id prefix.
         reference: String,
     },
-    /// Produce a signed `crowinvite1…` string another device can paste into
-    /// `crow nest join`.
+    /// Produce a signed `crowinvite1…` string a specific device can paste
+    /// into `crow nest join`.
     #[command(
-        long_about = "Generate a signed invite for the active nest (or --nest N). The local \
-                      device must already be a member; the invite carries the granter's \
-                      pubkey, expires after --expires-in (default 7d), and bundles up to four \
-                      bootstrap addresses for the recipient's first sync. Anyone with the \
-                      printed string can join the nest, so treat it like a password while in \
-                      transit."
+        long_about = "Generate a signed invite for MEMBER_NODE_ID to join the active nest \
+                      (or --nest N). The local device must already be an Owner; the invite \
+                      carries the granter's pubkey, a member-grant signature for that exact \
+                      recipient key, expires after --expires-in (default 7d), and bundles up \
+                      to four bootstrap addresses for the recipient's first sync."
     )]
     Invite {
+        /// Full 64-hex NodeId of the recipient device.
+        member_node_id: String,
         /// How long the invite is valid for (e.g. 7d, 24h, 30m). Default: 7d.
         /// `0` or `never` disables expiry (not recommended).
         #[arg(long, value_name = "DURATION")]
@@ -707,8 +708,8 @@ enum NestCommand {
         long_about = "Decode INVITE, verify the granter's signature and expiry, create a local \
                       nest directory for the named nest_id, and append a MemberAdded event to \
                       its catalog. After joining, run `crow nest use <name>` to make this nest \
-                      active. The granter's `invite_signature` is preserved verbatim so a third \
-                      device merging this membership event can verify the chain of trust."
+                      active. The embedded member-grant signature is preserved verbatim so a \
+                      third device merging this membership event can verify the chain of trust."
     )]
     Join {
         /// The `crowinvite1…` string produced by `crow nest invite`.
@@ -1069,9 +1070,10 @@ fn cmd_nest(home: &Path, nest_override: Option<&str>, command: NestCommand) -> D
         NestCommand::Current => cmd_nest_current(home),
         NestCommand::Create { name } => cmd_nest_create(home, &name),
         NestCommand::Use { reference } => cmd_nest_use(home, &reference),
-        NestCommand::Invite { expires_in } => {
-            cmd_nest_invite(home, nest_override, expires_in.as_deref())
-        }
+        NestCommand::Invite {
+            member_node_id,
+            expires_in,
+        } => cmd_nest_invite(home, nest_override, &member_node_id, expires_in.as_deref()),
         NestCommand::Join { invite } => cmd_nest_join(home, &invite),
     }
 }
@@ -1130,9 +1132,11 @@ const INVITE_DEFAULT_EXPIRY: &str = "7d";
 fn cmd_nest_invite(
     home: &Path,
     nest_override: Option<&str>,
+    member_node_id: &str,
     expires_in: Option<&str>,
 ) -> DynResult<()> {
-    let encoded = build_invite(home, nest_override, expires_in)?;
+    let member = member_node_id.parse::<NodeId>()?;
+    let encoded = build_invite(home, nest_override, member, expires_in)?;
     println!("{encoded}");
     Ok(())
 }
@@ -1143,6 +1147,7 @@ fn cmd_nest_invite(
 fn build_invite(
     home: &Path,
     nest_override: Option<&str>,
+    member: NodeId,
     expires_in: Option<&str>,
 ) -> DynResult<String> {
     let identity = Identity::load_or_create(home)?;
@@ -1181,6 +1186,7 @@ fn build_invite(
         nest.id,
         nest.name.clone(),
         me,
+        member,
         NestRole::Owner,
         expires_at,
         bootstrap,
@@ -1194,6 +1200,14 @@ fn cmd_nest_join(home: &Path, encoded: &str) -> DynResult<()> {
     let invite = crow::Invite::decode(encoded)?;
     let granter = invite.verify()?;
     debug_assert_eq!(granter, invite.granter);
+    let local_member = identity.node_id();
+    if invite.member != local_member {
+        return Err(format!(
+            "invite is for device {}, but this device is {}",
+            invite.member, local_member
+        )
+        .into());
+    }
 
     let device_id = identity.node_id().short();
     let mut nests = NestIndex::ensure_default(home, &device_id)?;
@@ -1210,33 +1224,18 @@ fn cmd_nest_join(home: &Path, encoded: &str) -> DynResult<()> {
         .create_with_id(invite.nest_id, &local_name, &device_id)?
         .clone();
 
-    // Stamp the granter's authorization as a MemberAdded event with the
-    // invite_signature derived from the granter's pubkey. This makes the
-    // local device a recognised member; later catalog sync will replicate
-    // the granter's own founding event from their device.
-    let added_at = unix_now();
-    let invite_sig = match invite.granted_role {
-        NestRole::Owner => {
-            // Reconstruct the granter's signature over our member-grant.
-            // Since we can't sign as the granter (we don't have their
-            // private key), we instead embed the granter's signature on
-            // the original invite payload as the invite_signature. That
-            // signature was over a wider payload (the whole Invite blob),
-            // so verifiers that want chain-of-trust must check the wider
-            // payload as well. For Phase-3 simplicity we store the
-            // outer-invite signature here and Phase-5 catalog merge can
-            // tighten the verifier.
-            invite.signature
-        }
-    };
+    // Stamp the granter's authorization as a MemberAdded event. The
+    // `grant_signature` is over member_grant_canonical_bytes and is
+    // independently verifiable by third devices during catalog merge.
+    let added_at = invite.created_at;
     let catalog = CatalogIndex::open(nests.nest_dir(&nest.id))?;
     catalog.append_member_added_with_signature(
         &identity,
-        identity.node_id(),
+        invite.member,
         invite.granter,
         invite.granted_role,
         added_at,
-        invite_sig,
+        invite.grant_signature,
     )?;
 
     println!(
@@ -3474,10 +3473,9 @@ fn cmd_sync(
     let rt = runtime()?;
 
     // Prefer nest-scoped auth when this device is a recognised member of
-    // the active nest (the common case after `crow setup` /
-    // `crow nest join`). Falls back to the legacy cluster-token path
-    // only when the local catalog has no MemberAdded for us — i.e. a
-    // pre-Phase-3 install that hasn't been migrated yet.
+    // the active nest. If the peer cannot authenticate this nest (common
+    // during mixed Phase-2/Phase-3 upgrades with different local NestIds),
+    // fall back to the legacy cluster-token bridge.
     let view = catalog.view()?;
     let am_member = view
         .members()
@@ -3485,16 +3483,24 @@ fn cmd_sync(
         .any(|m| m.member == identity.node_id() && m.revoked_at.is_none());
 
     let (socket_addr, catalog_report, object_report) = if am_member {
-        println!("auth          nest-scoped (signed challenge)");
-        sync_nest_scoped(&rt, peer, &socket_addrs, nest_id, identity, crow, catalog)?
+        let proof = local_membership_proof(catalog, identity.node_id())?;
+        match connect_peer_for_nest(&rt, peer, &socket_addrs, nest_id, identity, proof)? {
+            Some((addr, client)) => {
+                println!("auth          nest-scoped (signed challenge)");
+                let remote_events = rt.block_on(client.nest_catalog_events())?;
+                let catalog_report =
+                    sync_catalog_events_from_peer(catalog, &nest_id, remote_events)?;
+                let object_report = sync_catalog_objects_scoped(crow, &rt, &client, catalog)?;
+                (addr, catalog_report, object_report)
+            }
+            None => {
+                println!("auth          cluster-token (legacy fallback)");
+                sync_legacy_cluster_token(home, crow, catalog, &rt, peer, &socket_addrs)?
+            }
+        }
     } else {
         println!("auth          cluster-token (legacy)");
-        let token = load_token(home)?;
-        let (addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
-        let remote_events = rt.block_on(client.catalog_events(token))?;
-        let catalog_report = sync_catalog_events(catalog, remote_events)?;
-        let object_report = sync_catalog_objects(crow, &rt, &client, token, catalog)?;
-        (addr, catalog_report, object_report)
+        sync_legacy_cluster_token(home, crow, catalog, &rt, peer, &socket_addrs)?
     };
 
     println!("peer          {socket_addr}");
@@ -3582,6 +3588,35 @@ fn sync_catalog_objects(
         fetched_bytes: counters.fetched_bytes,
         failed_caps,
     })
+}
+
+fn sync_legacy_cluster_token(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    rt: &tokio::runtime::Runtime,
+    peer: &str,
+    socket_addrs: &[SocketAddr],
+) -> DynResult<(SocketAddr, SyncCatalogReport, SyncObjectReport)> {
+    let token = load_token(home)?;
+    let (addr, client) = connect_peer(rt, token, peer, socket_addrs)?;
+    let remote_events = rt.block_on(client.catalog_events(token))?;
+    let catalog_report = sync_catalog_events(catalog, remote_events)?;
+    let object_report = sync_catalog_objects(crow, rt, &client, token, catalog)?;
+    Ok((addr, catalog_report, object_report))
+}
+
+fn local_membership_proof(
+    catalog: &CatalogIndex,
+    member: NodeId,
+) -> DynResult<Option<CatalogEvent>> {
+    Ok(catalog.load_events()?.into_iter().find(|event| {
+        matches!(
+            &event.op,
+            crow::CatalogOp::MemberAdded { member: event_member, .. }
+                if *event_member == member
+        )
+    }))
 }
 
 struct ReceiveCliRequest<'a> {
@@ -3796,29 +3831,27 @@ fn connect_peer(
     Err(msg.into())
 }
 
-/// Run a nest-scoped sync against the first reachable address. Returns
-/// (chosen_addr, catalog_report, object_report).
-fn sync_nest_scoped(
+/// Try to open a nest-scoped connection to the first reachable address.
+/// Returns `Ok(None)` when every candidate failed during connect/handshake,
+/// allowing the caller to try the legacy token bridge without hiding later
+/// catalog/object sync failures.
+fn connect_peer_for_nest(
     rt: &tokio::runtime::Runtime,
     peer_arg: &str,
     addresses: &[SocketAddr],
     nest_id: NestId,
     identity: &Identity,
-    crow: &Crow<FsStore>,
-    catalog: &CatalogIndex,
-) -> DynResult<(SocketAddr, SyncCatalogReport, SyncObjectReport)> {
+    membership_proof: Option<CatalogEvent>,
+) -> DynResult<Option<(SocketAddr, Client)>> {
     let mut failures = Vec::new();
     for addr in addresses {
-        match rt.block_on(Client::connect_for_nest(*addr, nest_id, identity)) {
-            Ok(client) => {
-                let remote_events = rt.block_on(client.nest_catalog_events())?;
-                // Peer events MUST be signed; the merge-from-peer path
-                // enforces that. This is the Phase-3 win: only
-                // cryptographically attributable events propagate.
-                let catalog_report = sync_catalog_events_from_peer(catalog, remote_events)?;
-                let object_report = sync_catalog_objects_scoped(crow, rt, &client, catalog)?;
-                return Ok((*addr, catalog_report, object_report));
-            }
+        match rt.block_on(Client::connect_for_nest_with_proof(
+            *addr,
+            nest_id,
+            identity,
+            membership_proof.clone(),
+        )) {
+            Ok(client) => return Ok(Some((*addr, client))),
             Err(crow_net::NetError::Unauthorized) => {
                 failures.push(format!(
                     "{addr}: nest handshake rejected (not a member of {nest_id})"
@@ -3836,15 +3869,20 @@ fn sync_nest_scoped(
         msg.push_str("\n  ");
         msg.push_str(&failure);
     }
-    Err(msg.into())
+    println!("auth          nest-scoped failed");
+    for line in msg.lines() {
+        println!("auth detail   {line}");
+    }
+    Ok(None)
 }
 
 fn sync_catalog_events_from_peer(
     catalog: &CatalogIndex,
+    nest_id: &NestId,
     remote_events: Vec<CatalogEvent>,
 ) -> DynResult<SyncCatalogReport> {
     let remote_count = remote_events.len();
-    let new_events = catalog.merge_events_from_peer(remote_events)?;
+    let new_events = catalog.merge_events_from_peer_for_nest(nest_id, remote_events)?;
     let local_events = catalog.load_events()?.len();
     let catalog_files = catalog.view()?.files().len();
     Ok(SyncCatalogReport {
@@ -6516,11 +6554,12 @@ mod tests {
         setup_device(tmp_a.path(), Some("a".into()), None, false).unwrap();
         cmd_nest_create(tmp_a.path(), "team").unwrap();
 
-        let encoded = build_invite(tmp_a.path(), Some("team"), Some("1d")).unwrap();
-        assert!(encoded.starts_with("crowinvite1"));
-
         let tmp_b = tempfile::TempDir::new().unwrap();
         let identity_b = test_identity(tmp_b.path());
+        let encoded =
+            build_invite(tmp_a.path(), Some("team"), identity_b.node_id(), Some("1d")).unwrap();
+        assert!(encoded.starts_with("crowinvite1"));
+
         cmd_nest_join(tmp_b.path(), &encoded).unwrap();
 
         // B should now have a "team" nest with the same id and a catalog
@@ -6548,9 +6587,11 @@ mod tests {
         let tmp_a = tempfile::TempDir::new().unwrap();
         setup_device(tmp_a.path(), Some("a".into()), None, false).unwrap();
         cmd_nest_create(tmp_a.path(), "team").unwrap();
-        let encoded = build_invite(tmp_a.path(), Some("team"), Some("1d")).unwrap();
 
         let tmp_b = tempfile::TempDir::new().unwrap();
+        let identity_b = test_identity(tmp_b.path());
+        let encoded =
+            build_invite(tmp_a.path(), Some("team"), identity_b.node_id(), Some("1d")).unwrap();
         cmd_nest_join(tmp_b.path(), &encoded).unwrap();
         let err = cmd_nest_join(tmp_b.path(), &encoded).unwrap_err();
         assert!(
@@ -6573,11 +6614,15 @@ mod tests {
             .unwrap()
             .clone();
 
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let identity_b = test_identity(tmp_b.path());
+
         // Build an invite by hand with `expires_at` already in the past.
         let mut invite = crow::Invite::new_unsigned(
             team.id,
             team.name.clone(),
             identity_a.node_id(),
+            identity_b.node_id(),
             NestRole::Owner,
             1, // 1970-01-01: definitely past
             vec![],
@@ -6585,11 +6630,28 @@ mod tests {
         invite.sign(&identity_a).unwrap();
         let encoded = invite.encode().unwrap();
 
-        let tmp_b = tempfile::TempDir::new().unwrap();
         let err = cmd_nest_join(tmp_b.path(), &encoded).unwrap_err();
         assert!(
             err.to_string().contains("expired"),
             "expected expiry error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn join_rejects_invite_for_different_device() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        setup_device(tmp_a.path(), Some("a".into()), None, false).unwrap();
+        cmd_nest_create(tmp_a.path(), "team").unwrap();
+
+        let intended = Identity::random().node_id();
+        let encoded = build_invite(tmp_a.path(), Some("team"), intended, Some("1d")).unwrap();
+
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        test_identity(tmp_b.path());
+        let err = cmd_nest_join(tmp_b.path(), &encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("invite is for device"),
+            "expected recipient-bound error, got: {err}"
         );
     }
 
@@ -6609,7 +6671,8 @@ mod tests {
         cmd_nest_create(tmp.path(), "team").unwrap();
 
         // Sanity: with the original identity, building an invite works.
-        assert!(build_invite(tmp.path(), Some("team"), Some("1d")).is_ok());
+        let recipient = NodeId::from_bytes([0xDDu8; 32]);
+        assert!(build_invite(tmp.path(), Some("team"), recipient, Some("1d")).is_ok());
 
         // Now write a fresh identity over the existing one and reopen.
         // Identity::load_or_create reads from disk, so deleting forces a
@@ -6624,7 +6687,7 @@ mod tests {
 
         // The new identity has not been admitted to /team's catalog, so
         // build_invite() must refuse.
-        let err = build_invite(tmp.path(), Some("team"), Some("1d")).unwrap_err();
+        let err = build_invite(tmp.path(), Some("team"), recipient, Some("1d")).unwrap_err();
         assert!(
             err.to_string().contains("not an Owner"),
             "expected Owner-required error, got: {err}"
