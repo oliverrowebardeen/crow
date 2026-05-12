@@ -420,6 +420,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crow",
+ "ed25519-dalek",
  "hostname",
  "mdns-sd",
  "postcard",
