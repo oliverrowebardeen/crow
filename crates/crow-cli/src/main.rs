@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use crow::{
     Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
-    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace,
+    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, Nest,
     NestIndex, NodeId, PinIndex, PinRecord, SignatureStatus, compute_live_set,
     compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
@@ -2727,6 +2727,7 @@ struct SetupReport {
     name: Option<String>,
     token: ClusterToken,
     token_action: SetupTokenAction,
+    active_nest: Nest,
 }
 
 fn cmd_setup(
@@ -2746,6 +2747,11 @@ fn cmd_setup(
     println!(
         "token     {}",
         setup_token_action_label(&report.token_action)
+    );
+    println!(
+        "nest      {} ({})",
+        report.active_nest.name,
+        report.active_nest.id.short()
     );
     println!();
     println!("On another trusted device:");
@@ -2806,11 +2812,17 @@ fn setup_device(
         )
     };
 
+    // Ensure the default nest exists (migrates a legacy layout if present;
+    // otherwise just creates the `personal` nest on a fresh home).
+    let nests = NestIndex::ensure_default(home, &identity.node_id().short())?;
+    let active_nest = nests.active().clone();
+
     Ok(SetupReport {
         node_id: identity.node_id(),
         name,
         token,
         token_action,
+        active_nest,
     })
 }
 
@@ -5890,6 +5902,53 @@ mod tests {
         assert!(cmd_nest_create(tmp.path(), "").is_err());
         assert!(cmd_nest_create(tmp.path(), "bad/name").is_err());
         assert!(cmd_nest_create(tmp.path(), &"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn setup_creates_default_personal_nest_on_fresh_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let report = setup_device(tmp.path(), Some("laptop".into()), None, false).unwrap();
+        assert_eq!(report.active_nest.name, "personal");
+        assert!(tmp.path().join("nests.json").exists());
+        let nest_dir = tmp
+            .path()
+            .join("nests")
+            .join(report.active_nest.id.to_string());
+        assert!(nest_dir.exists());
+        assert!(nest_dir.join("policy.json").exists());
+    }
+
+    #[test]
+    fn setup_migrates_legacy_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for sub in ["catalog", "pins", "chunks", "manifests"] {
+            fs::create_dir_all(tmp.path().join(sub)).unwrap();
+            fs::write(tmp.path().join(sub).join("marker"), b"legacy").unwrap();
+        }
+        let report = setup_device(tmp.path(), Some("laptop".into()), None, false).unwrap();
+        let nest_dir = tmp
+            .path()
+            .join("nests")
+            .join(report.active_nest.id.to_string());
+        for sub in ["catalog", "pins", "chunks", "manifests"] {
+            assert!(
+                !tmp.path().join(sub).exists(),
+                "<home>/{sub} should have migrated"
+            );
+            assert_eq!(
+                fs::read_to_string(nest_dir.join(sub).join("marker")).unwrap(),
+                "legacy"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_is_idempotent_for_nest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = setup_device(tmp.path(), Some("laptop".into()), None, false).unwrap();
+        let second = setup_device(tmp.path(), Some("laptop".into()), None, false).unwrap();
+        assert_eq!(first.active_nest.id, second.active_nest.id);
+        assert_eq!(first.active_nest.name, "personal");
     }
 
     #[test]
