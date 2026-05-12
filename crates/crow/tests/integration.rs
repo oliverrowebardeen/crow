@@ -3,10 +3,13 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use tempfile::TempDir;
 
+use std::fs;
+
 use crow::{
-    Cap, ChunkStore, Crow, DirectoryEntry, DirectoryManifest, ErasureParams, Error, FsStore,
-    GcOptions, Identity, Manifest, ManifestHash, ManifestKey, MemStore, Namespace, PinIndex,
-    SignatureStatus, compute_live_set, sweep, targeted_remove,
+    Cap, CatalogIndex, CatalogPath, ChunkStore, Crow, DirectoryEntry, DirectoryManifest,
+    ErasureParams, Error, FsStore, GcOptions, Identity, Manifest, ManifestHash, ManifestKey,
+    MemStore, Namespace, NestIndex, PinIndex, SignatureStatus, compute_live_set, sweep,
+    targeted_remove,
 };
 
 /// Test-friendly chunk size: 65 520 bytes (= 64 KiB − 16). Picked so that
@@ -484,4 +487,183 @@ fn pinning_does_not_leak_into_chunk_store() {
     assert_eq!(manifests_count, 1);
     assert!(chunks_count >= 1);
     assert_eq!(pins.list().unwrap().len(), 1);
+}
+
+// ----------------------------------------------------------------------
+// Phase 2 — nest foundation
+// ----------------------------------------------------------------------
+
+/// Pre-populate a legacy `<home>/{catalog,pins,chunks,manifests}` layout by
+/// running the actual put pipeline against the home root, then drop the
+/// returned handles so the migration in the next step starts from a clean
+/// process state.
+fn populate_legacy_home<P: AsRef<std::path::Path>>(
+    home: P,
+    payload: &[u8],
+    identity: &Identity,
+) -> Cap {
+    let home = home.as_ref();
+    let store = FsStore::open(home).expect("FsStore::open(home)");
+    let pins = PinIndex::open(home).expect("PinIndex::open(home)");
+    // Touch the catalog so the migration covers all four legacy directories.
+    let catalog = CatalogIndex::open(home).expect("CatalogIndex::open(home)");
+    catalog.mkdir("/inbox", false).expect("catalog mkdir");
+    let crow = Crow::new(store);
+    let cap = crow
+        .put_bytes_with(
+            payload,
+            "application/octet-stream",
+            ErasureParams::default(),
+            TEST_CHUNK_SIZE,
+            identity,
+        )
+        .expect("put_bytes_with");
+    catalog
+        .put_file("/inbox/file", cap.clone(), Some("file".into()))
+        .expect("catalog put_file");
+    pins.add(cap.clone(), Some("legacy-file".into()), None)
+        .expect("pin add");
+    cap
+}
+
+#[test]
+fn nest_migration_preserves_files() {
+    // Lay down real put data at the legacy root, then run ensure_default and
+    // confirm the bytes still reconstruct from the new nest dir.
+    let tmp = TempDir::new().unwrap();
+    let identity = Identity::random();
+    let payload = random_bytes(64 * 1024); // 64 KiB
+    let cap = populate_legacy_home(tmp.path(), &payload, &identity);
+
+    let nests = NestIndex::ensure_default(tmp.path(), "test-device").unwrap();
+    let nest_dir = nests.nest_dir(&nests.active().id);
+
+    // Legacy paths should be gone.
+    for sub in ["catalog", "pins", "chunks", "manifests"] {
+        assert!(
+            !tmp.path().join(sub).exists(),
+            "<home>/{sub} should have moved into the nest dir"
+        );
+        assert!(
+            nest_dir.join(sub).exists(),
+            "{} should exist after migration",
+            nest_dir.join(sub).display()
+        );
+    }
+
+    // Bytes are still reconstructable through the nest-dir stores.
+    let crow = Crow::new(FsStore::open(&nest_dir).unwrap());
+    let restored = crow.get_bytes(&cap).expect("get_bytes after migration");
+    assert_eq!(restored, payload);
+
+    // The pin record was preserved under the nest dir.
+    let pins = PinIndex::open(&nest_dir).unwrap();
+    let listed = pins.list().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name.as_deref(), Some("legacy-file"));
+}
+
+#[test]
+fn nest_isolation_keeps_pins_and_catalogs_separate() {
+    // Create two nests, write different content in each, verify the other
+    // nest's pins and catalog don't see it.
+    let tmp = TempDir::new().unwrap();
+    let mut nests = NestIndex::ensure_default(tmp.path(), "test-device").unwrap();
+    let personal_id = nests.active().id;
+    let work_id = nests.create("work", "test-device").unwrap().id;
+    assert_ne!(personal_id, work_id);
+
+    let personal_dir = nests.nest_dir(&personal_id);
+    let work_dir = nests.nest_dir(&work_id);
+
+    let personal_crow = Crow::new(FsStore::open(&personal_dir).unwrap());
+    let personal_pins = PinIndex::open(&personal_dir).unwrap();
+    let personal_catalog = CatalogIndex::open(&personal_dir).unwrap();
+    let work_crow = Crow::new(FsStore::open(&work_dir).unwrap());
+    let work_pins = PinIndex::open(&work_dir).unwrap();
+    let work_catalog = CatalogIndex::open(&work_dir).unwrap();
+
+    let identity = Identity::random();
+    let personal_cap = personal_crow
+        .put_bytes_with(
+            b"personal bytes",
+            "text/plain",
+            ErasureParams::default(),
+            240,
+            &identity,
+        )
+        .unwrap();
+    personal_pins
+        .add(personal_cap.clone(), Some("personal".into()), None)
+        .unwrap();
+    personal_catalog.mkdir("/personal", false).unwrap();
+    personal_catalog
+        .put_file("/personal/file", personal_cap.clone(), Some("file".into()))
+        .unwrap();
+
+    let work_cap = work_crow
+        .put_bytes_with(
+            b"work bytes",
+            "text/plain",
+            ErasureParams::default(),
+            240,
+            &identity,
+        )
+        .unwrap();
+    work_pins
+        .add(work_cap.clone(), Some("work".into()), None)
+        .unwrap();
+    work_catalog.mkdir("/work", false).unwrap();
+    work_catalog
+        .put_file("/work/file", work_cap.clone(), Some("file".into()))
+        .unwrap();
+
+    // Personal nest only sees personal pin + path.
+    let personal_listed = personal_pins.list().unwrap();
+    assert_eq!(personal_listed.len(), 1);
+    assert_eq!(personal_listed[0].name.as_deref(), Some("personal"));
+    let personal_view = personal_catalog.view().unwrap();
+    assert!(personal_view.contains(&CatalogPath::normalize("/personal/file").unwrap()));
+    assert!(!personal_view.contains(&CatalogPath::normalize("/work/file").unwrap()));
+
+    // And vice versa.
+    let work_listed = work_pins.list().unwrap();
+    assert_eq!(work_listed.len(), 1);
+    assert_eq!(work_listed[0].name.as_deref(), Some("work"));
+    let work_view = work_catalog.view().unwrap();
+    assert!(work_view.contains(&CatalogPath::normalize("/work/file").unwrap()));
+    assert!(!work_view.contains(&CatalogPath::normalize("/personal/file").unwrap()));
+
+    // The encrypted chunks live in disjoint directories on disk.
+    assert!(personal_dir.join("chunks").exists());
+    assert!(work_dir.join("chunks").exists());
+}
+
+#[test]
+fn nest_partial_migration_recovers_without_data_loss() {
+    // Simulate a crash mid-migration: legacy directories are gone, nest dir
+    // exists with content, but nests.json was never written. ensure_default
+    // must write nests.json and recognise the existing nest dir.
+    let tmp = TempDir::new().unwrap();
+    let identity = Identity::random();
+    let marker_payload = b"survived";
+    let cap = populate_legacy_home(tmp.path(), marker_payload, &identity);
+
+    // Do the first half of the migration by hand to model the crashed state.
+    let nest_id_str = "deadbeefcafef00d0102030405060708"; // 32 hex chars
+    let nest_dir = tmp.path().join("nests").join(nest_id_str);
+    fs::create_dir_all(&nest_dir).unwrap();
+    for sub in ["catalog", "pins", "chunks", "manifests"] {
+        fs::rename(tmp.path().join(sub), nest_dir.join(sub)).unwrap();
+    }
+    assert!(!tmp.path().join("nests.json").exists());
+
+    // ensure_default should write nests.json pointing at the existing dir.
+    let nests = NestIndex::ensure_default(tmp.path(), "test-device").unwrap();
+    assert_eq!(nests.active().id.to_string(), nest_id_str);
+    assert!(tmp.path().join("nests.json").exists());
+
+    // And the bytes still reconstruct through the recovered nest dir.
+    let crow = Crow::new(FsStore::open(&nest_dir).unwrap());
+    assert_eq!(crow.get_bytes(&cap).unwrap(), marker_payload);
 }

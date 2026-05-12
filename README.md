@@ -220,6 +220,38 @@ crow gc    [--dry-run]                # sweep chunks/manifests not referenced by
 
 The split between `unpin` and `rm` is deliberate: `unpin` is reversible if you still have the cap, since the chunks are still on disk, while `rm` is the unix-style "delete now." Catalog directories require `crow unpin -r /path` so a typo does not detach a whole subtree silently. Use `--dry-run` on `rm` and `gc` to see what would happen before committing.
 
+### Nests
+
+A nest is a named encrypted vault on this device — its own catalog, pins, and encrypted shares living under `<home>/nests/<id>/`. Every Crow command operates on one nest at a time; new homes get a `personal` nest automatically, and you can add more for project- or context-specific work.
+
+```sh
+$ crow nest list
+ID         NAME                 CREATED      ACTIVE
+1a638213   personal             2026-05-12   *
+
+$ crow nest create work
+created nest 'work' (b09af1ad)
+
+$ crow nest use work
+active nest: work (b09af1ad)
+
+$ crow put report.pdf /docs/   # lands in `work`, not `personal`
+
+$ crow ls /docs                # work's view
+HASH         SIZE     MIME             PINNED      NAME
+ffe72208     14 B     application/pdf  2026-05-12  report.pdf
+
+$ crow --nest personal ls /docs # one-shot override; active stays `work`
+(empty)
+
+$ crow nest current
+work  b09af1adba05923fc3e3961ade0cec3f
+```
+
+Nests are isolated on disk — files, pins, and catalog entries in one nest can never be seen from another. They are not yet a network boundary: the existing shared `cluster-token` continues to gate LAN fetches across all nests on a device. Per-nest membership and scoped tokens come in Phase 3.
+
+Upgrading from a pre-Phase-2 layout migrates `<home>/{catalog, pins, chunks, manifests}` under a fresh `personal` nest the first time any nest-aware command runs. The migration is atomic via temp+rename and idempotent on re-runs.
+
 ### Two-device test
 
 Phase 1 networking is for trusted devices you own on the same LAN. It is not friend-scoped sharing yet: every device with the shared cluster token can ask a serving peer for encrypted chunks by hash. The peer never sees cap keys or plaintext.
@@ -551,12 +583,12 @@ metadata-first sync, selective local bytes, and policy-driven placement.
 
 Turn the single local catalog into explicit named encrypted spaces without breaking the existing CLI.
 
-1. **Nest metadata model.** Add a nest record with stable id, human name, created timestamp, creator device id, catalog root, storage policy, member list, and key material references. Keep the actual secret material separate from display metadata.
-2. **Storage layout migration.** Introduce a future layout such as `<home>/nests/<nest-id>/catalog`, `<home>/nests/<nest-id>/pins`, and `<home>/nests/<nest-id>/policy.json`. Migrate the current single catalog/pin index into a default `personal` nest on first use.
-3. **Active nest selection.** Add `crow nest list`, `crow nest create <name>`, `crow nest use <name-or-id>`, `crow nest current`, and `--nest <name-or-id>`. Existing commands should operate inside the active nest.
-4. **Nest-safe setup.** Make `crow setup` create identity plus a default `personal` nest. If legacy setup data exists, adopt it instead of overwriting it.
-5. **Nest devices view.** Add `crow nest devices` as the user-facing trusted-device list. Keep `crow peers` as lower-level LAN/network discovery.
-6. **Migration tests.** Cover empty homes, legacy homes, active nest switching, duplicate names, invalid names, and rollback-safe partial migration.
+1. **Nest metadata model — shipped.** `Nest`, `NestId`, and `NestIndex` types persist to `<home>/nests.json`; atomic temp+rename writes; format-aware serde (hex string in JSON, raw bytes in postcard).
+2. **Storage layout migration — shipped.** First nest-aware command on a legacy `<home>` moves `catalog/`, `pins/`, `chunks/`, and `manifests/` under `<home>/nests/<id>/`. Partial migrations recover by writing `nests.json` for the existing nest dir without re-moving data. Refuses to silently merge legacy directories into an existing index.
+3. **Active nest selection — shipped.** `crow nest list`, `crow nest current`, `crow nest create <name>`, `crow nest use <name-or-id>`, and the global `--nest <name-or-id>` flag. Existing commands operate inside the active nest.
+4. **Nest-safe setup — shipped.** `crow setup` now ensures the default `personal` nest exists (creating it on a fresh home, or migrating a legacy layout) and surfaces it in the success banner.
+5. **Nest devices view.** Add `crow nest devices` as the user-facing trusted-device list. Keep `crow peers` as lower-level LAN/network discovery. Deferred to Phase 3 — needs nest membership.
+6. **Migration tests — shipped.** Unit tests in `crow::nest` cover fresh/legacy/partial/idempotent migration paths plus create/use/resolve validation. Integration tests verify that legacy data reconstructs through the migrated nest, that two nests stay isolated, and that partial-migration crashes recover without data loss.
 
 Acceptance criteria: existing README workflows still work; new users see a default nest; multiple
 nests can coexist without cross-contaminating catalog entries, pins, policies, or member metadata.
