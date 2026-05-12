@@ -659,9 +659,10 @@ mod tests {
     #[test]
     fn catalog_events_request_returns_events_for_valid_token() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = crow::Identity::load_or_create(tmp.path()).unwrap();
         let store = Arc::new(FsStore::open(tmp.path()).unwrap());
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         let token = ClusterToken::random();
         let rt = tokio::runtime::Runtime::new().unwrap();
 

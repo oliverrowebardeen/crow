@@ -8,8 +8,12 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
+use ed25519_dalek::{Signature as Ed25519Signature, Signer, Verifier, VerifyingKey};
+
 use crate::cap::Cap;
 use crate::error::{Error, Result};
+use crate::identity::{Identity, NodeId};
+use crate::manifest::Signature;
 
 const CATALOG_DIR: &str = "catalog";
 const EVENTS_FILE: &str = "events.jsonl";
@@ -98,6 +102,68 @@ pub struct CatalogEvent {
     pub seq: u64,
     pub created_at: u64,
     pub op: CatalogOp,
+    /// Ed25519 public key of the device that produced this event. None for
+    /// legacy pre-Phase-3 events; rejected on peer merge but accepted on
+    /// local replay.
+    #[serde(default)]
+    pub signer: Option<NodeId>,
+    /// Ed25519 signature over the canonical postcard encoding of this event
+    /// with `signature` set to `None`. Verified against `signer`.
+    #[serde(default)]
+    pub signature: Option<Signature>,
+}
+
+/// Did this event arrive locally (from our own events.jsonl) or from a peer?
+/// Legacy unsigned events are tolerated on `Local` replay but rejected on
+/// `Remote` merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventOrigin {
+    Local,
+    Remote,
+}
+
+impl CatalogEvent {
+    /// Sign this event with the given identity. Sets `signer` to the
+    /// identity's pubkey and `signature` to the Ed25519 signature over the
+    /// canonical-bytes-with-signature-zeroed payload.
+    pub fn sign(&mut self, identity: &Identity) -> Result<()> {
+        let signer = identity.node_id();
+        self.signer = Some(signer);
+        self.signature = None;
+        let payload = self.signing_payload(signer)?;
+        let signature: Ed25519Signature = identity.signing.sign(&payload);
+        self.signature = Some(Signature(signature.to_bytes()));
+        Ok(())
+    }
+
+    /// Verify the event's signature, if any. Returns `Ok(Some(signer))` for a
+    /// signed-and-valid event, `Ok(None)` for an unsigned legacy event, and
+    /// an error for tampered or malformed events.
+    pub fn verify(&self) -> Result<Option<NodeId>> {
+        match (self.signer, self.signature) {
+            (None, None) => Ok(None),
+            (Some(signer), Some(signature)) => {
+                let payload = self.signing_payload(signer)?;
+                let verifying_key = VerifyingKey::from_bytes(signer.as_bytes())
+                    .map_err(|e| Error::Catalog(format!("invalid signer pubkey: {e}")))?;
+                let signature = Ed25519Signature::from_bytes(&signature.0);
+                verifying_key
+                    .verify(&payload, &signature)
+                    .map_err(|_| Error::Catalog("invalid catalog event signature".into()))?;
+                Ok(Some(signer))
+            }
+            _ => Err(Error::Catalog(
+                "malformed catalog event signature fields".into(),
+            )),
+        }
+    }
+
+    fn signing_payload(&self, signer: NodeId) -> Result<Vec<u8>> {
+        let mut canonical = self.clone();
+        canonical.signer = Some(signer);
+        canonical.signature = None;
+        postcard::to_allocvec(&canonical).map_err(|e| Error::Catalog(format!("encode: {e}")))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,7 +396,27 @@ impl CatalogIndex {
         Ok(out)
     }
 
+    /// Merge events from a remote peer. Signatures are required and verified;
+    /// unsigned events are rejected. Use `merge_events` for the wider API
+    /// that lets the caller declare origin explicitly.
+    pub fn merge_events_from_peer(
+        &self,
+        events: impl IntoIterator<Item = CatalogEvent>,
+    ) -> Result<usize> {
+        self.merge_events_with_origin(events, EventOrigin::Remote)
+    }
+
+    /// Local replay of events (e.g. import from another local file). Legacy
+    /// unsigned events are tolerated; tampered signatures still reject.
     pub fn merge_events(&self, events: impl IntoIterator<Item = CatalogEvent>) -> Result<usize> {
+        self.merge_events_with_origin(events, EventOrigin::Local)
+    }
+
+    fn merge_events_with_origin(
+        &self,
+        events: impl IntoIterator<Item = CatalogEvent>,
+        origin: EventOrigin,
+    ) -> Result<usize> {
         let mut known: HashSet<String> = self
             .load_events()?
             .into_iter()
@@ -339,6 +425,17 @@ impl CatalogIndex {
         let mut added = 0usize;
         for event in events {
             validate_event(&event)?;
+            match event.verify()? {
+                Some(_) => { /* signed + valid */ }
+                None => {
+                    if origin == EventOrigin::Remote {
+                        return Err(Error::Catalog(format!(
+                            "unsigned catalog event {} rejected from peer",
+                            event.event_id
+                        )));
+                    }
+                }
+            }
             if known.insert(event.event_id.clone()) {
                 self.append_event(&event)?;
                 added += 1;
@@ -347,7 +444,12 @@ impl CatalogIndex {
         Ok(added)
     }
 
-    pub fn mkdir(&self, path: &str, parents: bool) -> Result<Vec<CatalogEvent>> {
+    pub fn mkdir(
+        &self,
+        path: &str,
+        parents: bool,
+        identity: &Identity,
+    ) -> Result<Vec<CatalogEvent>> {
         let target = CatalogPath::normalize(path)?;
         if target == CatalogPath::root() {
             return Ok(Vec::new());
@@ -355,14 +457,23 @@ impl CatalogIndex {
         let view = self.view()?;
         let mut events = Vec::new();
         for dir in missing_dirs(&view, &target, parents)? {
-            events.push(self.append(CatalogOp::Mkdir {
-                path: dir.to_string(),
-            })?);
+            events.push(self.append(
+                CatalogOp::Mkdir {
+                    path: dir.to_string(),
+                },
+                identity,
+            )?);
         }
         Ok(events)
     }
 
-    pub fn put_file(&self, path: &str, cap: Cap, name: Option<String>) -> Result<CatalogEvent> {
+    pub fn put_file(
+        &self,
+        path: &str,
+        cap: Cap,
+        name: Option<String>,
+        identity: &Identity,
+    ) -> Result<CatalogEvent> {
         let path = CatalogPath::normalize(path)?;
         if path == CatalogPath::root() {
             return Err(Error::Catalog("cannot put a file at /".into()));
@@ -372,14 +483,17 @@ impl CatalogIndex {
         if view.get(&path).is_some_and(CatalogEntry::is_dir) {
             return Err(Error::Catalog(format!("{path} is a directory")));
         }
-        self.append(CatalogOp::PutFile {
-            path: path.to_string(),
-            cap: cap.encode(),
-            name,
-        })
+        self.append(
+            CatalogOp::PutFile {
+                path: path.to_string(),
+                cap: cap.encode(),
+                name,
+            },
+            identity,
+        )
     }
 
-    pub fn remove(&self, path: &str) -> Result<CatalogEvent> {
+    pub fn remove(&self, path: &str, identity: &Identity) -> Result<CatalogEvent> {
         let path = CatalogPath::normalize(path)?;
         if path == CatalogPath::root() {
             return Err(Error::Catalog("cannot remove /".into()));
@@ -388,12 +502,15 @@ impl CatalogIndex {
         if !view.contains(&path) {
             return Err(Error::Catalog(format!("{path} does not exist")));
         }
-        self.append(CatalogOp::Remove {
-            path: path.to_string(),
-        })
+        self.append(
+            CatalogOp::Remove {
+                path: path.to_string(),
+            },
+            identity,
+        )
     }
 
-    pub fn move_path(&self, from: &str, to: &str) -> Result<CatalogEvent> {
+    pub fn move_path(&self, from: &str, to: &str, identity: &Identity) -> Result<CatalogEvent> {
         let from = CatalogPath::normalize(from)?;
         let to = CatalogPath::normalize(to)?;
         if from == CatalogPath::root() || to == CatalogPath::root() {
@@ -407,21 +524,27 @@ impl CatalogIndex {
             return Err(Error::Catalog(format!("{from} does not exist")));
         }
         ensure_parent_exists(&view, &to)?;
-        self.append(CatalogOp::Move {
-            from: from.to_string(),
-            to: to.to_string(),
-        })
+        self.append(
+            CatalogOp::Move {
+                from: from.to_string(),
+                to: to.to_string(),
+            },
+            identity,
+        )
     }
 
-    fn append(&self, op: CatalogOp) -> Result<CatalogEvent> {
+    fn append(&self, op: CatalogOp, identity: &Identity) -> Result<CatalogEvent> {
         let seq = self.next_seq()?;
-        let event = CatalogEvent {
+        let mut event = CatalogEvent {
             event_id: format!("{}:{seq}", self.device_id),
             device_id: self.device_id.clone(),
             seq,
             created_at: unix_now(),
             op,
+            signer: None,
+            signature: None,
         };
+        event.sign(identity)?;
         self.append_event(&event)?;
         Ok(event)
     }
@@ -564,14 +687,44 @@ mod tests {
         )
     }
 
-    fn remote_event(device_id: &str, seq: u64, created_at: u64, op: CatalogOp) -> CatalogEvent {
+    fn fresh_identity(tmp: &TempDir) -> Identity {
+        Identity::load_or_create(tmp.path()).unwrap()
+    }
+
+    /// Build an unsigned (legacy) event — used for backward-compat replay
+    /// tests of `merge_events` (the local-origin API).
+    fn legacy_event(device_id: &str, seq: u64, created_at: u64, op: CatalogOp) -> CatalogEvent {
         CatalogEvent {
             event_id: format!("{device_id}:{seq}"),
             device_id: device_id.into(),
             seq,
             created_at,
             op,
+            signer: None,
+            signature: None,
         }
+    }
+
+    /// Build a signed event from a peer identity, mimicking what a real
+    /// remote append would produce.
+    fn signed_event(
+        identity: &Identity,
+        device_id: &str,
+        seq: u64,
+        created_at: u64,
+        op: CatalogOp,
+    ) -> CatalogEvent {
+        let mut event = CatalogEvent {
+            event_id: format!("{device_id}:{seq}"),
+            device_id: device_id.into(),
+            seq,
+            created_at,
+            op,
+            signer: None,
+            signature: None,
+        };
+        event.sign(identity).unwrap();
+        event
     }
 
     #[test]
@@ -588,13 +741,15 @@ mod tests {
     #[test]
     fn mkdir_put_remove_roundtrip() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
             .put_file(
                 "/docs/report.pdf",
                 cap_with_hash_byte(1),
                 Some("report.pdf".into()),
+                &identity,
             )
             .unwrap();
 
@@ -611,7 +766,7 @@ mod tests {
                 .is_some()
         );
 
-        catalog.remove("/docs").unwrap();
+        catalog.remove("/docs", &identity).unwrap();
         let view = catalog.view().unwrap();
         assert!(
             view.get(&CatalogPath::normalize("/docs").unwrap())
@@ -626,9 +781,10 @@ mod tests {
     #[test]
     fn mkdir_requires_parents_unless_requested() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        assert!(catalog.mkdir("/a/b", false).is_err());
-        catalog.mkdir("/a/b", true).unwrap();
+        assert!(catalog.mkdir("/a/b", false, &identity).is_err());
+        catalog.mkdir("/a/b", true, &identity).unwrap();
         let view = catalog.view().unwrap();
         assert!(
             view.get(&CatalogPath::normalize("/a").unwrap())
@@ -645,12 +801,13 @@ mod tests {
     #[test]
     fn move_path_moves_subtree() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
-            .put_file("/docs/report.pdf", cap_with_hash_byte(2), None)
+            .put_file("/docs/report.pdf", cap_with_hash_byte(2), None, &identity)
             .unwrap();
-        catalog.move_path("/docs", "/archive").unwrap();
+        catalog.move_path("/docs", "/archive", &identity).unwrap();
         let view = catalog.view().unwrap();
         assert!(
             view.get(&CatalogPath::normalize("/docs").unwrap())
@@ -671,6 +828,8 @@ mod tests {
             seq: 1,
             created_at: 1,
             op: CatalogOp::Mkdir { path: "/x".into() },
+            signer: None,
+            signature: None,
         };
         let b = CatalogEvent {
             event_id: "a:1".into(),
@@ -682,6 +841,8 @@ mod tests {
                 cap,
                 name: None,
             },
+            signer: None,
+            signature: None,
         };
         let view = CatalogView::materialize(vec![b, a]).unwrap();
         assert!(view.get(&CatalogPath::normalize("/x/f").unwrap()).is_some());
@@ -690,10 +851,13 @@ mod tests {
     #[test]
     fn file_caps_returns_live_file_caps() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(4);
-        catalog.mkdir("/docs", false).unwrap();
-        catalog.put_file("/docs/a", cap.clone(), None).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
+        catalog
+            .put_file("/docs/a", cap.clone(), None, &identity)
+            .unwrap();
         let caps = catalog.view().unwrap().file_caps();
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].manifest_hash, cap.manifest_hash);
@@ -706,7 +870,7 @@ mod tests {
         let device = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let cap = cap_with_hash_byte(5);
         let events = vec![
-            remote_event(
+            legacy_event(
                 device,
                 1,
                 1,
@@ -714,7 +878,7 @@ mod tests {
                     path: "/docs".into(),
                 },
             ),
-            remote_event(
+            legacy_event(
                 device,
                 2,
                 2,
@@ -749,7 +913,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let device = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let event = remote_event(
+        let event = legacy_event(
             device,
             1,
             1,
@@ -777,7 +941,7 @@ mod tests {
 
         catalog
             .merge_events(vec![
-                remote_event(
+                legacy_event(
                     a,
                     1,
                     1,
@@ -787,7 +951,7 @@ mod tests {
                         name: Some("a".into()),
                     },
                 ),
-                remote_event(
+                legacy_event(
                     b,
                     1,
                     1,
@@ -813,19 +977,127 @@ mod tests {
     #[test]
     fn rejects_file_where_parent_missing_or_file_parent() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         assert!(
             catalog
-                .put_file("/missing/a", cap_with_hash_byte(1), None)
+                .put_file("/missing/a", cap_with_hash_byte(1), None, &identity)
                 .is_err()
         );
         catalog
-            .put_file("/file", cap_with_hash_byte(2), None)
+            .put_file("/file", cap_with_hash_byte(2), None, &identity)
             .unwrap();
         assert!(
             catalog
-                .put_file("/file/child", cap_with_hash_byte(3), None)
+                .put_file("/file/child", cap_with_hash_byte(3), None, &identity)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sign_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
+        catalog
+            .put_file("/docs/a.txt", cap_with_hash_byte(8), None, &identity)
+            .unwrap();
+
+        let events = catalog.load_events().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let signer = event.verify().unwrap().expect("event is signed");
+            assert_eq!(signer, identity.node_id());
+        }
+    }
+
+    #[test]
+    fn merge_rejects_tampered_event() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let device = "cccccccccccccccccccccccccccccccc";
+        let mut event = signed_event(
+            &identity_a,
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/orig".into(),
+            },
+        );
+        // Tamper with the op without re-signing.
+        event.op = CatalogOp::Mkdir {
+            path: "/evil".into(),
+        };
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let err = catalog.merge_events_from_peer(vec![event]).unwrap_err();
+        assert!(err.to_string().contains("invalid catalog event signature"));
+    }
+
+    #[test]
+    fn merge_rejects_unsigned_from_peer() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let device = "dddddddddddddddddddddddddddddddd";
+        let event = legacy_event(
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/legacy".into(),
+            },
+        );
+        let err = catalog.merge_events_from_peer(vec![event]).unwrap_err();
+        assert!(
+            err.to_string().contains("unsigned"),
+            "expected unsigned-rejection, got: {err}"
+        );
+        assert!(catalog.load_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_accepts_legacy_unsigned_local() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let device = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let event = legacy_event(
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/legacy".into(),
+            },
+        );
+        assert_eq!(catalog.merge_events(vec![event]).unwrap(), 1);
+        let view = catalog.view().unwrap();
+        assert!(
+            view.get(&CatalogPath::normalize("/legacy").unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn merge_accepts_signed_from_peer() {
+        // Sanity: a properly-signed remote event from a peer identity is
+        // accepted by `merge_events_from_peer`.
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let device = "ffffffffffffffffffffffffffffffff";
+        let event = signed_event(
+            &identity_a,
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/peer".into(),
+            },
+        );
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        assert_eq!(catalog.merge_events_from_peer(vec![event]).unwrap(), 1);
     }
 }

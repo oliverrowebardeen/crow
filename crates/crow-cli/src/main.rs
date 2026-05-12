@@ -735,6 +735,7 @@ struct StoreContext<'a> {
     crow: &'a Crow<FsStore>,
     pins: &'a PinIndex,
     catalog: &'a CatalogIndex,
+    identity: &'a Identity,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -855,6 +856,7 @@ fn run(cli: Cli) -> DynResult<()> {
         Command::Nest { command } => cmd_nest(&home, command),
         command => {
             let nest_dir = active_nest_dir(&home, cli.nest.as_deref())?;
+            let identity = Identity::load_or_create(&home)?;
             let store = FsStore::open(&nest_dir)?;
             let pins = PinIndex::open(&nest_dir)?;
             let catalog = CatalogIndex::open(&nest_dir)?;
@@ -889,23 +891,21 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                     plain,
-                } => {
-                    let identity = Identity::load_or_create(&home)?;
-                    cmd_share(
-                        StoreContext {
-                            home: &home,
-                            crow: &crow,
-                            pins: &pins,
-                            catalog: &catalog,
-                        },
-                        &identity,
-                        ShareCliRequest {
-                            arg: &cap_or_prefix,
-                            name,
-                            plain,
-                        },
-                    )
-                }
+                } => cmd_share(
+                    StoreContext {
+                        home: &home,
+                        crow: &crow,
+                        pins: &pins,
+                        catalog: &catalog,
+                        identity: &identity,
+                    },
+                    &identity,
+                    ShareCliRequest {
+                        arg: &cap_or_prefix,
+                        name,
+                        plain,
+                    },
+                ),
                 Command::Info { cap_or_prefix } => cmd_info(&crow, &pins, &catalog, &cap_or_prefix),
                 Command::Ls {
                     path,
@@ -919,41 +919,31 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                 } => cmd_grep(&crow, &pins, &catalog, &pattern, &cap_or_prefix),
                 Command::Du { path } => cmd_du(&crow, &catalog, path.as_deref()),
-                Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &path, parents),
-                Command::PutDir { source, dest, yes } => cmd_put_dir(
-                    &crow,
-                    &catalog,
-                    &Identity::load_or_create(&home)?,
-                    &source,
-                    dest.as_deref(),
-                    yes,
-                ),
+                Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &identity, &path, parents),
+                Command::PutDir { source, dest, yes } => {
+                    cmd_put_dir(&crow, &catalog, &identity, &source, dest.as_deref(), yes)
+                }
                 Command::GetDir { path, out, yes } => {
                     cmd_get_dir(&crow, &pins, &catalog, &path, &out, yes)
                 }
-                Command::CapDir { path, name } => cmd_cap_dir(
-                    &crow,
-                    &pins,
-                    &catalog,
-                    &Identity::load_or_create(&home)?,
-                    &path,
-                    name,
-                ),
+                Command::CapDir { path, name } => {
+                    cmd_cap_dir(&crow, &pins, &catalog, &identity, &path, name)
+                }
                 Command::AddDir {
                     cap_or_prefix,
                     dest,
-                } => cmd_add_dir(&crow, &pins, &catalog, &cap_or_prefix, &dest),
+                } => cmd_add_dir(&crow, &pins, &catalog, &identity, &cap_or_prefix, &dest),
                 Command::Pin { cap, name } => cmd_pin(&pins, &cap, name),
                 Command::Unpin {
                     cap_or_prefix,
                     recursive,
-                } => cmd_unpin(&pins, &catalog, &cap_or_prefix, recursive),
+                } => cmd_unpin(&pins, &catalog, &identity, &cap_or_prefix, recursive),
                 Command::Rm {
                     cap_or_prefix,
                     dry_run,
-                } => cmd_rm(&crow, &pins, &catalog, &cap_or_prefix, dry_run),
-                Command::Mv { from, to } => cmd_mv(&catalog, &from, &to),
-                Command::Cp { src, dst } => cmd_cp(&pins, &catalog, &src, &dst),
+                } => cmd_rm(&crow, &pins, &catalog, &identity, &cap_or_prefix, dry_run),
+                Command::Mv { from, to } => cmd_mv(&catalog, &identity, &from, &to),
+                Command::Cp { src, dst } => cmd_cp(&pins, &catalog, &identity, &src, &dst),
                 Command::Gc { dry_run } => cmd_gc(&crow, &pins, &catalog, dry_run),
                 Command::Stat { cap_or_prefix } => {
                     cmd_stat(&crow, &pins, &catalog, cap_or_prefix.as_deref())
@@ -975,6 +965,7 @@ fn run(cli: Cli) -> DynResult<()> {
                         crow: &crow,
                         pins: &pins,
                         catalog: &catalog,
+                        identity: &identity,
                     },
                     ReceiveCliRequest {
                         peer: &peer,
@@ -1120,7 +1111,7 @@ fn cmd_put(
     )?;
     let pin_name = args.name.or_else(|| default_name(args.path));
     if let Some(catalog_path) = catalog_dest {
-        catalog.put_file(catalog_path.as_str(), cap.clone(), pin_name)?;
+        catalog.put_file(catalog_path.as_str(), cap.clone(), pin_name, identity)?;
         println!("path {}", catalog_path);
     } else {
         pins.add(cap.clone(), pin_name, None)?;
@@ -1876,9 +1867,14 @@ fn pin_listing_metadata(
     }
 }
 
-fn cmd_mkdir(catalog: &CatalogIndex, path: &str, parents: bool) -> DynResult<()> {
+fn cmd_mkdir(
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    path: &str,
+    parents: bool,
+) -> DynResult<()> {
     let path = CatalogPath::normalize(path)?;
-    let events = catalog.mkdir(path.as_str(), parents)?;
+    let events = catalog.mkdir(path.as_str(), parents, identity)?;
     if events.is_empty() {
         println!("exists {path}");
     } else {
@@ -1914,10 +1910,10 @@ fn cmd_put_dir(
         yes,
     )?;
 
-    catalog.mkdir(dest_path.as_str(), true)?;
+    catalog.mkdir(dest_path.as_str(), true, identity)?;
     for dir in &plan.dirs {
         let path = join_catalog_relative(&dest_path, dir)?;
-        catalog.mkdir(path.as_str(), true)?;
+        catalog.mkdir(path.as_str(), true, identity)?;
     }
 
     for file in &plan.files {
@@ -1936,7 +1932,7 @@ fn cmd_put_dir(
             auto_chunk_size(bytes.len()),
             identity,
         )?;
-        catalog.put_file(catalog_path.as_str(), cap, source_name)?;
+        catalog.put_file(catalog_path.as_str(), cap, source_name, identity)?;
     }
 
     println!(
@@ -1976,11 +1972,12 @@ fn cmd_add_dir(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
     catalog: &CatalogIndex,
+    identity: &Identity,
     arg: &str,
     dest: &str,
 ) -> DynResult<()> {
     let cap = resolve_cap(pins, arg)?;
-    let report = add_directory_cap_to_catalog(crow, catalog, &cap, dest)?;
+    let report = add_directory_cap_to_catalog(crow, catalog, identity, &cap, dest)?;
     println!(
         "added directory snapshot at {} ({} file{} / {} director{})",
         report.path,
@@ -2002,6 +1999,7 @@ struct DirectoryImportReport {
 fn add_directory_cap_to_catalog(
     crow: &Crow<FsStore>,
     catalog: &CatalogIndex,
+    identity: &Identity,
     cap: &Cap,
     dest: &str,
 ) -> DynResult<DirectoryImportReport> {
@@ -2016,19 +2014,19 @@ fn add_directory_cap_to_catalog(
         return Err(format!("destination already exists: {dest}").into());
     }
 
-    catalog.mkdir(dest.as_str(), true)?;
+    catalog.mkdir(dest.as_str(), true, identity)?;
     for entry in &manifest.entries {
         match &entry.kind {
             DirectoryEntryKind::Dir => {
                 let path = join_catalog_relative(&dest, Path::new(&entry.path))?;
-                catalog.mkdir(path.as_str(), true)?;
+                catalog.mkdir(path.as_str(), true, identity)?;
             }
             DirectoryEntryKind::File { cap, name } => {
                 let path = join_catalog_relative(&dest, Path::new(&entry.path))?;
                 if let Some(parent) = path.parent() {
-                    catalog.mkdir(parent.as_str(), true)?;
+                    catalog.mkdir(parent.as_str(), true, identity)?;
                 }
-                catalog.put_file(path.as_str(), Cap::decode(cap)?, name.clone())?;
+                catalog.put_file(path.as_str(), Cap::decode(cap)?, name.clone(), identity)?;
             }
         }
     }
@@ -2186,7 +2184,13 @@ fn cmd_pin(pins: &PinIndex, cap_str: &str, name: Option<String>) -> DynResult<()
     Ok(())
 }
 
-fn cmd_unpin(pins: &PinIndex, catalog: &CatalogIndex, arg: &str, recursive: bool) -> DynResult<()> {
+fn cmd_unpin(
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    arg: &str,
+    recursive: bool,
+) -> DynResult<()> {
     if let Ok(path) = CatalogPath::normalize(arg) {
         let view = catalog.view()?;
         if let Some(entry) = view.get(&path) {
@@ -2200,7 +2204,7 @@ fn cmd_unpin(pins: &PinIndex, catalog: &CatalogIndex, arg: &str, recursive: bool
                 .into());
             }
             let file_count = catalog_caps_under(&view, &path).len();
-            catalog.remove(path.as_str())?;
+            catalog.remove(path.as_str(), identity)?;
             if entry.is_dir() {
                 println!(
                     "unpinned catalog subtree {path} ({} file{})",
@@ -2232,13 +2236,14 @@ fn cmd_rm(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
     catalog: &CatalogIndex,
+    identity: &Identity,
     arg: &str,
     dry_run: bool,
 ) -> DynResult<()> {
     if let Ok(path) = CatalogPath::normalize(arg) {
         let view = catalog.view()?;
         if view.get(&path).is_some() {
-            return cmd_rm_catalog_path(crow, pins, catalog, &view, &path, dry_run);
+            return cmd_rm_catalog_path(crow, pins, catalog, identity, &view, &path, dry_run);
         }
     }
 
@@ -2293,6 +2298,7 @@ fn cmd_rm_catalog_path(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
     catalog: &CatalogIndex,
+    identity: &Identity,
     view: &CatalogView,
     path: &CatalogPath,
     dry_run: bool,
@@ -2306,7 +2312,7 @@ fn cmd_rm_catalog_path(
     remaining_caps.extend(catalog_caps_not_under(view, path));
 
     if !dry_run {
-        catalog.remove(path.as_str())?;
+        catalog.remove(path.as_str(), identity)?;
     }
 
     let report = targeted_remove(
@@ -2334,7 +2340,7 @@ fn cmd_rm_catalog_path(
     Ok(())
 }
 
-fn cmd_mv(catalog: &CatalogIndex, from: &str, to: &str) -> DynResult<()> {
+fn cmd_mv(catalog: &CatalogIndex, identity: &Identity, from: &str, to: &str) -> DynResult<()> {
     let from = CatalogPath::normalize(from)?;
     if from.as_str() == "/" {
         return Err("refusing to move catalog root".into());
@@ -2369,12 +2375,18 @@ fn cmd_mv(catalog: &CatalogIndex, from: &str, to: &str) -> DynResult<()> {
         }
     }
 
-    catalog.move_path(from.as_str(), to.as_str())?;
+    catalog.move_path(from.as_str(), to.as_str(), identity)?;
     println!("moved {from} -> {to}");
     Ok(())
 }
 
-fn cmd_cp(pins: &PinIndex, catalog: &CatalogIndex, src: &str, dst: &str) -> DynResult<()> {
+fn cmd_cp(
+    pins: &PinIndex,
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    src: &str,
+    dst: &str,
+) -> DynResult<()> {
     let source = resolve_file_ref(catalog, pins, src)?;
     let view = catalog.view()?;
     let dst = resolve_copy_destination(pins, &view, &source, dst)?;
@@ -2391,7 +2403,7 @@ fn cmd_cp(pins: &PinIndex, catalog: &CatalogIndex, src: &str, dst: &str) -> DynR
     }
 
     let name = dst.file_name().map(str::to_string);
-    catalog.put_file(dst.as_str(), source.cap, name)?;
+    catalog.put_file(dst.as_str(), source.cap, name, identity)?;
     println!("copied {} -> {dst}", src.trim());
     Ok(())
 }
@@ -3322,7 +3334,15 @@ fn receive_after_fetch(
     name: Option<String>,
 ) -> DynResult<()> {
     if let Some(dest) = dest {
-        match catalog_received_cap(ctx.crow, ctx.pins, ctx.catalog, cap, dest, name)? {
+        match catalog_received_cap(
+            ctx.crow,
+            ctx.pins,
+            ctx.catalog,
+            ctx.identity,
+            cap,
+            dest,
+            name,
+        )? {
             ReceiveCatalogReport::File { path } => println!("cataloged     {path}"),
             ReceiveCatalogReport::Directory {
                 path,
@@ -3376,22 +3396,24 @@ fn catalog_received_cap(
     crow: &Crow<FsStore>,
     pins: &PinIndex,
     catalog: &CatalogIndex,
+    identity: &Identity,
     cap: &Cap,
     dest: &str,
     name: Option<String>,
 ) -> DynResult<ReceiveCatalogReport> {
     match crow.open_manifest_kind(cap)? {
         ManifestKind::File(_) => {
-            let path = receive_file_destination(pins, catalog, cap, dest, name)?;
+            let path = receive_file_destination(pins, catalog, identity, cap, dest, name)?;
             catalog.put_file(
                 path.as_str(),
                 cap.clone(),
                 path.file_name().map(str::to_string),
+                identity,
             )?;
             Ok(ReceiveCatalogReport::File { path })
         }
         ManifestKind::Directory(_) => {
-            let report = add_directory_cap_to_catalog(crow, catalog, cap, dest)?;
+            let report = add_directory_cap_to_catalog(crow, catalog, identity, cap, dest)?;
             Ok(ReceiveCatalogReport::Directory {
                 path: report.path,
                 files: report.files,
@@ -3404,6 +3426,7 @@ fn catalog_received_cap(
 fn receive_file_destination(
     pins: &PinIndex,
     catalog: &CatalogIndex,
+    identity: &Identity,
     cap: &Cap,
     dest: &str,
     name: Option<String>,
@@ -3428,7 +3451,7 @@ fn receive_file_destination(
             Some(entry) if entry.is_dir() => {}
             Some(_) => return Err(format!("destination parent is a file: {parent}").into()),
             None => {
-                catalog.mkdir(parent.as_str(), true)?;
+                catalog.mkdir(parent.as_str(), true, identity)?;
             }
         }
     }
@@ -4386,6 +4409,12 @@ mod tests {
             .unwrap()
     }
 
+    /// Open or create a stable test identity rooted at `dir`. The identity
+    /// is needed for catalog event signing.
+    fn test_identity(dir: &std::path::Path) -> Identity {
+        Identity::load_or_create(dir).unwrap()
+    }
+
     #[test]
     fn fetch_without_name_preserves_existing_pin_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4519,6 +4548,8 @@ mod tests {
                 op: crow::CatalogOp::Mkdir {
                     path: "/docs".into(),
                 },
+                signer: None,
+                signature: None,
             },
             CatalogEvent {
                 event_id: format!("{device}:2"),
@@ -4530,6 +4561,8 @@ mod tests {
                     cap: cap.encode(),
                     name: Some("report.pdf".into()),
                 },
+                signer: None,
+                signature: None,
             },
         ];
 
@@ -4567,12 +4600,18 @@ mod tests {
     fn sync_catalog_objects_fetches_missing_file_and_is_idempotent() {
         let source = tempfile::TempDir::new().unwrap();
         let dest = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(source.path());
         let source_crow = Crow::new(FsStore::open(source.path()).unwrap());
         let source_catalog = CatalogIndex::open(source.path()).unwrap();
         let cap = stored_cap(&source_crow, b"cloud bytes");
-        source_catalog.mkdir("/docs", false).unwrap();
+        source_catalog.mkdir("/docs", false, &identity).unwrap();
         source_catalog
-            .put_file("/docs/report.txt", cap.clone(), Some("report.txt".into()))
+            .put_file(
+                "/docs/report.txt",
+                cap.clone(),
+                Some("report.txt".into()),
+                &identity,
+            )
             .unwrap();
 
         let token = ClusterToken::random();
@@ -4610,10 +4649,11 @@ mod tests {
     fn sync_catalog_objects_reports_incomplete_peer_data() {
         let source = tempfile::TempDir::new().unwrap();
         let dest = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(source.path());
         let source_catalog = CatalogIndex::open(source.path()).unwrap();
         let cap = cap_with_hash_byte(0x64);
         source_catalog
-            .put_file("/missing.txt", cap, Some("missing.txt".into()))
+            .put_file("/missing.txt", cap, Some("missing.txt".into()), &identity)
             .unwrap();
 
         let token = ClusterToken::random();
@@ -4796,14 +4836,16 @@ mod tests {
     #[test]
     fn tree_renders_nested_catalog() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs/projects", true).unwrap();
-        catalog.mkdir("/photos", false).unwrap();
+        catalog.mkdir("/docs/projects", true, &identity).unwrap();
+        catalog.mkdir("/photos", false, &identity).unwrap();
         catalog
             .put_file(
                 "/docs/notes.md",
                 cap_with_hash_byte(0x41),
                 Some("notes.md".into()),
+                &identity,
             )
             .unwrap();
         catalog
@@ -4811,6 +4853,7 @@ mod tests {
                 "/docs/projects/crow.md",
                 cap_with_hash_byte(0x42),
                 Some("crow.md".into()),
+                &identity,
             )
             .unwrap();
 
@@ -4833,13 +4876,15 @@ mod tests {
     #[test]
     fn tree_can_start_at_file_or_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
             .put_file(
                 "/docs/notes.md",
                 cap_with_hash_byte(0x43),
                 Some("notes.md".into()),
+                &identity,
             )
             .unwrap();
         let view = catalog.view().unwrap();
@@ -4869,13 +4914,15 @@ mod tests {
     #[test]
     fn find_matches_catalog_basenames() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs/projects", true).unwrap();
+        catalog.mkdir("/docs/projects", true, &identity).unwrap();
         catalog
             .put_file(
                 "/docs/notes.md",
                 cap_with_hash_byte(0x44),
                 Some("notes.md".into()),
+                &identity,
             )
             .unwrap();
         catalog
@@ -4883,6 +4930,7 @@ mod tests {
                 "/docs/projects/readme.md",
                 cap_with_hash_byte(0x45),
                 Some("readme.md".into()),
+                &identity,
             )
             .unwrap();
         catalog
@@ -4890,6 +4938,7 @@ mod tests {
                 "/docs/projects/report-01.pdf",
                 cap_with_hash_byte(0x46),
                 Some("report-01.pdf".into()),
+                &identity,
             )
             .unwrap();
 
@@ -4904,15 +4953,17 @@ mod tests {
     #[test]
     fn find_matches_question_mark_and_directories() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
-        catalog.mkdir("/dogs", false).unwrap();
-        catalog.mkdir("/docks", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
+        catalog.mkdir("/dogs", false, &identity).unwrap();
+        catalog.mkdir("/docks", false, &identity).unwrap();
         catalog
             .put_file(
                 "/docs/report-01.pdf",
                 cap_with_hash_byte(0x47),
                 Some("report-01.pdf".into()),
+                &identity,
             )
             .unwrap();
 
@@ -4955,12 +5006,13 @@ mod tests {
     #[test]
     fn grep_searches_single_file() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"alpha\nTODO one\nbeta\n");
         catalog
-            .put_file("/notes.txt", cap, Some("notes.txt".into()))
+            .put_file("/notes.txt", cap, Some("notes.txt".into()), &identity)
             .unwrap();
 
         let report = grep_report(&crow, &pins, &catalog, "TODO", "/notes.txt").unwrap();
@@ -4981,17 +5033,18 @@ mod tests {
     #[test]
     fn grep_recurses_catalog_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let a = stored_cap(&crow, b"TODO root\n");
         let b = stored_cap(&crow, b"skip\nTODO nested\n");
-        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog.mkdir("/docs/nested", true, &identity).unwrap();
         catalog
-            .put_file("/docs/a.txt", a, Some("a.txt".into()))
+            .put_file("/docs/a.txt", a, Some("a.txt".into()), &identity)
             .unwrap();
         catalog
-            .put_file("/docs/nested/b.txt", b, Some("b.txt".into()))
+            .put_file("/docs/nested/b.txt", b, Some("b.txt".into()), &identity)
             .unwrap();
 
         let report = grep_report(&crow, &pins, &catalog, "TODO", "/docs").unwrap();
@@ -5014,12 +5067,13 @@ mod tests {
     #[test]
     fn grep_no_matches_success() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"nothing here\n");
         catalog
-            .put_file("/notes.txt", cap, Some("notes.txt".into()))
+            .put_file("/notes.txt", cap, Some("notes.txt".into()), &identity)
             .unwrap();
 
         let report = grep_report(&crow, &pins, &catalog, "TODO", "/notes.txt").unwrap();
@@ -5043,6 +5097,7 @@ mod tests {
     #[test]
     fn grep_reports_missing_files() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
@@ -5051,6 +5106,7 @@ mod tests {
                 "/missing.txt",
                 cap_with_hash_byte(0x51),
                 Some("missing.txt".into()),
+                &identity,
             )
             .unwrap();
 
@@ -5064,15 +5120,16 @@ mod tests {
     #[test]
     fn du_sums_logical_size_but_deduplicates_stored_objects() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"shared");
-        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog.mkdir("/docs/nested", true, &identity).unwrap();
         catalog
-            .put_file("/docs/a.txt", cap.clone(), Some("a.txt".into()))
+            .put_file("/docs/a.txt", cap.clone(), Some("a.txt".into()), &identity)
             .unwrap();
         catalog
-            .put_file("/docs/nested/b.txt", cap, Some("b.txt".into()))
+            .put_file("/docs/nested/b.txt", cap, Some("b.txt".into()), &identity)
             .unwrap();
         let path = CatalogPath::normalize("/docs").unwrap();
 
@@ -5090,12 +5147,18 @@ mod tests {
     #[test]
     fn du_reports_file_targets_and_missing_manifests() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let missing = cap_with_hash_byte(0x48);
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
-            .put_file("/docs/missing.txt", missing, Some("missing.txt".into()))
+            .put_file(
+                "/docs/missing.txt",
+                missing,
+                Some("missing.txt".into()),
+                &identity,
+            )
             .unwrap();
         let path = CatalogPath::normalize("/docs/missing.txt").unwrap();
 
@@ -5132,13 +5195,19 @@ mod tests {
     #[test]
     fn cat_reads_catalog_path_and_full_cap() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"hello from cat\n");
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
-            .put_file("/docs/note.txt", cap.clone(), Some("note.txt".into()))
+            .put_file(
+                "/docs/note.txt",
+                cap.clone(),
+                Some("note.txt".into()),
+                &identity,
+            )
             .unwrap();
 
         assert_eq!(
@@ -5171,10 +5240,11 @@ mod tests {
     #[test]
     fn cat_rejects_directories() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
 
         let err = cat_bytes(&crow, &pins, &catalog, "/docs").unwrap_err();
 
@@ -5184,11 +5254,12 @@ mod tests {
     #[test]
     fn cap_resolves_catalog_file_full_cap_and_pinned_prefix() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(0x61);
         catalog
-            .put_file("/note.txt", cap.clone(), Some("note.txt".into()))
+            .put_file("/note.txt", cap.clone(), Some("note.txt".into()), &identity)
             .unwrap();
         pins.add(cap.clone(), Some("note.txt".into()), None)
             .unwrap();
@@ -5215,9 +5286,10 @@ mod tests {
     #[test]
     fn cap_rejects_catalog_directories_and_missing_paths() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
 
         let dir_err = cap_for_target(&pins, &catalog, "/docs").unwrap_err();
         let missing_err = cap_for_target(&pins, &catalog, "/missing.txt").unwrap_err();
@@ -5239,7 +5311,7 @@ mod tests {
             .save(ClusterToken::from_bytes([1u8; 32]))
             .unwrap();
         catalog
-            .put_file("/docs.txt", cap.clone(), Some("docs.txt".into()))
+            .put_file("/docs.txt", cap.clone(), Some("docs.txt".into()), &identity)
             .unwrap();
 
         let report = share_target(
@@ -5299,9 +5371,14 @@ mod tests {
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let identity = Identity::random();
         let child = stored_cap(&crow, b"child");
-        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog.mkdir("/docs/nested", true, &identity).unwrap();
         catalog
-            .put_file("/docs/nested/file.txt", child, Some("file.txt".into()))
+            .put_file(
+                "/docs/nested/file.txt",
+                child,
+                Some("file.txt".into()),
+                &identity,
+            )
             .unwrap();
 
         let report = share_target(
@@ -5330,13 +5407,22 @@ mod tests {
     #[test]
     fn receive_catalogs_file_to_explicit_path_and_creates_parents() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"received");
 
-        let report =
-            catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/report.txt", None).unwrap();
+        let report = catalog_received_cap(
+            &crow,
+            &pins,
+            &catalog,
+            &identity,
+            &cap,
+            "/inbox/report.txt",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             report,
@@ -5362,15 +5448,17 @@ mod tests {
     #[test]
     fn receive_catalogs_file_into_directory_from_pin_name() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"received");
         pins.add(cap.clone(), Some("report.txt".into()), None)
             .unwrap();
-        catalog.mkdir("/inbox", false).unwrap();
+        catalog.mkdir("/inbox", false, &identity).unwrap();
 
-        let report = catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/", None).unwrap();
+        let report =
+            catalog_received_cap(&crow, &pins, &catalog, &identity, &cap, "/inbox/", None).unwrap();
 
         assert_eq!(
             report,
@@ -5383,24 +5471,34 @@ mod tests {
     #[test]
     fn receive_rejects_directory_destination_without_name_and_overwrites() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"received");
-        catalog.mkdir("/inbox", false).unwrap();
+        catalog.mkdir("/inbox", false, &identity).unwrap();
         catalog
             .put_file(
                 "/inbox/existing.txt",
                 cap.clone(),
                 Some("existing.txt".into()),
+                &identity,
             )
             .unwrap();
 
         let no_name =
-            catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/", None).unwrap_err();
-        let overwrite =
-            catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/existing.txt", None)
+            catalog_received_cap(&crow, &pins, &catalog, &identity, &cap, "/inbox/", None)
                 .unwrap_err();
+        let overwrite = catalog_received_cap(
+            &crow,
+            &pins,
+            &catalog,
+            &identity,
+            &cap,
+            "/inbox/existing.txt",
+            None,
+        )
+        .unwrap_err();
 
         assert!(no_name.to_string().contains("pass --name"));
         assert!(overwrite.to_string().contains("destination already exists"));
@@ -5409,15 +5507,17 @@ mod tests {
     #[test]
     fn receive_rejects_bad_inferred_file_name() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"received");
         pins.add(cap.clone(), Some("bad/name.txt".into()), None)
             .unwrap();
-        catalog.mkdir("/inbox", false).unwrap();
+        catalog.mkdir("/inbox", false, &identity).unwrap();
 
-        let err = catalog_received_cap(&crow, &pins, &catalog, &cap, "/inbox/", None).unwrap_err();
+        let err = catalog_received_cap(&crow, &pins, &catalog, &identity, &cap, "/inbox/", None)
+            .unwrap_err();
 
         assert!(err.to_string().contains("single path segment"));
     }
@@ -5440,8 +5540,16 @@ mod tests {
         .unwrap();
         let dir_cap = crow.put_directory_manifest(&manifest, &identity).unwrap();
 
-        let report =
-            catalog_received_cap(&crow, &pins, &catalog, &dir_cap, "/imports/docs", None).unwrap();
+        let report = catalog_received_cap(
+            &crow,
+            &pins,
+            &catalog,
+            &identity,
+            &dir_cap,
+            "/imports/docs",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             report,
@@ -5463,16 +5571,24 @@ mod tests {
     #[test]
     fn cp_copies_catalog_file_to_new_path() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(0x41);
-        catalog.mkdir("/docs", false).unwrap();
-        catalog.mkdir("/archive", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
+        catalog.mkdir("/archive", false, &identity).unwrap();
         catalog
-            .put_file("/docs/a.txt", cap.clone(), Some("a.txt".into()))
+            .put_file("/docs/a.txt", cap.clone(), Some("a.txt".into()), &identity)
             .unwrap();
 
-        cmd_cp(&pins, &catalog, "/docs/a.txt", "/archive/a-copy.txt").unwrap();
+        cmd_cp(
+            &pins,
+            &catalog,
+            &identity,
+            "/docs/a.txt",
+            "/archive/a-copy.txt",
+        )
+        .unwrap();
 
         let view = catalog.view().unwrap();
         let source = view
@@ -5492,16 +5608,22 @@ mod tests {
     #[test]
     fn cp_copies_into_existing_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(0x42);
-        catalog.mkdir("/docs", false).unwrap();
-        catalog.mkdir("/archive", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
+        catalog.mkdir("/archive", false, &identity).unwrap();
         catalog
-            .put_file("/docs/report.pdf", cap.clone(), Some("report.pdf".into()))
+            .put_file(
+                "/docs/report.pdf",
+                cap.clone(),
+                Some("report.pdf".into()),
+                &identity,
+            )
             .unwrap();
 
-        cmd_cp(&pins, &catalog, "/docs/report.pdf", "/archive/").unwrap();
+        cmd_cp(&pins, &catalog, &identity, "/docs/report.pdf", "/archive/").unwrap();
 
         let view = catalog.view().unwrap();
         let copy = view
@@ -5517,15 +5639,16 @@ mod tests {
     #[test]
     fn cp_uses_pin_name_for_cap_source_into_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(0x43);
         pins.add(cap.clone(), Some("friend.txt".into()), None)
             .unwrap();
-        catalog.mkdir("/imports", false).unwrap();
+        catalog.mkdir("/imports", false, &identity).unwrap();
         let prefix = &cap.manifest_hash.to_string()[..8];
 
-        cmd_cp(&pins, &catalog, prefix, "/imports/").unwrap();
+        cmd_cp(&pins, &catalog, &identity, prefix, "/imports/").unwrap();
 
         let view = catalog.view().unwrap();
         let copy = view
@@ -5541,23 +5664,40 @@ mod tests {
     #[test]
     fn cp_refuses_overwrite_and_directory_source() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(0x44);
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
-            .put_file("/docs/source.txt", cap.clone(), Some("source.txt".into()))
+            .put_file(
+                "/docs/source.txt",
+                cap.clone(),
+                Some("source.txt".into()),
+                &identity,
+            )
             .unwrap();
         catalog
-            .put_file("/docs/existing.txt", cap, Some("existing.txt".into()))
+            .put_file(
+                "/docs/existing.txt",
+                cap,
+                Some("existing.txt".into()),
+                &identity,
+            )
             .unwrap();
 
-        let overwrite = cmd_cp(&pins, &catalog, "/docs/source.txt", "/docs/existing.txt")
-            .expect_err("expected overwrite error");
+        let overwrite = cmd_cp(
+            &pins,
+            &catalog,
+            &identity,
+            "/docs/source.txt",
+            "/docs/existing.txt",
+        )
+        .expect_err("expected overwrite error");
         assert!(overwrite.to_string().contains("destination already exists"));
 
-        let dir_source =
-            cmd_cp(&pins, &catalog, "/docs", "/copy").expect_err("expected directory error");
+        let dir_source = cmd_cp(&pins, &catalog, &identity, "/docs", "/copy")
+            .expect_err("expected directory error");
         assert!(dir_source.to_string().contains("is a directory"));
     }
 
@@ -5578,15 +5718,21 @@ mod tests {
     #[test]
     fn stat_catalog_file_includes_cap_pin_and_mime() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"stat bytes");
         pins.add(cap.clone(), Some("note.txt".into()), None)
             .unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
-            .put_file("/docs/note.txt", cap.clone(), Some("note.txt".into()))
+            .put_file(
+                "/docs/note.txt",
+                cap.clone(),
+                Some("note.txt".into()),
+                &identity,
+            )
             .unwrap();
 
         let lines = stat_lines(&crow, &pins, &catalog, "/docs/note.txt").unwrap();
@@ -5602,17 +5748,18 @@ mod tests {
     #[test]
     fn stat_catalog_dir_summarizes_subtree() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let a = stored_cap(&crow, b"abc");
         let b = stored_cap(&crow, b"de");
-        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog.mkdir("/docs/nested", true, &identity).unwrap();
         catalog
-            .put_file("/docs/a.txt", a, Some("a.txt".into()))
+            .put_file("/docs/a.txt", a, Some("a.txt".into()), &identity)
             .unwrap();
         catalog
-            .put_file("/docs/nested/b.txt", b, Some("b.txt".into()))
+            .put_file("/docs/nested/b.txt", b, Some("b.txt".into()), &identity)
             .unwrap();
 
         let lines = stat_lines(&crow, &pins, &catalog, "/docs").unwrap();
@@ -5644,15 +5791,16 @@ mod tests {
     #[test]
     fn unpin_catalog_file_detaches_without_deleting_chunks() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let cap = stored_cap(&crow, b"keep bytes");
         catalog
-            .put_file("/note.txt", cap.clone(), Some("note.txt".into()))
+            .put_file("/note.txt", cap.clone(), Some("note.txt".into()), &identity)
             .unwrap();
 
-        cmd_unpin(&pins, &catalog, "/note.txt", false).unwrap();
+        cmd_unpin(&pins, &catalog, &identity, "/note.txt", false).unwrap();
 
         let path = CatalogPath::normalize("/note.txt").unwrap();
         assert!(catalog.view().unwrap().get(&path).is_none());
@@ -5667,15 +5815,17 @@ mod tests {
     #[test]
     fn unpin_catalog_dir_requires_recursive() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(0x11);
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
-            .put_file("/docs/a.txt", cap, Some("a.txt".into()))
+            .put_file("/docs/a.txt", cap, Some("a.txt".into()), &identity)
             .unwrap();
 
-        let err = cmd_unpin(&pins, &catalog, "/docs", false).expect_err("expected error");
+        let err =
+            cmd_unpin(&pins, &catalog, &identity, "/docs", false).expect_err("expected error");
 
         assert!(err.to_string().contains("use `crow unpin -r /docs`"));
         let path = CatalogPath::normalize("/docs/a.txt").unwrap();
@@ -5685,14 +5835,16 @@ mod tests {
     #[test]
     fn unpin_catalog_dir_recursive_detaches_subtree() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs/nested", true).unwrap();
+        catalog.mkdir("/docs/nested", true, &identity).unwrap();
         catalog
             .put_file(
                 "/docs/a.txt",
                 cap_with_hash_byte(0x21),
                 Some("a.txt".into()),
+                &identity,
             )
             .unwrap();
         catalog
@@ -5700,10 +5852,11 @@ mod tests {
                 "/docs/nested/b.txt",
                 cap_with_hash_byte(0x22),
                 Some("b.txt".into()),
+                &identity,
             )
             .unwrap();
 
-        cmd_unpin(&pins, &catalog, "/docs", true).unwrap();
+        cmd_unpin(&pins, &catalog, &identity, "/docs", true).unwrap();
 
         let docs = CatalogPath::normalize("/docs").unwrap();
         let nested = CatalogPath::normalize("/docs/nested/b.txt").unwrap();
@@ -5715,14 +5868,21 @@ mod tests {
     #[test]
     fn unpin_full_cap_hint_lists_catalog_paths() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(0x31);
         catalog
-            .put_file("/cataloged.txt", cap.clone(), Some("cataloged.txt".into()))
+            .put_file(
+                "/cataloged.txt",
+                cap.clone(),
+                Some("cataloged.txt".into()),
+                &identity,
+            )
             .unwrap();
 
-        let err = cmd_unpin(&pins, &catalog, &cap.encode(), false).expect_err("expected error");
+        let err = cmd_unpin(&pins, &catalog, &identity, &cap.encode(), false)
+            .expect_err("expected error");
 
         assert!(err.to_string().contains("is cataloged at"));
         assert!(err.to_string().contains("/cataloged.txt"));
@@ -5732,13 +5892,14 @@ mod tests {
     #[test]
     fn cap_dir_creates_pinned_directory_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
         let child = stored_cap(&crow, b"snapshot bytes");
-        catalog.mkdir("/docs/empty", true).unwrap();
+        catalog.mkdir("/docs/empty", true, &identity).unwrap();
         catalog
-            .put_file("/docs/file.txt", child, Some("file.txt".into()))
+            .put_file("/docs/file.txt", child, Some("file.txt".into()), &identity)
             .unwrap();
 
         let identity = Identity::random();
@@ -5822,6 +5983,7 @@ mod tests {
             &crow,
             &pins,
             &catalog,
+            &identity,
             &cap.manifest_hash.to_string()[..8],
             "/imported",
         )

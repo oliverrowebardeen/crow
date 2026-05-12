@@ -318,13 +318,19 @@ mod tests {
     #[test]
     fn catalog_live_set_keeps_cataloged_file() {
         let tmp = TempDir::new().unwrap();
+        let identity = Identity::load_or_create(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
 
         let crow = Crow::new(MemStore::new());
         let cap = put(&crow, b"path-rooted");
         catalog
-            .put_file("/docs/report.txt", cap.clone(), Some("report.txt".into()))
+            .put_file(
+                "/docs/report.txt",
+                cap.clone(),
+                Some("report.txt".into()),
+                &identity,
+            )
             .unwrap();
 
         let view = catalog.view().unwrap();
@@ -339,6 +345,7 @@ mod tests {
     #[test]
     fn root_live_set_combines_pins_and_catalog() {
         let tmp = TempDir::new().unwrap();
+        let identity = Identity::load_or_create(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
 
         let crow = Crow::new(MemStore::new());
@@ -349,6 +356,7 @@ mod tests {
                 "/cataloged.txt",
                 cataloged.clone(),
                 Some("cataloged.txt".into()),
+                &identity,
             )
             .unwrap();
 

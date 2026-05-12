@@ -507,7 +507,9 @@ fn populate_legacy_home<P: AsRef<std::path::Path>>(
     let pins = PinIndex::open(home).expect("PinIndex::open(home)");
     // Touch the catalog so the migration covers all four legacy directories.
     let catalog = CatalogIndex::open(home).expect("CatalogIndex::open(home)");
-    catalog.mkdir("/inbox", false).expect("catalog mkdir");
+    catalog
+        .mkdir("/inbox", false, identity)
+        .expect("catalog mkdir");
     let crow = Crow::new(store);
     let cap = crow
         .put_bytes_with(
@@ -519,7 +521,7 @@ fn populate_legacy_home<P: AsRef<std::path::Path>>(
         )
         .expect("put_bytes_with");
     catalog
-        .put_file("/inbox/file", cap.clone(), Some("file".into()))
+        .put_file("/inbox/file", cap.clone(), Some("file".into()), identity)
         .expect("catalog put_file");
     pins.add(cap.clone(), Some("legacy-file".into()), None)
         .expect("pin add");
@@ -596,9 +598,16 @@ fn nest_isolation_keeps_pins_and_catalogs_separate() {
     personal_pins
         .add(personal_cap.clone(), Some("personal".into()), None)
         .unwrap();
-    personal_catalog.mkdir("/personal", false).unwrap();
     personal_catalog
-        .put_file("/personal/file", personal_cap.clone(), Some("file".into()))
+        .mkdir("/personal", false, &identity)
+        .unwrap();
+    personal_catalog
+        .put_file(
+            "/personal/file",
+            personal_cap.clone(),
+            Some("file".into()),
+            &identity,
+        )
         .unwrap();
 
     let work_cap = work_crow
@@ -613,9 +622,14 @@ fn nest_isolation_keeps_pins_and_catalogs_separate() {
     work_pins
         .add(work_cap.clone(), Some("work".into()), None)
         .unwrap();
-    work_catalog.mkdir("/work", false).unwrap();
+    work_catalog.mkdir("/work", false, &identity).unwrap();
     work_catalog
-        .put_file("/work/file", work_cap.clone(), Some("file".into()))
+        .put_file(
+            "/work/file",
+            work_cap.clone(),
+            Some("file".into()),
+            &identity,
+        )
         .unwrap();
 
     // Personal nest only sees personal pin + path.
