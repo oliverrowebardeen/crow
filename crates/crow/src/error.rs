@@ -36,6 +36,9 @@ pub enum Error {
     #[error("identity error: {0}")]
     Identity(String),
 
+    #[error("nest error: {0}")]
+    Nest(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

@@ -29,6 +29,7 @@ pub mod gc;
 pub mod hash;
 pub mod identity;
 pub mod manifest;
+pub mod nest;
 pub mod pin;
 pub mod pipeline;
 
@@ -55,5 +56,6 @@ pub use manifest::{
     Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, SignatureStatus,
     Stripe,
 };
+pub use nest::{Nest, NestId, NestIndex};
 pub use pin::{PinIndex, PinRecord};
 pub use pipeline::{Crow, ManifestKind};
