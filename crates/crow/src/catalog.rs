@@ -14,6 +14,8 @@ use crate::cap::Cap;
 use crate::error::{Error, Result};
 use crate::identity::{Identity, NodeId};
 use crate::manifest::Signature;
+use crate::member::{MemberRecord, NestRole, member_grant_canonical_bytes};
+use crate::nest::NestId;
 
 const CATALOG_DIR: &str = "catalog";
 const EVENTS_FILE: &str = "events.jsonl";
@@ -183,6 +185,25 @@ pub enum CatalogOp {
         from: String,
         to: String,
     },
+    /// A member was added to the nest. `granter` must already be a member
+    /// (founding case: `granter == member`, self-grant). `invite_signature`
+    /// is the granter's Ed25519 signature over
+    /// [`member_grant_canonical_bytes`]; a verifier rebuilds those bytes
+    /// from the event and checks the signature against `granter`.
+    MemberAdded {
+        member: NodeId,
+        granter: NodeId,
+        role: NestRole,
+        added_at: u64,
+        invite_signature: Signature,
+    },
+    /// A member was revoked. Wire shape only — Phase 3 records the event
+    /// but [`CatalogView::members`] still returns revoked members as
+    /// current; CRDT merge semantics for revocation are Phase 5.
+    MemberRevoked {
+        member: NodeId,
+        revoked_at: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -213,6 +234,7 @@ impl CatalogEntry {
 #[derive(Clone, Debug)]
 pub struct CatalogView {
     entries: BTreeMap<CatalogPath, CatalogEntry>,
+    members: Vec<MemberRecord>,
 }
 
 impl CatalogView {
@@ -259,6 +281,14 @@ impl CatalogView {
             .collect()
     }
 
+    /// Current member set derived from the event log, in the order they
+    /// were added. Phase 3 returns revoked members too (with `revoked_at`
+    /// populated); follow-up work in Phase 5 will treat revocation as a
+    /// CRDT-merge-aware removal.
+    pub fn members(&self) -> &[MemberRecord] {
+        &self.members
+    }
+
     fn materialize(mut events: Vec<CatalogEvent>) -> Result<Self> {
         events.sort_by(|a, b| {
             a.created_at
@@ -276,6 +306,12 @@ impl CatalogView {
                 kind: EntryKind::Dir,
             },
         );
+
+        // Member ops are walked in the same time-ordered pass. We keep an
+        // index from NodeId to slot so MemberRevoked can stamp the matching
+        // record's `revoked_at` without scanning.
+        let mut members: Vec<MemberRecord> = Vec::new();
+        let mut member_idx: BTreeMap<NodeId, usize> = BTreeMap::new();
 
         for event in events {
             match event.op {
@@ -332,10 +368,41 @@ impl CatalogView {
                         entries.insert(new_path, entry);
                     }
                 }
+                CatalogOp::MemberAdded {
+                    member,
+                    granter,
+                    role,
+                    added_at,
+                    ..
+                } => {
+                    // Duplicate MemberAdded for the same member is a no-op;
+                    // the first add wins so re-merging doesn't reshuffle
+                    // the granter/role recorded the first time.
+                    if let std::collections::btree_map::Entry::Vacant(e) = member_idx.entry(member)
+                    {
+                        e.insert(members.len());
+                        members.push(MemberRecord {
+                            member,
+                            granter,
+                            role,
+                            added_at,
+                            revoked_at: None,
+                        });
+                    }
+                }
+                CatalogOp::MemberRevoked { member, revoked_at } => {
+                    if let Some(&slot) = member_idx.get(&member) {
+                        // Earliest revocation wins so a later add+revoke
+                        // pair can't undo an earlier one.
+                        if members[slot].revoked_at.is_none() {
+                            members[slot].revoked_at = Some(revoked_at);
+                        }
+                    }
+                }
             }
         }
 
-        Ok(Self { entries })
+        Ok(Self { entries, members })
     }
 }
 
@@ -510,6 +577,107 @@ impl CatalogIndex {
         )
     }
 
+    /// Append a `MemberAdded` event signed by `granter` (`identity`). The
+    /// embedded `invite_signature` is produced over
+    /// [`member_grant_canonical_bytes`] so a third device can verify the
+    /// grant independent of `Invite` semantics.
+    pub fn append_member_added(
+        &self,
+        nest_id: &NestId,
+        identity: &Identity,
+        member: NodeId,
+        role: NestRole,
+    ) -> Result<CatalogEvent> {
+        let added_at = unix_now();
+        let granter = identity.node_id();
+        let payload = member_grant_canonical_bytes(nest_id, &granter, &member, role, added_at);
+        let signature: Ed25519Signature = identity.signing.sign(&payload);
+        self.append(
+            CatalogOp::MemberAdded {
+                member,
+                granter,
+                role,
+                added_at,
+                invite_signature: Signature(signature.to_bytes()),
+            },
+            identity,
+        )
+    }
+
+    /// Append a `MemberAdded` event whose `invite_signature` was produced
+    /// elsewhere (e.g. by decoding an Invite). The local device is the
+    /// event's outer signer (the new member); `granter` is whoever
+    /// authorised the grant. Phase 3 callers verify the invite signature
+    /// before calling this; the catalog re-verifies after merge.
+    pub fn append_member_added_with_signature(
+        &self,
+        identity: &Identity,
+        member: NodeId,
+        granter: NodeId,
+        role: NestRole,
+        added_at: u64,
+        invite_signature: Signature,
+    ) -> Result<CatalogEvent> {
+        self.append(
+            CatalogOp::MemberAdded {
+                member,
+                granter,
+                role,
+                added_at,
+                invite_signature,
+            },
+            identity,
+        )
+    }
+
+    /// Append a `MemberRevoked` event. Phase 3 ships this for wire-format
+    /// stability; revocation is observable via `MemberRecord::revoked_at`
+    /// but does not yet remove the member from
+    /// [`CatalogView::members`] (CRDT merge semantics for revocation are
+    /// Phase 5).
+    pub fn append_member_revoked(
+        &self,
+        identity: &Identity,
+        member: NodeId,
+    ) -> Result<CatalogEvent> {
+        self.append(
+            CatalogOp::MemberRevoked {
+                member,
+                revoked_at: unix_now(),
+            },
+            identity,
+        )
+    }
+
+    /// Idempotently ensure a founding-member event exists for the local
+    /// identity. No-op if a `MemberAdded` event for `identity.node_id()`
+    /// is already on the log. Otherwise appends a self-granting event
+    /// (`granter == member`).
+    ///
+    /// This is the bridge for Phase-2 nests that pre-date signed
+    /// membership: opening them with Phase-3 code stamps the founding
+    /// event on first use.
+    pub fn ensure_founding_member(
+        &self,
+        nest_id: &NestId,
+        identity: &Identity,
+    ) -> Result<Option<CatalogEvent>> {
+        let me = identity.node_id();
+        let already_a_member = self
+            .load_events()?
+            .iter()
+            .any(|event| matches!(event.op, CatalogOp::MemberAdded { member, .. } if member == me));
+        if already_a_member {
+            return Ok(None);
+        }
+        Ok(Some(self.append_member_added(
+            nest_id,
+            identity,
+            me,
+            NestRole::Owner,
+        )?))
+    }
+
     pub fn move_path(&self, from: &str, to: &str, identity: &Identity) -> Result<CatalogEvent> {
         let from = CatalogPath::normalize(from)?;
         let to = CatalogPath::normalize(to)?;
@@ -608,8 +776,42 @@ fn validate_event(event: &CatalogEvent) -> Result<()> {
             CatalogPath::normalize(from)?;
             CatalogPath::normalize(to)?;
         }
+        CatalogOp::MemberAdded { .. } | CatalogOp::MemberRevoked { .. } => {
+            // Member ops carry no paths to normalise. Cryptographic
+            // verification of `invite_signature` is left to callers that
+            // know the nest_id (it isn't in the event), via
+            // [`verify_member_added_signature`].
+        }
     }
     Ok(())
+}
+
+/// Verify that a `MemberAdded` event's `invite_signature` is a valid
+/// Ed25519 signature by `granter` over the canonical member-grant payload
+/// for the given `nest_id`.
+///
+/// Returns `Ok(true)` for a valid signature, `Ok(false)` if the event is
+/// not a `MemberAdded` op, and an error on signature failure or malformed
+/// signer key bytes.
+pub fn verify_member_added_signature(event: &CatalogEvent, nest_id: &NestId) -> Result<bool> {
+    let CatalogOp::MemberAdded {
+        member,
+        granter,
+        role,
+        added_at,
+        invite_signature,
+    } = &event.op
+    else {
+        return Ok(false);
+    };
+    let payload = member_grant_canonical_bytes(nest_id, granter, member, *role, *added_at);
+    let granter_key = VerifyingKey::from_bytes(granter.as_bytes())
+        .map_err(|e| Error::Catalog(format!("invalid granter pubkey: {e}")))?;
+    let sig = Ed25519Signature::from_bytes(&invite_signature.0);
+    granter_key
+        .verify(&payload, &sig)
+        .map_err(|_| Error::Catalog("invalid MemberAdded invite signature".into()))?;
+    Ok(true)
 }
 
 fn missing_dirs(
@@ -1099,5 +1301,101 @@ mod tests {
         let tmp_b = TempDir::new().unwrap();
         let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
         assert_eq!(catalog.merge_events_from_peer(vec![event]).unwrap(), 1);
+    }
+
+    #[test]
+    fn ensure_founding_member_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+
+        let first = catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        assert!(first.is_some(), "first call must append the founding event");
+        let second = catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        assert!(second.is_none(), "second call must be a no-op");
+        assert_eq!(
+            catalog
+                .load_events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.op, CatalogOp::MemberAdded { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_founding_member_signature_verifies() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let event = catalog
+            .ensure_founding_member(&nest_id, &identity)
+            .unwrap()
+            .unwrap();
+        // Outer event signature verifies.
+        let signer = event.verify().unwrap().expect("event is signed");
+        assert_eq!(signer, identity.node_id());
+        // Inner invite_signature verifies against the canonical bytes.
+        assert!(verify_member_added_signature(&event, &nest_id).unwrap());
+        // ...and fails under a different nest_id.
+        let other_nest = NestId::random();
+        assert!(verify_member_added_signature(&event, &other_nest).is_err());
+    }
+
+    #[test]
+    fn view_members_replay() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+
+        // Founder self-grants.
+        catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        // Founder grants a second member.
+        let other_a = NodeId::from_bytes([0xAAu8; 32]);
+        catalog
+            .append_member_added(&nest_id, &identity, other_a, NestRole::Owner)
+            .unwrap();
+        // Founder revokes the second member.
+        catalog.append_member_revoked(&identity, other_a).unwrap();
+
+        let view = catalog.view().unwrap();
+        let members = view.members();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].member, identity.node_id());
+        assert_eq!(members[0].granter, identity.node_id(), "self-grant");
+        assert!(members[0].revoked_at.is_none());
+        assert_eq!(members[1].member, other_a);
+        assert!(members[1].revoked_at.is_some());
+    }
+
+    #[test]
+    fn revoked_at_does_not_remove_yet() {
+        // Phase 3 ships `MemberRevoked` for wire-format stability but
+        // `members()` still returns revoked members as current (with
+        // revoked_at populated). Phase 5 will treat this as a CRDT remove.
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+
+        catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        let to_revoke = NodeId::from_bytes([0xBBu8; 32]);
+        catalog
+            .append_member_added(&nest_id, &identity, to_revoke, NestRole::Owner)
+            .unwrap();
+        catalog.append_member_revoked(&identity, to_revoke).unwrap();
+
+        let members = catalog.view().unwrap().members().to_vec();
+        let revoked = members.iter().find(|m| m.member == to_revoke).unwrap();
+        assert!(revoked.revoked_at.is_some(), "revoked_at must be populated");
+        // …but they are still in the returned list (Phase-3 invariant).
+        assert!(
+            members.iter().any(|m| m.member == to_revoke),
+            "revoked member still appears in members() in Phase 3"
+        );
     }
 }

@@ -10,7 +10,7 @@ use crow::{
     Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
     ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, Nest,
-    NestIndex, NodeId, PinIndex, PinRecord, SignatureStatus, compute_live_set,
+    NestId, NestIndex, NodeId, PinIndex, PinRecord, SignatureStatus, compute_live_set,
     compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
@@ -855,11 +855,15 @@ fn run(cli: Cli) -> DynResult<()> {
         Command::Peers { long, json } => cmd_peers(&home, long, json),
         Command::Nest { command } => cmd_nest(&home, command),
         command => {
-            let nest_dir = active_nest_dir(&home, cli.nest.as_deref())?;
+            let (nest_dir, nest_id) = active_nest(&home, cli.nest.as_deref())?;
             let identity = Identity::load_or_create(&home)?;
             let store = FsStore::open(&nest_dir)?;
             let pins = PinIndex::open(&nest_dir)?;
             let catalog = CatalogIndex::open(&nest_dir)?;
+            // Phase 2 nests (and Phase 3 nests on first run) have no
+            // founding-member event; stamp one for this device so the
+            // catalog view reports the current member set correctly.
+            catalog.ensure_founding_member(&nest_id, &identity)?;
             let crow = Crow::new(store);
 
             match command {
@@ -1013,12 +1017,18 @@ fn open_nest_index(home: &Path) -> DynResult<NestIndex> {
 /// `override_` lets a single invocation operate on a non-active nest (the
 /// global `--nest` flag); pass `None` for the persisted active selection.
 fn active_nest_dir(home: &Path, override_: Option<&str>) -> DynResult<PathBuf> {
+    Ok(active_nest(home, override_)?.0)
+}
+
+/// Resolve the active (or overridden) nest to both its directory and its
+/// id. Callers that need only the directory should use `active_nest_dir`.
+fn active_nest(home: &Path, override_: Option<&str>) -> DynResult<(PathBuf, NestId)> {
     let nests = open_nest_index(home)?;
     let nest = match override_ {
         Some(reference) => nests.resolve(reference)?,
         None => nests.active(),
     };
-    Ok(nests.nest_dir(&nest.id))
+    Ok((nests.nest_dir(&nest.id), nest.id))
 }
 
 fn cmd_nest(home: &Path, command: NestCommand) -> DynResult<()> {
@@ -1057,7 +1067,11 @@ fn cmd_nest_create(home: &Path, name: &str) -> DynResult<()> {
     let identity = Identity::load_or_create(home)?;
     let device_id = identity.node_id().short();
     let mut nests = NestIndex::ensure_default(home, &device_id)?;
-    let created = nests.create(name, &device_id)?;
+    let created = nests.create(name, &device_id)?.clone();
+    // Stamp a founding-member event so this device is a recognised Owner
+    // from the moment the nest exists.
+    let catalog = CatalogIndex::open(nests.nest_dir(&created.id))?;
+    catalog.ensure_founding_member(&created.id, &identity)?;
     println!("created nest '{}' ({})", created.name, created.id.short());
     Ok(())
 }
@@ -2828,6 +2842,12 @@ fn setup_device(
     // otherwise just creates the `personal` nest on a fresh home).
     let nests = NestIndex::ensure_default(home, &identity.node_id().short())?;
     let active_nest = nests.active().clone();
+
+    // Stamp a founding-member event so the active nest's catalog has a
+    // member list from day one (Phase-2 nests get this on first Phase-3 use).
+    let active_dir = nests.nest_dir(&active_nest.id);
+    let active_catalog = CatalogIndex::open(&active_dir)?;
+    active_catalog.ensure_founding_member(&active_nest.id, &identity)?;
 
     Ok(SetupReport {
         node_id: identity.node_id(),

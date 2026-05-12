@@ -654,6 +654,49 @@ fn nest_isolation_keeps_pins_and_catalogs_separate() {
 }
 
 #[test]
+fn ensure_founding_member_backfills_phase2_nest() {
+    // A Phase-2 nest's catalog has no MemberAdded events. The first time a
+    // Phase-3 build opens it, ensure_founding_member must stamp a
+    // founding event for the local identity without touching the
+    // filesystem state (pins, chunks, paths) it inherited.
+    let tmp = TempDir::new().unwrap();
+    let identity = Identity::random();
+    let payload = b"hello phase 2";
+    let cap = populate_legacy_home(tmp.path(), payload, &identity);
+
+    let nests = NestIndex::ensure_default(tmp.path(), "test-device").unwrap();
+    let nest_id = nests.active().id;
+    let nest_dir = nests.nest_dir(&nest_id);
+
+    let catalog = CatalogIndex::open(&nest_dir).unwrap();
+    // Pre-condition: no founding event before we run the migration.
+    assert!(catalog.view().unwrap().members().is_empty());
+
+    let appended = catalog
+        .ensure_founding_member(&nest_id, &identity)
+        .expect("ensure_founding_member appends on Phase-2 nest");
+    assert!(appended.is_some(), "first call writes the founding event");
+
+    let members = catalog.view().unwrap().members().to_vec();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].member, identity.node_id());
+    assert_eq!(members[0].granter, identity.node_id());
+    assert!(members[0].revoked_at.is_none());
+
+    // Calling again is a no-op.
+    let second = catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+    assert!(
+        second.is_none(),
+        "re-running ensure_founding_member is idempotent"
+    );
+    assert_eq!(catalog.view().unwrap().members().len(), 1);
+
+    // Existing pre-migration data still reconstructs.
+    let crow = Crow::new(FsStore::open(&nest_dir).unwrap());
+    assert_eq!(crow.get_bytes(&cap).unwrap(), payload);
+}
+
+#[test]
 fn nest_partial_migration_recovers_without_data_loss() {
     // Simulate a crash mid-migration: legacy directories are gone, nest dir
     // exists with content, but nests.json was never written. ensure_default
