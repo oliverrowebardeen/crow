@@ -9,8 +9,9 @@ use clap::{Parser, Subcommand};
 use crow::{
     Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
-    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, NodeId,
-    PinIndex, PinRecord, SignatureStatus, compute_live_set, compute_live_set_from_roots,
+    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace,
+    NestIndex, NodeId, PinIndex, PinRecord, SignatureStatus, compute_live_set,
+    compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
@@ -795,14 +796,16 @@ fn run(cli: Cli) -> DynResult<()> {
         } => cmd_setup(&home, name, token, force_token),
         Command::Token(command) => cmd_token(&home, command),
         Command::Serve { bind, name } => {
-            let store = FsStore::open(&home)?;
+            let nest_dir = active_nest_dir(&home)?;
+            let store = FsStore::open(&nest_dir)?;
             cmd_serve(&home, store, bind, name)
         }
         Command::Peers { long, json } => cmd_peers(&home, long, json),
         command => {
-            let store = FsStore::open(&home)?;
-            let pins = PinIndex::open(&home)?;
-            let catalog = CatalogIndex::open(&home)?;
+            let nest_dir = active_nest_dir(&home)?;
+            let store = FsStore::open(&nest_dir)?;
+            let pins = PinIndex::open(&nest_dir)?;
+            let catalog = CatalogIndex::open(&nest_dir)?;
             let crow = Crow::new(store);
 
             match command {
@@ -946,6 +949,17 @@ fn resolve_home(explicit: Option<PathBuf>) -> DynResult<PathBuf> {
     }
     let home = std::env::var("HOME").map_err(|_| "HOME is not set; pass --home")?;
     Ok(PathBuf::from(home).join(".crow"))
+}
+
+/// Materialise the active nest's storage directory under `home`, running the
+/// legacy-layout migration on first invocation. All nest-aware commands route
+/// their `FsStore` / `PinIndex` / `CatalogIndex` opens through this helper so
+/// they see the active nest's data and only the active nest's data.
+fn active_nest_dir(home: &Path) -> DynResult<PathBuf> {
+    let identity = Identity::load_or_create(home)?;
+    let device_id = identity.node_id().short();
+    let nests = NestIndex::ensure_default(home, &device_id)?;
+    Ok(nests.nest_dir(&nests.active().id))
 }
 
 struct PutArgs<'a> {
@@ -5683,5 +5697,62 @@ mod tests {
         let view = catalog.view().unwrap();
         let entry = view.get(&path).unwrap();
         assert_eq!(entry.cap().unwrap().encode(), child.encode());
+    }
+
+    #[test]
+    fn active_nest_dir_initialises_fresh_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nest_dir = active_nest_dir(tmp.path()).unwrap();
+
+        // Lives under <home>/nests/<id>
+        assert!(
+            nest_dir.starts_with(tmp.path().join("nests")),
+            "nest dir {} should be under <home>/nests/",
+            nest_dir.display(),
+        );
+        assert!(nest_dir.exists());
+        assert!(tmp.path().join("nests.json").exists());
+
+        // Stores opened against the returned dir create their own subdirs in
+        // it, not at <home>/ root.
+        let _store = FsStore::open(&nest_dir).unwrap();
+        let _pins = PinIndex::open(&nest_dir).unwrap();
+        let _catalog = CatalogIndex::open(&nest_dir).unwrap();
+        assert!(nest_dir.join("chunks").exists());
+        assert!(nest_dir.join("pins").exists());
+        assert!(nest_dir.join("catalog").exists());
+        // None of those should appear at the home root.
+        assert!(!tmp.path().join("chunks").exists());
+        assert!(!tmp.path().join("pins").exists());
+        assert!(!tmp.path().join("catalog").exists());
+    }
+
+    #[test]
+    fn active_nest_dir_migrates_legacy_home() {
+        // Hand-construct a legacy <home>/{catalog,pins,chunks,manifests}
+        // with marker files, then verify they all move under the new active
+        // nest after the first call.
+        let tmp = tempfile::TempDir::new().unwrap();
+        for sub in ["catalog", "pins", "chunks", "manifests"] {
+            fs::create_dir_all(tmp.path().join(sub)).unwrap();
+            fs::write(tmp.path().join(sub).join("marker"), b"legacy-marker").unwrap();
+        }
+
+        let nest_dir = active_nest_dir(tmp.path()).unwrap();
+
+        for sub in ["catalog", "pins", "chunks", "manifests"] {
+            assert!(
+                !tmp.path().join(sub).exists(),
+                "legacy <home>/{sub} should have moved",
+            );
+            let moved = nest_dir.join(sub).join("marker");
+            assert!(moved.exists(), "marker {} missing", moved.display());
+            assert_eq!(fs::read_to_string(&moved).unwrap(), "legacy-marker");
+        }
+        assert!(tmp.path().join("nests.json").exists());
+
+        // Second call is a no-op and returns the same nest dir.
+        let again = active_nest_dir(tmp.path()).unwrap();
+        assert_eq!(nest_dir, again);
     }
 }
