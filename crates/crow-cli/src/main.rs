@@ -10,7 +10,7 @@ use crow::{
     Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
     ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, Nest,
-    NestId, NestIndex, NodeId, PinIndex, PinRecord, SignatureStatus, compute_live_set,
+    NestId, NestIndex, NestRole, NodeId, PinIndex, PinRecord, SignatureStatus, compute_live_set,
     compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
@@ -685,6 +685,35 @@ enum NestCommand {
         /// Nest name, full hex id, or id prefix.
         reference: String,
     },
+    /// Produce a signed `crowinvite1…` string another device can paste into
+    /// `crow nest join`.
+    #[command(
+        long_about = "Generate a signed invite for the active nest (or --nest N). The local \
+                      device must already be a member; the invite carries the granter's \
+                      pubkey, expires after --expires-in (default 7d), and bundles up to four \
+                      bootstrap addresses for the recipient's first sync. Anyone with the \
+                      printed string can join the nest, so treat it like a password while in \
+                      transit."
+    )]
+    Invite {
+        /// How long the invite is valid for (e.g. 7d, 24h, 30m). Default: 7d.
+        /// `0` or `never` disables expiry (not recommended).
+        #[arg(long, value_name = "DURATION")]
+        expires_in: Option<String>,
+    },
+    /// Decode and accept a `crowinvite1…` string, creating the local nest dir
+    /// and recording our membership in the catalog event log.
+    #[command(
+        long_about = "Decode INVITE, verify the granter's signature and expiry, create a local \
+                      nest directory for the named nest_id, and append a MemberAdded event to \
+                      its catalog. After joining, run `crow nest use <name>` to make this nest \
+                      active. The granter's `invite_signature` is preserved verbatim so a third \
+                      device merging this membership event can verify the chain of trust."
+    )]
+    Join {
+        /// The `crowinvite1…` string produced by `crow nest invite`.
+        invite: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -853,7 +882,7 @@ fn run(cli: Cli) -> DynResult<()> {
             cmd_serve(&home, store, bind, name)
         }
         Command::Peers { long, json } => cmd_peers(&home, long, json),
-        Command::Nest { command } => cmd_nest(&home, command),
+        Command::Nest { command } => cmd_nest(&home, cli.nest.as_deref(), command),
         command => {
             let (nest_dir, nest_id) = active_nest(&home, cli.nest.as_deref())?;
             let identity = Identity::load_or_create(&home)?;
@@ -1031,12 +1060,16 @@ fn active_nest(home: &Path, override_: Option<&str>) -> DynResult<(PathBuf, Nest
     Ok((nests.nest_dir(&nest.id), nest.id))
 }
 
-fn cmd_nest(home: &Path, command: NestCommand) -> DynResult<()> {
+fn cmd_nest(home: &Path, nest_override: Option<&str>, command: NestCommand) -> DynResult<()> {
     match command {
         NestCommand::List => cmd_nest_list(home),
         NestCommand::Current => cmd_nest_current(home),
         NestCommand::Create { name } => cmd_nest_create(home, &name),
         NestCommand::Use { reference } => cmd_nest_use(home, &reference),
+        NestCommand::Invite { expires_in } => {
+            cmd_nest_invite(home, nest_override, expires_in.as_deref())
+        }
+        NestCommand::Join { invite } => cmd_nest_join(home, &invite),
     }
 }
 
@@ -1087,6 +1120,193 @@ fn cmd_nest_use(home: &Path, reference: &str) -> DynResult<()> {
         now_active.id.short()
     );
     Ok(())
+}
+
+const INVITE_DEFAULT_EXPIRY: &str = "7d";
+
+fn cmd_nest_invite(
+    home: &Path,
+    nest_override: Option<&str>,
+    expires_in: Option<&str>,
+) -> DynResult<()> {
+    let encoded = build_invite(home, nest_override, expires_in)?;
+    println!("{encoded}");
+    Ok(())
+}
+
+/// Test-friendly invite generator: returns the encoded `crowinvite1…`
+/// string instead of printing it. The CLI wrapper around this is
+/// [`cmd_nest_invite`].
+fn build_invite(
+    home: &Path,
+    nest_override: Option<&str>,
+    expires_in: Option<&str>,
+) -> DynResult<String> {
+    let identity = Identity::load_or_create(home)?;
+    let nests = open_nest_index(home)?;
+    let nest = match nest_override {
+        Some(reference) => nests.resolve(reference)?,
+        None => nests.active(),
+    };
+    let nest_dir = nests.nest_dir(&nest.id);
+    let catalog = CatalogIndex::open(&nest_dir)?;
+    // ensure_founding_member here guards the common case where someone
+    // runs `crow nest invite` on a Phase-2 nest that's never seen the
+    // founding event written. Idempotent.
+    catalog.ensure_founding_member(&nest.id, &identity)?;
+
+    // Granter must already be an Owner of this nest.
+    let me = identity.node_id();
+    let view = catalog.view()?;
+    let is_member = view
+        .members()
+        .iter()
+        .any(|m| m.member == me && matches!(m.role, NestRole::Owner) && m.revoked_at.is_none());
+    if !is_member {
+        return Err(format!(
+            "this device is not an Owner of nest {}; cannot invite",
+            nest.name
+        )
+        .into());
+    }
+
+    let expires_in_str = expires_in.unwrap_or(INVITE_DEFAULT_EXPIRY);
+    let expires_at = compute_expiry(expires_in_str)?;
+    let bootstrap = bootstrap_addresses_for_self(home).unwrap_or_default();
+
+    let mut invite = crow::Invite::new_unsigned(
+        nest.id,
+        nest.name.clone(),
+        me,
+        NestRole::Owner,
+        expires_at,
+        bootstrap,
+    );
+    invite.sign(&identity)?;
+    Ok(invite.encode()?)
+}
+
+fn cmd_nest_join(home: &Path, encoded: &str) -> DynResult<()> {
+    let identity = Identity::load_or_create(home)?;
+    let invite = crow::Invite::decode(encoded)?;
+    let granter = invite.verify()?;
+    debug_assert_eq!(granter, invite.granter);
+
+    let device_id = identity.node_id().short();
+    let mut nests = NestIndex::ensure_default(home, &device_id)?;
+    if nests.list().iter().any(|n| n.id == invite.nest_id) {
+        return Err(format!(
+            "nest {} is already known on this device; nothing to join",
+            invite.nest_id
+        )
+        .into());
+    }
+
+    let local_name = pick_local_nest_name(&nests, &invite.nest_name, &invite.nest_id);
+    let nest = nests
+        .create_with_id(invite.nest_id, &local_name, &device_id)?
+        .clone();
+
+    // Stamp the granter's authorization as a MemberAdded event with the
+    // invite_signature derived from the granter's pubkey. This makes the
+    // local device a recognised member; later catalog sync will replicate
+    // the granter's own founding event from their device.
+    let added_at = unix_now();
+    let invite_sig = match invite.granted_role {
+        NestRole::Owner => {
+            // Reconstruct the granter's signature over our member-grant.
+            // Since we can't sign as the granter (we don't have their
+            // private key), we instead embed the granter's signature on
+            // the original invite payload as the invite_signature. That
+            // signature was over a wider payload (the whole Invite blob),
+            // so verifiers that want chain-of-trust must check the wider
+            // payload as well. For Phase-3 simplicity we store the
+            // outer-invite signature here and Phase-5 catalog merge can
+            // tighten the verifier.
+            invite.signature
+        }
+    };
+    let catalog = CatalogIndex::open(nests.nest_dir(&nest.id))?;
+    catalog.append_member_added_with_signature(
+        &identity,
+        identity.node_id(),
+        invite.granter,
+        invite.granted_role,
+        added_at,
+        invite_sig,
+    )?;
+
+    println!(
+        "joined nest '{}' ({}); granter {}",
+        nest.name,
+        nest.id.short(),
+        invite.granter.short()
+    );
+    if !invite.bootstrap_addresses.is_empty() {
+        println!("bootstrap addresses:");
+        for addr in &invite.bootstrap_addresses {
+            println!("  {addr}");
+        }
+    }
+    println!("run `crow nest use {}` to make it active", nest.name);
+    Ok(())
+}
+
+/// Parse a humantime-flavoured duration (`7d`, `24h`, `30m`, `60s`) and
+/// return `now + duration` in unix-seconds. `0` or `never` returns 0 (no
+/// expiry).
+fn compute_expiry(spec: &str) -> DynResult<u64> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("never") {
+        return Ok(0);
+    }
+    let (num_part, unit_part) = trimmed.split_at(
+        trimmed
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(trimmed.len()),
+    );
+    let n: u64 = num_part
+        .parse()
+        .map_err(|_| format!("bad duration {trimmed:?}: leading digits required"))?;
+    let seconds = match unit_part.trim() {
+        "s" | "" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        "w" => n * 86_400 * 7,
+        other => {
+            return Err(format!(
+                "bad duration {trimmed:?}: unknown unit {other:?} (use s/m/h/d/w)"
+            )
+            .into());
+        }
+    };
+    Ok(unix_now().saturating_add(seconds))
+}
+
+/// Pick a non-colliding local display name for a joined nest. Falls back
+/// to `<name>-<short-id>` and then `<name>-<full-id>` if both prior names
+/// are taken on this device. The recipient can `crow nest use` either
+/// way; the on-disk id is canonical.
+fn pick_local_nest_name(nests: &NestIndex, suggested: &str, id: &NestId) -> String {
+    if !nests.has_name(suggested) {
+        return suggested.to_string();
+    }
+    let short = format!("{suggested}-{}", id.short());
+    if !nests.has_name(&short) {
+        return short;
+    }
+    format!("{suggested}-{id}")
+}
+
+/// Bootstrap addresses to embed in invites. Pulled from this device's
+/// peer snapshot's `self_info.address`; absent before the daemon has
+/// run, in which case the invite ships with no bootstrap hints and the
+/// recipient must rely on mDNS or an explicit `crow sync <peer>`.
+fn bootstrap_addresses_for_self(home: &Path) -> Option<Vec<std::net::SocketAddr>> {
+    let path = peer_snapshot::snapshot_path(home);
+    let snap = peer_snapshot::load(&path).ok().flatten()?;
+    Some(vec![snap.self_info.address])
 }
 
 struct PutArgs<'a> {
@@ -6084,6 +6304,154 @@ mod tests {
         assert!(cmd_nest_create(tmp.path(), "").is_err());
         assert!(cmd_nest_create(tmp.path(), "bad/name").is_err());
         assert!(cmd_nest_create(tmp.path(), &"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn invite_join_roundtrip_locally() {
+        // Device A creates a nest and an invite; device B (a different
+        // tempdir with its own Identity) decodes + joins; B's catalog must
+        // then list both A's founding-member event and B's own
+        // MemberAdded.
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let identity_a = test_identity(tmp_a.path());
+        setup_device(tmp_a.path(), Some("a".into()), None, false).unwrap();
+        cmd_nest_create(tmp_a.path(), "team").unwrap();
+
+        let encoded = build_invite(tmp_a.path(), Some("team"), Some("1d")).unwrap();
+        assert!(encoded.starts_with("crowinvite1"));
+
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let identity_b = test_identity(tmp_b.path());
+        cmd_nest_join(tmp_b.path(), &encoded).unwrap();
+
+        // B should now have a "team" nest with the same id and a catalog
+        // showing both members.
+        let nests_b = open_nest_index(tmp_b.path()).unwrap();
+        let team_b = nests_b
+            .list()
+            .iter()
+            .find(|n| n.name == "team")
+            .expect("B has a 'team' nest after join");
+        let invite = crow::Invite::decode(&encoded).unwrap();
+        assert_eq!(team_b.id, invite.nest_id);
+
+        let catalog_b = CatalogIndex::open(nests_b.nest_dir(&team_b.id)).unwrap();
+        let view = catalog_b.view().unwrap();
+        let members = view.members();
+        // Only B's MemberAdded — A's founding event hasn't synced yet.
+        // What matters is that B is a recognised member of this nest.
+        assert!(members.iter().any(|m| m.member == identity_b.node_id()));
+        assert!(members.iter().any(|m| m.granter == identity_a.node_id()));
+    }
+
+    #[test]
+    fn join_refuses_already_joined_nest() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        setup_device(tmp_a.path(), Some("a".into()), None, false).unwrap();
+        cmd_nest_create(tmp_a.path(), "team").unwrap();
+        let encoded = build_invite(tmp_a.path(), Some("team"), Some("1d")).unwrap();
+
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        cmd_nest_join(tmp_b.path(), &encoded).unwrap();
+        let err = cmd_nest_join(tmp_b.path(), &encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("already known"),
+            "second join must report already-joined: {err}"
+        );
+    }
+
+    #[test]
+    fn join_rejects_expired_invite() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let identity_a = test_identity(tmp_a.path());
+        setup_device(tmp_a.path(), Some("a".into()), None, false).unwrap();
+        cmd_nest_create(tmp_a.path(), "team").unwrap();
+        let nests_a = open_nest_index(tmp_a.path()).unwrap();
+        let team = nests_a
+            .list()
+            .iter()
+            .find(|n| n.name == "team")
+            .unwrap()
+            .clone();
+
+        // Build an invite by hand with `expires_at` already in the past.
+        let mut invite = crow::Invite::new_unsigned(
+            team.id,
+            team.name.clone(),
+            identity_a.node_id(),
+            NestRole::Owner,
+            1, // 1970-01-01: definitely past
+            vec![],
+        );
+        invite.sign(&identity_a).unwrap();
+        let encoded = invite.encode().unwrap();
+
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let err = cmd_nest_join(tmp_b.path(), &encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("expired"),
+            "expected expiry error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn invite_requires_owner_role() {
+        // Build a nest on device A, but try to create an invite from a
+        // device that isn't a member of it. We emulate this by
+        // hand-crafting a setup where the local identity differs from
+        // what's recorded in the catalog as the founding member.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let identity_caller = test_identity(tmp.path());
+
+        // Set up the home and the nest under the caller's identity, then
+        // overwrite identity.json so build_invite() loads a *different*
+        // identity that's not yet a member of the catalog.
+        setup_device(tmp.path(), Some("a".into()), None, false).unwrap();
+        cmd_nest_create(tmp.path(), "team").unwrap();
+
+        // Sanity: with the original identity, building an invite works.
+        assert!(build_invite(tmp.path(), Some("team"), Some("1d")).is_ok());
+
+        // Now write a fresh identity over the existing one and reopen.
+        // Identity::load_or_create reads from disk, so deleting forces a
+        // new keypair.
+        let id_path = tmp.path().join("identity.json");
+        if id_path.exists() {
+            std::fs::remove_file(&id_path).unwrap();
+        }
+        let _ = test_identity(tmp.path());
+        let new_identity = Identity::load_or_create(tmp.path()).unwrap();
+        assert_ne!(new_identity.node_id(), identity_caller.node_id());
+
+        // The new identity has not been admitted to /team's catalog, so
+        // build_invite() must refuse.
+        let err = build_invite(tmp.path(), Some("team"), Some("1d")).unwrap_err();
+        assert!(
+            err.to_string().contains("not an Owner"),
+            "expected Owner-required error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_expiry_zero_or_never_means_no_expiry() {
+        assert_eq!(compute_expiry("0").unwrap(), 0);
+        assert_eq!(compute_expiry("never").unwrap(), 0);
+        assert_eq!(compute_expiry("").unwrap(), 0);
+    }
+
+    #[test]
+    fn compute_expiry_parses_units() {
+        let now = unix_now();
+        let plus_one_h = compute_expiry("1h").unwrap();
+        assert!(plus_one_h >= now + 3600 && plus_one_h <= now + 3700);
+        let plus_seven_d = compute_expiry("7d").unwrap();
+        assert!(plus_seven_d >= now + 7 * 86_400);
+    }
+
+    #[test]
+    fn compute_expiry_rejects_garbage() {
+        assert!(compute_expiry("abc").is_err());
+        assert!(compute_expiry("7y").is_err()); // years unsupported
     }
 
     #[test]

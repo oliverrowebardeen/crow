@@ -649,27 +649,30 @@ impl CatalogIndex {
         )
     }
 
-    /// Idempotently ensure a founding-member event exists for the local
-    /// identity. No-op if a `MemberAdded` event for `identity.node_id()`
-    /// is already on the log. Otherwise appends a self-granting event
-    /// (`granter == member`).
+    /// Idempotently ensure a founding-member event exists for *this nest*
+    /// (not necessarily for this identity).
     ///
-    /// This is the bridge for Phase-2 nests that pre-date signed
-    /// membership: opening them with Phase-3 code stamps the founding
-    /// event on first use.
+    /// - If the catalog already has at least one `MemberAdded` event, no-op.
+    /// - Otherwise, append a self-granting event for the local identity.
+    ///
+    /// The second condition is the migration bridge for Phase-2 nests:
+    /// the first device to open such a nest with Phase-3 code becomes
+    /// the founding member. A *different* device opening a Phase-3 nest
+    /// that already has a founding event does NOT silently self-grant —
+    /// non-founders must join via an invite.
     pub fn ensure_founding_member(
         &self,
         nest_id: &NestId,
         identity: &Identity,
     ) -> Result<Option<CatalogEvent>> {
-        let me = identity.node_id();
-        let already_a_member = self
+        let has_any_founding = self
             .load_events()?
             .iter()
-            .any(|event| matches!(event.op, CatalogOp::MemberAdded { member, .. } if member == me));
-        if already_a_member {
+            .any(|event| matches!(event.op, CatalogOp::MemberAdded { .. }));
+        if has_any_founding {
             return Ok(None);
         }
+        let me = identity.node_id();
         Ok(Some(self.append_member_added(
             nest_id,
             identity,

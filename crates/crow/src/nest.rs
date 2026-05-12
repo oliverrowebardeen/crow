@@ -366,6 +366,27 @@ impl NestIndex {
     /// Add a new nest with `name`. Does not change the active selection.
     /// Errors if `name` is invalid or duplicates an existing nest's name.
     pub fn create(&mut self, name: &str, creator_device_id: &str) -> Result<&Nest> {
+        let id = NestId::random();
+        self.create_with_id(id, name, creator_device_id)
+    }
+
+    /// Like [`NestIndex::create`] but uses an externally-supplied
+    /// `NestId`. Used by `crow nest join` so the joined nest carries the
+    /// same id as on the granter's device (catalog events replicate by
+    /// nest_id, not by name). Errors if either the id or the name is
+    /// already taken on this device; callers that want to deconflict
+    /// names should do so before calling.
+    pub fn create_with_id(
+        &mut self,
+        id: NestId,
+        name: &str,
+        creator_device_id: &str,
+    ) -> Result<&Nest> {
+        if self.nests.iter().any(|n| n.id == id) {
+            return Err(Error::Nest(format!(
+                "nest with id {id} already exists on this device"
+            )));
+        }
         let name = validate_name(name)?;
         if let Some(existing) = self.nests.iter().find(|n| n.name == name) {
             return Err(Error::Nest(format!(
@@ -374,7 +395,7 @@ impl NestIndex {
             )));
         }
         let nest = Nest {
-            id: NestId::random(),
+            id,
             name: name.to_string(),
             created_at: now_unix(),
             creator_device_id: creator_device_id.to_string(),
@@ -385,6 +406,11 @@ impl NestIndex {
         self.nests.push(nest);
         self.save()?;
         Ok(self.nests.last().expect("just pushed; cannot be empty"))
+    }
+
+    /// Returns true iff a nest with `name` already exists on this device.
+    pub fn has_name(&self, name: &str) -> bool {
+        self.nests.iter().any(|n| n.name == name)
     }
 
     /// Switch the active nest. `reference` can be a full hex id, an id
