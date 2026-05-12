@@ -28,6 +28,7 @@ pub mod fs_store;
 pub mod gc;
 pub mod hash;
 pub mod identity;
+pub mod invite;
 pub mod manifest;
 pub mod member;
 pub mod nest;
@@ -54,6 +55,7 @@ pub use gc::{
 };
 pub use hash::{ChunkHash, Hash, ManifestHash};
 pub use identity::{Identity, NodeId};
+pub use invite::{INVITE_HRP, INVITE_VERSION, Invite};
 pub use manifest::{
     Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, SignatureStatus,
     Stripe,
