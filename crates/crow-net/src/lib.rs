@@ -408,7 +408,7 @@ struct PendingNestAuth {
 #[derive(Clone)]
 struct ConfirmedNestAuth {
     nest_id: NestId,
-    #[allow(dead_code)] // recorded for diagnostics / future auditing
+    #[allow(dead_code)] // recorded for diagnostics
     member: NodeId,
 }
 

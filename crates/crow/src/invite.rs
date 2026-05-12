@@ -107,14 +107,9 @@ impl Invite {
         }
     }
 
-    /// Sign with `identity`. Identity's pubkey must equal `self.granter`,
-    /// otherwise the resulting signature won't verify.
+    /// Sign with `identity`. Identity's pubkey must equal `self.granter`.
     pub fn sign(&mut self, identity: &Identity) -> Result<()> {
-        if identity.node_id() != self.granter {
-            return Err(Error::Invite(
-                "signing identity does not match Invite.granter".into(),
-            ));
-        }
+        // sign_member_grant enforces identity.node_id() == self.granter.
         self.grant_signature = self.sign_member_grant(identity, &self.member, self.created_at)?;
         self.signature = Signature([0u8; 64]);
         let payload = self.canonical_bytes()?;
@@ -406,8 +401,8 @@ mod tests {
     #[test]
     fn sign_member_grant_matches_canonical_payload() {
         // Sanity check that Invite::sign_member_grant produces a signature
-        // verifiable by member_grant_canonical_bytes. This is the bridge
-        // to MemberAdded.invite_signature used in commit 4.
+        // verifiable by member_grant_canonical_bytes — the bridge to
+        // MemberAdded.invite_signature.
         let identity = Identity::random();
         let invite = invite_for(&identity, 0);
         let member = NodeId::from_bytes([0xAAu8; 32]);

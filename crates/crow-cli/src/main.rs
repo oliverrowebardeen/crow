@@ -933,7 +933,6 @@ fn run(cli: Cli) -> DynResult<()> {
                         catalog: &catalog,
                         identity: &identity,
                     },
-                    &identity,
                     ShareCliRequest {
                         arg: &cap_or_prefix,
                         name,
@@ -1448,17 +1447,13 @@ struct ShareCliRequest<'a> {
     plain: bool,
 }
 
-fn cmd_share(
-    ctx: StoreContext<'_>,
-    identity: &Identity,
-    request: ShareCliRequest<'_>,
-) -> DynResult<()> {
+fn cmd_share(ctx: StoreContext<'_>, request: ShareCliRequest<'_>) -> DynResult<()> {
     let report = share_target(
         ctx.home,
         ctx.crow,
         ctx.pins,
         ctx.catalog,
-        identity,
+        ctx.identity,
         ShareRequest {
             arg: request.arg,
             name: request.name,

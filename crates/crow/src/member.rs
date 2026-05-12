@@ -1,27 +1,23 @@
 //! Nest membership types and canonical signing payloads.
 //!
-//! Membership in a nest is recorded as signed events in the catalog event
-//! log. Each `MemberAdded` event carries a granter's signature over a small
-//! canonical payload — `member_grant_canonical_bytes` — that uniquely
-//! identifies the (nest, granter, member, role, added_at) tuple. The same
-//! payload is signed at two points:
+//! Membership is recorded as signed `MemberAdded` events in the catalog
+//! event log. Each carries a granter's signature over
+//! [`member_grant_canonical_bytes`] — the (nest, granter, member, role,
+//! added_at) tuple. The same payload is signed at two points:
 //!
-//! 1. **Founding:** when a device creates a nest, it self-grants by signing
-//!    the payload with its own identity (`granter == member`). The outer
-//!    catalog-event signature and the embedded `invite_signature` then
-//!    match.
-//! 2. **Invited member:** an existing Owner produces the canonical bytes,
-//!    signs them, and embeds the signature in the [`Invite`] payload. When
-//!    the recipient writes their own `MemberAdded` event, they copy that
-//!    signature into `invite_signature`. A third device merging the event
-//!    can re-derive the canonical bytes from the event's fields and verify
-//!    the granter authorised the grant.
+//! 1. **Founding self-grant:** the device that creates the nest signs
+//!    with `granter == member`. Outer event signature and embedded
+//!    grant signature both come from the same key.
+//! 2. **Invited member:** an existing Owner signs the payload inside an
+//!    [`Invite`](crate::Invite). The recipient copies that signature
+//!    into the `invite_signature` field of their own `MemberAdded`. A
+//!    third device merging the event re-derives the canonical bytes
+//!    and verifies the granter authorised the grant.
 //!
-//! Revocation merge logic is deferred to Phase 5 (the orchestration plan
-//! treats CRDT conflict resolution as its own design pass). The
-//! [`MemberRevoked`](super::catalog::CatalogOp::MemberRevoked) op variant
-//! and the `revoked_at` field on [`MemberRecord`] are reserved here so the
-//! wire format does not change later.
+//! Merge-aware revocation is not implemented yet. The
+//! [`MemberRevoked`](super::catalog::CatalogOp::MemberRevoked) variant
+//! and `revoked_at` field are reserved for forward wire-format
+//! compatibility.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,9 +29,9 @@ use crate::nest::NestId;
 /// without a migration story.
 const GRANT_DOMAIN_TAG: &[u8] = b"crow.member-grant.v1";
 
-/// The role assigned to a member. Phase 3 ships a single variant; future
-/// roles (`Reader`, `Writer`, `Storage`) will land when there is a real
-/// capability difference between them.
+/// The role assigned to a member. Only `Owner` exists today; finer-grained
+/// roles (`Reader`, `Writer`, `Storage`) land when they imply a real
+/// capability difference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NestRole {
     Owner,
@@ -50,12 +46,11 @@ impl NestRole {
     }
 }
 
-/// A current-state member entry derived from the catalog event log by
+/// A member entry derived from the catalog event log by
 /// [`CatalogView::members`](super::catalog::CatalogView::members).
 ///
-/// `revoked_at` is reserved data shape: it is populated by a
-/// `MemberRevoked` op but Phase 3 does not yet treat a revoked member as
-/// non-current (that requires CRDT merge semantics).
+/// `revoked_at` is populated by `MemberRevoked` ops but the merge layer
+/// does not yet treat a revoked member as non-current.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberRecord {
     pub member: NodeId,
@@ -67,11 +62,10 @@ pub struct MemberRecord {
 
 /// Canonical bytes a granter signs to authorise a `MemberAdded` event.
 ///
-/// Same payload is used at three points:
-/// 1. The founding device produces it when self-granting.
-/// 2. An Owner produces and signs it inside an `Invite` (Phase 3 commit 3).
-/// 3. A verifier reconstructs it from a `MemberAdded` event's fields and
-///    checks the embedded `invite_signature` against the named granter.
+/// Same payload at three points: founding self-grant produces it; an
+/// Owner producing an [`Invite`](crate::Invite) signs it; the verifier
+/// rebuilds it from a `MemberAdded` event's fields and checks the
+/// embedded `invite_signature` against the named granter.
 ///
 /// Encoding is a hand-rolled, fixed-layout byte string rather than postcard,
 /// so the canonical form does not depend on a particular serde version's

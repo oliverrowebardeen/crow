@@ -104,20 +104,20 @@ pub struct CatalogEvent {
     pub seq: u64,
     pub created_at: u64,
     pub op: CatalogOp,
-    /// Ed25519 public key of the device that produced this event. None for
-    /// legacy pre-Phase-3 events; rejected on peer merge but accepted on
-    /// local replay.
+    /// Ed25519 public key of the device that produced this event. `None`
+    /// for legacy unsigned events — accepted on local replay, rejected
+    /// when arriving from a peer.
     #[serde(default)]
     pub signer: Option<NodeId>,
-    /// Ed25519 signature over the canonical postcard encoding of this event
-    /// with `signature` set to `None`. Verified against `signer`.
+    /// Ed25519 signature over the canonical postcard encoding of this
+    /// event with `signature` zeroed. Verified against `signer`.
     #[serde(default)]
     pub signature: Option<Signature>,
 }
 
-/// Did this event arrive locally (from our own events.jsonl) or from a peer?
-/// Legacy unsigned events are tolerated on `Local` replay but rejected on
-/// `Remote` merge.
+/// Whether an event arrived from our own log or from a peer. Unsigned
+/// events are tolerated on `Local` replay (for legacy on-disk events) but
+/// rejected on `Remote` merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventOrigin {
     Local,
@@ -125,9 +125,9 @@ pub enum EventOrigin {
 }
 
 impl CatalogEvent {
-    /// Sign this event with the given identity. Sets `signer` to the
-    /// identity's pubkey and `signature` to the Ed25519 signature over the
-    /// canonical-bytes-with-signature-zeroed payload.
+    /// Sign with `identity`. The signing payload is this event's postcard
+    /// encoding with the `signature` field zeroed; the verifier
+    /// reconstructs the same bytes.
     pub fn sign(&mut self, identity: &Identity) -> Result<()> {
         let signer = identity.node_id();
         self.signer = Some(signer);
@@ -197,9 +197,9 @@ pub enum CatalogOp {
         added_at: u64,
         invite_signature: Signature,
     },
-    /// A member was revoked. Wire shape only — Phase 3 records the event
-    /// but [`CatalogView::members`] still returns revoked members as
-    /// current; CRDT merge semantics for revocation are Phase 5.
+    /// A member was revoked. Wire shape only — [`CatalogView::members`]
+    /// still returns revoked entries with `revoked_at` populated; CRDT
+    /// merge semantics for revocation are not yet implemented.
     MemberRevoked {
         member: NodeId,
         revoked_at: u64,
@@ -281,10 +281,9 @@ impl CatalogView {
             .collect()
     }
 
-    /// Current member set derived from the event log, in the order they
-    /// were added. Phase 3 returns revoked members too (with `revoked_at`
-    /// populated); follow-up work in Phase 5 will treat revocation as a
-    /// CRDT-merge-aware removal.
+    /// Members derived from the event log, in the order they were added.
+    /// Revoked members are still returned with `revoked_at` populated;
+    /// the merge layer does not yet treat revocation as removal.
     pub fn members(&self) -> &[MemberRecord] {
         &self.members
     }
@@ -624,8 +623,8 @@ impl CatalogIndex {
     /// Append a `MemberAdded` event whose `invite_signature` was produced
     /// elsewhere (e.g. by decoding an Invite). The local device is the
     /// event's outer signer (the new member); `granter` is whoever
-    /// authorised the grant. Phase 3 callers verify the invite signature
-    /// before calling this; the catalog re-verifies after merge.
+    /// authorised the grant. Caller is responsible for verifying the
+    /// invite signature; the merge path re-verifies on peer ingest.
     pub fn append_member_added_with_signature(
         &self,
         identity: &Identity,
@@ -647,11 +646,10 @@ impl CatalogIndex {
         )
     }
 
-    /// Append a `MemberRevoked` event. Phase 3 ships this for wire-format
-    /// stability; revocation is observable via `MemberRecord::revoked_at`
-    /// but does not yet remove the member from
-    /// [`CatalogView::members`] (CRDT merge semantics for revocation are
-    /// Phase 5).
+    /// Append a `MemberRevoked` event. Wire-format only — revocation
+    /// surfaces as `MemberRecord::revoked_at` but does not yet remove
+    /// the member from [`CatalogView::members`]; merge-aware revocation
+    /// is not implemented.
     pub fn append_member_revoked(
         &self,
         identity: &Identity,
@@ -666,17 +664,17 @@ impl CatalogIndex {
         )
     }
 
-    /// Idempotently ensure a founding-member event exists for *this nest*
-    /// (not necessarily for this identity).
+    /// Idempotently stamp a founding-member event for *this nest* (not
+    /// necessarily for this identity).
     ///
     /// - If the catalog already has at least one `MemberAdded` event, no-op.
     /// - Otherwise, append a self-granting event for the local identity.
     ///
-    /// The second condition is the migration bridge for Phase-2 nests:
-    /// the first device to open such a nest with Phase-3 code becomes
-    /// the founding member. A *different* device opening a Phase-3 nest
-    /// that already has a founding event does NOT silently self-grant —
-    /// non-founders must join via an invite.
+    /// The second branch is the migration bridge for nests created
+    /// before catalog events were signed: the first device to open such
+    /// a nest becomes the founding member. A *different* device opening
+    /// a nest that already has a founding event does NOT silently
+    /// self-grant — non-founders must join via an invite.
     pub fn ensure_founding_member(
         &self,
         nest_id: &NestId,
