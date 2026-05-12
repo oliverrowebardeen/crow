@@ -877,9 +877,9 @@ fn run(cli: Cli) -> DynResult<()> {
         } => cmd_setup(&home, name, token, force_token),
         Command::Token(command) => cmd_token(&home, command),
         Command::Serve { bind, name } => {
-            let nest_dir = active_nest_dir(&home, cli.nest.as_deref())?;
+            let (nest_dir, nest_id) = active_nest(&home, cli.nest.as_deref())?;
             let store = FsStore::open(&nest_dir)?;
-            cmd_serve(&home, store, bind, name)
+            cmd_serve(&home, &nest_dir, nest_id, store, bind, name)
         }
         Command::Peers { long, json } => cmd_peers(&home, long, json),
         Command::Nest { command } => cmd_nest(&home, cli.nest.as_deref(), command),
@@ -986,7 +986,9 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
-                Command::Sync { peer } => cmd_sync(&home, &crow, &catalog, &peer),
+                Command::Sync { peer } => {
+                    cmd_sync(&home, &crow, &catalog, &identity, nest_id, &peer)
+                }
                 Command::Receive {
                     peer,
                     cap_or_prefix,
@@ -1045,6 +1047,7 @@ fn open_nest_index(home: &Path) -> DynResult<NestIndex> {
 ///
 /// `override_` lets a single invocation operate on a non-active nest (the
 /// global `--nest` flag); pass `None` for the persisted active selection.
+#[cfg(test)]
 fn active_nest_dir(home: &Path, override_: Option<&str>) -> DynResult<PathBuf> {
     Ok(active_nest(home, override_)?.0)
 }
@@ -3257,13 +3260,17 @@ fn humanize_age(unix: u64) -> String {
 
 fn cmd_serve(
     home: &Path,
+    nest_dir: &Path,
+    nest_id: NestId,
     store: FsStore,
     bind: SocketAddr,
     name_override: Option<String>,
 ) -> DynResult<()> {
     let token = load_token(home)?;
     let identity = Identity::load_or_create(home)?;
-    let catalog = CatalogIndex::open(home)?;
+    let catalog = CatalogIndex::open(nest_dir)?;
+    catalog.ensure_founding_member(&nest_id, &identity)?;
+    let legacy_catalog = CatalogIndex::open(nest_dir)?;
     let node_id = identity.node_id();
     let friendly_name = resolve_serve_name(home, name_override)?;
     let root = store.root().display().to_string();
@@ -3274,10 +3281,11 @@ fn cmd_serve(
         friendly_name,
         root,
         snapshot_path,
+        nest_id,
     };
 
     let rt = runtime()?;
-    rt.block_on(serve_loop(store, catalog, token, config))
+    rt.block_on(serve_loop(store, catalog, legacy_catalog, token, config))
 }
 
 struct ServeLoopConfig {
@@ -3286,15 +3294,24 @@ struct ServeLoopConfig {
     friendly_name: Option<String>,
     root: String,
     snapshot_path: PathBuf,
+    nest_id: NestId,
 }
 
 async fn serve_loop(
     store: FsStore,
     catalog: CatalogIndex,
+    legacy_catalog: CatalogIndex,
     token: ClusterToken,
     config: ServeLoopConfig,
 ) -> DynResult<()> {
-    let server = crow_net::serve_with_catalog(store, catalog, token, config.bind).await?;
+    let catalog = std::sync::Arc::new(catalog);
+    let mut serve_config = crow_net::ServeConfig::new(store, token, config.bind);
+    serve_config.legacy_catalog = Some(legacy_catalog);
+    serve_config.nest_serving = Some(crow_net::NestServingConfig {
+        nest_id: config.nest_id,
+        catalog: catalog.clone(),
+    });
+    let server = crow_net::serve_with_config(serve_config).await?;
     let actual_addr = server.local_addr();
 
     let advert = LocalAdvert {
@@ -3449,15 +3466,36 @@ fn cmd_sync(
     home: &Path,
     crow: &Crow<FsStore>,
     catalog: &CatalogIndex,
+    identity: &Identity,
+    nest_id: NestId,
     peer: &str,
 ) -> DynResult<()> {
-    let token = load_token(home)?;
     let socket_addrs = resolve_peer(home, peer)?;
     let rt = runtime()?;
-    let (socket_addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
-    let remote_events = rt.block_on(client.catalog_events(token))?;
-    let catalog_report = sync_catalog_events(catalog, remote_events)?;
-    let object_report = sync_catalog_objects(crow, &rt, &client, token, catalog)?;
+
+    // Prefer nest-scoped auth when this device is a recognised member of
+    // the active nest (the common case after `crow setup` /
+    // `crow nest join`). Falls back to the legacy cluster-token path
+    // only when the local catalog has no MemberAdded for us — i.e. a
+    // pre-Phase-3 install that hasn't been migrated yet.
+    let view = catalog.view()?;
+    let am_member = view
+        .members()
+        .iter()
+        .any(|m| m.member == identity.node_id() && m.revoked_at.is_none());
+
+    let (socket_addr, catalog_report, object_report) = if am_member {
+        println!("auth          nest-scoped (signed challenge)");
+        sync_nest_scoped(&rt, peer, &socket_addrs, nest_id, identity, crow, catalog)?
+    } else {
+        println!("auth          cluster-token (legacy)");
+        let token = load_token(home)?;
+        let (addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
+        let remote_events = rt.block_on(client.catalog_events(token))?;
+        let catalog_report = sync_catalog_events(catalog, remote_events)?;
+        let object_report = sync_catalog_objects(crow, &rt, &client, token, catalog)?;
+        (addr, catalog_report, object_report)
+    };
 
     println!("peer          {socket_addr}");
     println!("remote events {}", catalog_report.remote_events);
@@ -3758,6 +3796,93 @@ fn connect_peer(
     Err(msg.into())
 }
 
+/// Run a nest-scoped sync against the first reachable address. Returns
+/// (chosen_addr, catalog_report, object_report).
+fn sync_nest_scoped(
+    rt: &tokio::runtime::Runtime,
+    peer_arg: &str,
+    addresses: &[SocketAddr],
+    nest_id: NestId,
+    identity: &Identity,
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+) -> DynResult<(SocketAddr, SyncCatalogReport, SyncObjectReport)> {
+    let mut failures = Vec::new();
+    for addr in addresses {
+        match rt.block_on(Client::connect_for_nest(*addr, nest_id, identity)) {
+            Ok(client) => {
+                let remote_events = rt.block_on(client.nest_catalog_events())?;
+                // Peer events MUST be signed; the merge-from-peer path
+                // enforces that. This is the Phase-3 win: only
+                // cryptographically attributable events propagate.
+                let catalog_report = sync_catalog_events_from_peer(catalog, remote_events)?;
+                let object_report = sync_catalog_objects_scoped(crow, rt, &client, catalog)?;
+                return Ok((*addr, catalog_report, object_report));
+            }
+            Err(crow_net::NetError::Unauthorized) => {
+                failures.push(format!(
+                    "{addr}: nest handshake rejected (not a member of {nest_id})"
+                ));
+            }
+            Err(e) => failures.push(format!("{addr}: nest connect failed: {e}")),
+        }
+    }
+    let mut msg = format!(
+        "could not nest-sync with peer '{peer_arg}' using {} candidate address{}",
+        addresses.len(),
+        if addresses.len() == 1 { "" } else { "es" },
+    );
+    for failure in failures {
+        msg.push_str("\n  ");
+        msg.push_str(&failure);
+    }
+    Err(msg.into())
+}
+
+fn sync_catalog_events_from_peer(
+    catalog: &CatalogIndex,
+    remote_events: Vec<CatalogEvent>,
+) -> DynResult<SyncCatalogReport> {
+    let remote_count = remote_events.len();
+    let new_events = catalog.merge_events_from_peer(remote_events)?;
+    let local_events = catalog.load_events()?.len();
+    let catalog_files = catalog.view()?.files().len();
+    Ok(SyncCatalogReport {
+        remote_events: remote_count,
+        new_events,
+        local_events,
+        catalog_files,
+    })
+}
+
+fn sync_catalog_objects_scoped(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    catalog: &CatalogIndex,
+) -> DynResult<SyncObjectReport> {
+    let caps = catalog.view()?.file_caps();
+    let mut counters = FetchCounters::default();
+    let mut visited = HashSet::new();
+    for cap in &caps {
+        fetch_cap_recursive_scoped(crow, rt, client, cap, &mut counters, &mut visited)?;
+    }
+    let mut failed_caps = 0usize;
+    for cap in &caps {
+        if verify_cap_reconstructable(crow, cap).is_err() {
+            failed_caps += 1;
+        }
+    }
+    Ok(SyncObjectReport {
+        catalog_files: caps.len(),
+        fetched: counters.fetched,
+        already_local: counters.already_local,
+        remote_missing: counters.remote_missing,
+        fetched_bytes: counters.fetched_bytes,
+        failed_caps,
+    })
+}
+
 fn cmd_token(home: &Path, command: TokenCommand) -> DynResult<()> {
     let tokens = TokenStore::open(home);
     match command {
@@ -3970,6 +4095,80 @@ fn fetch_object(
         }
         None => Ok(FetchState::Missing),
     }
+}
+
+fn fetch_object_scoped(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    namespace: Namespace,
+    hash: Hash,
+    fetched_bytes: &mut u64,
+) -> DynResult<FetchState> {
+    if crow.store().has(namespace, &hash)? {
+        return Ok(FetchState::Local);
+    }
+    match rt.block_on(client.nest_get(namespace, hash))? {
+        Some(bytes) => {
+            *fetched_bytes += bytes.len() as u64;
+            crow.store().put_unverified(namespace, hash, bytes)?;
+            Ok(FetchState::Fetched)
+        }
+        None => Ok(FetchState::Missing),
+    }
+}
+
+fn fetch_cap_recursive_scoped(
+    crow: &Crow<FsStore>,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    cap: &Cap,
+    counters: &mut FetchCounters,
+    visited: &mut HashSet<Hash>,
+) -> DynResult<()> {
+    if !visited.insert(*cap.manifest_hash.inner()) {
+        return Ok(());
+    }
+    let manifest_state = fetch_object_scoped(
+        crow,
+        rt,
+        client,
+        Namespace::Manifests,
+        *cap.manifest_hash.inner(),
+        &mut counters.fetched_bytes,
+    )?;
+    counters.count_object(&manifest_state);
+    if matches!(manifest_state, FetchState::Missing) {
+        return Ok(());
+    }
+    let kind = crow.open_manifest_kind(cap)?;
+    match kind {
+        ManifestKind::File(manifest) => {
+            for hash in manifest
+                .stripes
+                .iter()
+                .flat_map(|s| s.data.iter().chain(s.parity.iter()))
+                .map(|h| *h.inner())
+            {
+                let state = fetch_object_scoped(
+                    crow,
+                    rt,
+                    client,
+                    Namespace::Chunks,
+                    hash,
+                    &mut counters.fetched_bytes,
+                )?;
+                counters.count_object(&state);
+                counters.count_share(&state);
+            }
+        }
+        ManifestKind::Directory(manifest) => {
+            for child_cap in manifest.file_caps()? {
+                fetch_cap_recursive_scoped(crow, rt, client, &child_cap, counters, visited)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn load_token(home: &Path) -> DynResult<ClusterToken> {

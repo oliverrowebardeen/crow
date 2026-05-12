@@ -289,6 +289,143 @@ async fn cluster_token_mode_still_works_with_nest_serving() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_devices_share_a_nest_without_cluster_token() {
+    // The Phase 3 acceptance criterion: two devices in the same nest can
+    // exchange bytes without ever copying a shared cluster token. Each
+    // device picks its own random token; B never learns A's token.
+    //
+    // Setup:
+    // - Device A has nest "team", is its founding member, and has stored
+    //   one file whose plaintext we'll later reconstruct on B.
+    // - Device B has its own identity; A has appended a MemberAdded for
+    //   B's pubkey to the catalog. (In real use this happens through
+    //   `crow nest invite` / `crow nest join`, but we exercise the
+    //   underlying catalog operations directly.)
+    // - Each device has a random cluster token; they are different.
+    let tmp_a = TempDir::new().unwrap();
+    let identity_a = Identity::load_or_create(tmp_a.path()).unwrap();
+    let nest_id = NestId::random();
+    let catalog_a = Arc::new(CatalogIndex::open(tmp_a.path()).unwrap());
+    catalog_a
+        .ensure_founding_member(&nest_id, &identity_a)
+        .unwrap();
+
+    let tmp_b = TempDir::new().unwrap();
+    let identity_b = Identity::load_or_create(tmp_b.path()).unwrap();
+    catalog_a
+        .append_member_added(&nest_id, &identity_a, identity_b.node_id(), NestRole::Owner)
+        .unwrap();
+
+    // Put a file under A.
+    let crow_a = Crow::new(FsStore::open(tmp_a.path()).unwrap());
+    let payload = b"two-device nest, no cluster token";
+    let cap = crow_a
+        .put_bytes_with(
+            payload,
+            "text/plain",
+            ErasureParams::default(),
+            TEST_CHUNK_SIZE,
+            &identity_a,
+        )
+        .unwrap();
+    // Catalog the file so the post-sync object loop reaches it.
+    catalog_a.mkdir("/docs", false, &identity_a).unwrap();
+    catalog_a
+        .put_file(
+            "/docs/file.txt",
+            cap.clone(),
+            Some("file.txt".into()),
+            &identity_a,
+        )
+        .unwrap();
+
+    // Stand up the server on A with two *different* tokens for A and B.
+    let token_a = ClusterToken::random();
+    let token_b = ClusterToken::random();
+    assert_ne!(
+        token_a, token_b,
+        "the test premise requires different tokens"
+    );
+
+    let server_store = FsStore::open(tmp_a.path()).unwrap();
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let serve_catalog = catalog_a.clone();
+    let handle = tokio::spawn(async move {
+        let mut config = ServeConfig::new(server_store, token_a, addr);
+        config.nest_serving = Some(NestServingConfig {
+            nest_id,
+            catalog: serve_catalog,
+        });
+        let _ = crow_net::serve_with_config(config).await;
+    });
+
+    // B connects via the nest-scoped handshake, syncs the catalog, then
+    // pulls the manifest + chunks. B holds token_b only, never token_a.
+    let client = connect_for_nest_retry(addr, nest_id, &identity_b)
+        .await
+        .expect("nest handshake should succeed for B");
+
+    let catalog_b = CatalogIndex::open(tmp_b.path()).unwrap();
+    // Phase-3 invariant: peer events MUST be signed.
+    let remote_events = client.nest_catalog_events().await.unwrap();
+    catalog_b.merge_events_from_peer(remote_events).unwrap();
+    let view = catalog_b.view().unwrap();
+    assert!(
+        view.get(&crow::CatalogPath::normalize("/docs/file.txt").unwrap())
+            .is_some()
+    );
+
+    // Now fetch the encrypted manifest + every shard.
+    let crow_b = Crow::new(FsStore::open(tmp_b.path()).unwrap());
+    let manifest_bytes = client
+        .nest_get(Namespace::Manifests, *cap.manifest_hash.inner())
+        .await
+        .unwrap()
+        .expect("manifest present on A");
+    crow_b
+        .store()
+        .put_unverified(
+            Namespace::Manifests,
+            *cap.manifest_hash.inner(),
+            manifest_bytes,
+        )
+        .unwrap();
+
+    let manifest = crow::Manifest::open(
+        &crow_b
+            .store()
+            .get(Namespace::Manifests, cap.manifest_hash.inner())
+            .unwrap()
+            .unwrap(),
+        &cap.manifest_key,
+    )
+    .unwrap();
+    for stripe in &manifest.stripes {
+        for hash in stripe.data.iter().chain(stripe.parity.iter()) {
+            let chunk_bytes = client
+                .nest_get(Namespace::Chunks, *hash.inner())
+                .await
+                .unwrap()
+                .expect("chunk present on A");
+            crow_b
+                .store()
+                .put_unverified(Namespace::Chunks, *hash.inner(), chunk_bytes)
+                .unwrap();
+        }
+    }
+
+    // B reconstructs the bytes without ever having seen A's cluster token.
+    let restored = crow_b.get_bytes(&cap).unwrap();
+    assert_eq!(restored, payload);
+    let _ = token_b; // token_b is the "different token" premise of this test
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nest_handshake_rejects_replay() {
     // Replay defence: a captured NestAuthResponse from connection 1 must
     // not authenticate connection 2 (each connection issues a fresh
