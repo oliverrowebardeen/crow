@@ -103,15 +103,23 @@ crow serve [--bind ADDR] [--name NAME]
 crow peers [--long] [--json]
 crow fetch <peer> <cap-or-prefix> [--name NAME]
 crow sync <peer>
+crow nest list
+crow nest current
+crow nest create <name>
+crow nest use <name-or-id-prefix>
 ```
 
 `<file>` and `<out>` accept `-` for stdin / stdout. Storage lives at `$CROW_HOME` (default `~/.crow`); override per-invocation with `--home PATH`.
+
+Nest selection is per-invocation overridable with `--nest <name-or-id-prefix>`. The default is the persisted active nest from `crow nest use`. Upgrading from a single-catalog layout migrates `<home>/{catalog, pins, chunks, manifests}` under a new default `personal` nest the first time any nest-aware command runs.
 
 `<path-or-cap-or-prefix>` accepts a local catalog path (`/docs/report.pdf`), a full bech32m `crow1…` string, or a hex prefix of a pinned manifest hash. Prefix resolution goes through the flat pin index — caps that aren't pinned still work, but only via their full string or catalog path. Ambiguous prefixes get an explicit error listing the candidates.
 
 Catalog folders are mutable local organization. To share a folder, freeze it into an immutable directory snapshot cap with `crow cap-dir /path`; later catalog edits do not change that cap.
 
 Device names are local convenience metadata. `crow serve` advertises the saved name on LAN mDNS, but caps never contain device names, IP addresses, or other locators.
+
+Nests are named encrypted vaults on the local device. Each nest has its own catalog, pins, and encrypted shares under `<home>/nests/<id>/`, so files in different nests can never see each other. Use `crow nest list` / `create` / `use` to switch between them and `--nest <name>` to target a non-active nest for a single command. Today every nest shares the same device-level cluster token for LAN fetch; per-nest membership and scoped tokens are Phase 3.
 
 ### Walkthrough
 

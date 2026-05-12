@@ -67,6 +67,12 @@ struct Cli {
     #[arg(long, env = "CROW_HOME")]
     home: Option<PathBuf>,
 
+    /// Operate on a specific nest for this invocation. Accepts a nest name, a
+    /// full 32-char hex id, or an id prefix. Does not change the persisted
+    /// active nest.
+    #[arg(long, global = true)]
+    nest: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -634,6 +640,51 @@ enum Command {
     /// Manage the shared personal-cluster token.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Manage named encrypted vaults ("nests") on this device.
+    #[command(
+        long_about = "A nest is a named encrypted vault with its own catalog, pins, and \
+                      encrypted shares. Every Crow command operates on one active nest at \
+                      a time; use --nest to override the active selection for a single \
+                      invocation.\n\
+                      \n\
+                      Examples:\n  \
+                      crow nest list\n  \
+                      crow nest create work\n  \
+                      crow nest use work\n  \
+                      crow nest current"
+    )]
+    Nest {
+        #[command(subcommand)]
+        command: NestCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum NestCommand {
+    /// List every nest on this device with an active marker.
+    List,
+    /// Print the currently active nest.
+    Current,
+    /// Create a new nest with the given name. Does not change the active nest.
+    #[command(
+        long_about = "Add a new nest with NAME. The name must be 1-32 characters drawn \
+                      from [A-Za-z0-9-_. ] and must be unique on this device. The active \
+                      nest is unchanged; run `crow nest use NAME` to switch."
+    )]
+    Create {
+        /// Nest name (1-32 chars; [A-Za-z0-9-_. ]).
+        name: String,
+    },
+    /// Change the active nest.
+    #[command(
+        long_about = "Switch the active nest. REFERENCE accepts a nest name, a full \
+                      32-character hex id, or an id prefix; ambiguous prefixes get an \
+                      explicit error listing the candidates."
+    )]
+    Use {
+        /// Nest name, full hex id, or id prefix.
+        reference: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -796,13 +847,14 @@ fn run(cli: Cli) -> DynResult<()> {
         } => cmd_setup(&home, name, token, force_token),
         Command::Token(command) => cmd_token(&home, command),
         Command::Serve { bind, name } => {
-            let nest_dir = active_nest_dir(&home)?;
+            let nest_dir = active_nest_dir(&home, cli.nest.as_deref())?;
             let store = FsStore::open(&nest_dir)?;
             cmd_serve(&home, store, bind, name)
         }
         Command::Peers { long, json } => cmd_peers(&home, long, json),
+        Command::Nest { command } => cmd_nest(&home, command),
         command => {
-            let nest_dir = active_nest_dir(&home)?;
+            let nest_dir = active_nest_dir(&home, cli.nest.as_deref())?;
             let store = FsStore::open(&nest_dir)?;
             let pins = PinIndex::open(&nest_dir)?;
             let catalog = CatalogIndex::open(&nest_dir)?;
@@ -935,7 +987,8 @@ fn run(cli: Cli) -> DynResult<()> {
                 | Command::Peers { .. }
                 | Command::Device { .. }
                 | Command::Setup { .. }
-                | Command::Token(_) => {
+                | Command::Token(_)
+                | Command::Nest { .. } => {
                     unreachable!("handled above")
                 }
             }
@@ -951,15 +1004,84 @@ fn resolve_home(explicit: Option<PathBuf>) -> DynResult<PathBuf> {
     Ok(PathBuf::from(home).join(".crow"))
 }
 
+/// Open or initialise the nest index at `home`, running the legacy-layout
+/// migration on first invocation. Used by everything that needs a nest
+/// handle: nest-aware command dispatch + the `crow nest …` subcommand itself.
+fn open_nest_index(home: &Path) -> DynResult<NestIndex> {
+    let identity = Identity::load_or_create(home)?;
+    let device_id = identity.node_id().short();
+    let nests = NestIndex::ensure_default(home, &device_id)?;
+    Ok(nests)
+}
+
 /// Materialise the active nest's storage directory under `home`, running the
 /// legacy-layout migration on first invocation. All nest-aware commands route
 /// their `FsStore` / `PinIndex` / `CatalogIndex` opens through this helper so
 /// they see the active nest's data and only the active nest's data.
-fn active_nest_dir(home: &Path) -> DynResult<PathBuf> {
+///
+/// `override_` lets a single invocation operate on a non-active nest (the
+/// global `--nest` flag); pass `None` for the persisted active selection.
+fn active_nest_dir(home: &Path, override_: Option<&str>) -> DynResult<PathBuf> {
+    let nests = open_nest_index(home)?;
+    let nest = match override_ {
+        Some(reference) => nests.resolve(reference)?,
+        None => nests.active(),
+    };
+    Ok(nests.nest_dir(&nest.id))
+}
+
+fn cmd_nest(home: &Path, command: NestCommand) -> DynResult<()> {
+    match command {
+        NestCommand::List => cmd_nest_list(home),
+        NestCommand::Current => cmd_nest_current(home),
+        NestCommand::Create { name } => cmd_nest_create(home, &name),
+        NestCommand::Use { reference } => cmd_nest_use(home, &reference),
+    }
+}
+
+fn cmd_nest_list(home: &Path) -> DynResult<()> {
+    let nests = open_nest_index(home)?;
+    let active = nests.active().id;
+    println!("{:<10} {:<20} {:<12} ACTIVE", "ID", "NAME", "CREATED");
+    for nest in nests.list() {
+        let marker = if nest.id == active { "*" } else { "" };
+        println!(
+            "{:<10} {:<20} {:<12} {marker}",
+            nest.id.short(),
+            truncate(&nest.name, 20),
+            format_short_date(nest.created_at),
+        );
+    }
+    Ok(())
+}
+
+fn cmd_nest_current(home: &Path) -> DynResult<()> {
+    let nests = open_nest_index(home)?;
+    let active = nests.active();
+    println!("{}  {}", active.name, active.id);
+    Ok(())
+}
+
+fn cmd_nest_create(home: &Path, name: &str) -> DynResult<()> {
     let identity = Identity::load_or_create(home)?;
     let device_id = identity.node_id().short();
-    let nests = NestIndex::ensure_default(home, &device_id)?;
-    Ok(nests.nest_dir(&nests.active().id))
+    let mut nests = NestIndex::ensure_default(home, &device_id)?;
+    let created = nests.create(name, &device_id)?;
+    println!("created nest '{}' ({})", created.name, created.id.short());
+    Ok(())
+}
+
+fn cmd_nest_use(home: &Path, reference: &str) -> DynResult<()> {
+    let identity = Identity::load_or_create(home)?;
+    let device_id = identity.node_id().short();
+    let mut nests = NestIndex::ensure_default(home, &device_id)?;
+    let now_active = nests.set_active(reference)?;
+    println!(
+        "active nest: {} ({})",
+        now_active.name,
+        now_active.id.short()
+    );
+    Ok(())
 }
 
 struct PutArgs<'a> {
@@ -5702,7 +5824,7 @@ mod tests {
     #[test]
     fn active_nest_dir_initialises_fresh_home() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let nest_dir = active_nest_dir(tmp.path()).unwrap();
+        let nest_dir = active_nest_dir(tmp.path(), None).unwrap();
 
         // Lives under <home>/nests/<id>
         assert!(
@@ -5728,6 +5850,58 @@ mod tests {
     }
 
     #[test]
+    fn nest_override_resolves_non_active_nest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a second nest "work" on top of the auto-created "personal".
+        cmd_nest_create(tmp.path(), "work").unwrap();
+        let personal_dir = active_nest_dir(tmp.path(), None).unwrap();
+        let work_dir = active_nest_dir(tmp.path(), Some("work")).unwrap();
+        assert_ne!(personal_dir, work_dir);
+        assert!(work_dir.to_string_lossy().contains("/nests/"));
+
+        // Override does not switch the persisted active nest.
+        let still_personal = active_nest_dir(tmp.path(), None).unwrap();
+        assert_eq!(personal_dir, still_personal);
+    }
+
+    #[test]
+    fn nest_use_switches_active_persistently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        cmd_nest_create(tmp.path(), "work").unwrap();
+        cmd_nest_use(tmp.path(), "work").unwrap();
+        // After `use`, the default (no-override) active nest dir matches the
+        // dir we get when explicitly requesting "work".
+        let active = active_nest_dir(tmp.path(), None).unwrap();
+        let work = active_nest_dir(tmp.path(), Some("work")).unwrap();
+        assert_eq!(active, work);
+    }
+
+    #[test]
+    fn nest_create_rejects_duplicate_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The auto-created "personal" already exists; recreating must error.
+        let err = cmd_nest_create(tmp.path(), "personal").unwrap_err();
+        assert!(err.to_string().contains("already in use"));
+    }
+
+    #[test]
+    fn nest_create_rejects_invalid_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(cmd_nest_create(tmp.path(), "").is_err());
+        assert!(cmd_nest_create(tmp.path(), "bad/name").is_err());
+        assert!(cmd_nest_create(tmp.path(), &"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn nest_use_reports_unknown_reference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Trigger the migration / creation first by calling list.
+        cmd_nest_list(tmp.path()).unwrap();
+        let err = cmd_nest_use(tmp.path(), "does-not-exist").unwrap_err();
+        assert!(err.to_string().contains("no nest matches"));
+    }
+
+    #[test]
     fn active_nest_dir_migrates_legacy_home() {
         // Hand-construct a legacy <home>/{catalog,pins,chunks,manifests}
         // with marker files, then verify they all move under the new active
@@ -5738,7 +5912,7 @@ mod tests {
             fs::write(tmp.path().join(sub).join("marker"), b"legacy-marker").unwrap();
         }
 
-        let nest_dir = active_nest_dir(tmp.path()).unwrap();
+        let nest_dir = active_nest_dir(tmp.path(), None).unwrap();
 
         for sub in ["catalog", "pins", "chunks", "manifests"] {
             assert!(
@@ -5752,7 +5926,7 @@ mod tests {
         assert!(tmp.path().join("nests.json").exists());
 
         // Second call is a no-op and returns the same nest dir.
-        let again = active_nest_dir(tmp.path()).unwrap();
+        let again = active_nest_dir(tmp.path(), None).unwrap();
         assert_eq!(nest_dir, again);
     }
 }
