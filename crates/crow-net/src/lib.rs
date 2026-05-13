@@ -32,6 +32,13 @@ pub const TOKEN_FILE: &str = "cluster-token";
 pub const PROTOCOL_VERSION: u16 = 2;
 const ALPN: &[u8] = b"crow-1";
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+/// Maximum number of in-flight `handle_stream` tasks per connection.
+/// Excess streams wait for a permit before being processed, bounding
+/// the memory and Mutex contention a single peer can induce. 128 is
+/// generous enough that the parallel-shard-fetch path never blocks
+/// itself (default 3-of-5 erasure × ≤16 stripes ≈ 80 concurrent
+/// requests) but small enough to make resource exhaustion infeasible.
+const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 128;
 /// Domain tag for the nest-auth challenge signed by clients during the
 /// handshake. Bumping it invalidates every in-flight handshake — only
 /// change with a coordinated version bump.
@@ -429,10 +436,23 @@ async fn accept_loop(endpoint: Endpoint, ctx: ServerCtx) -> Result<()> {
         tokio::spawn(async move {
             if let Ok(connection) = incoming.await {
                 let conn_state = Arc::new(tokio::sync::RwLock::new(AuthStage::default()));
+                // Cap concurrent stream-handler tasks per connection so a
+                // misbehaving peer can't open unbounded streams and exhaust
+                // memory or queue behind the per-connection lock. Excess
+                // streams wait on a permit; legitimate parallel-fetch
+                // batches fit comfortably under the cap.
+                let stream_permits = Arc::new(tokio::sync::Semaphore::new(
+                    MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+                ));
                 while let Ok((send, recv)) = connection.accept_bi().await {
+                    let permit = match stream_permits.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break, // semaphore closed → connection shutting down
+                    };
                     let ctx = ctx.clone();
                     let conn_state = conn_state.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let _ = handle_stream(ctx, conn_state, send, recv).await;
                     });
                 }
