@@ -388,14 +388,25 @@ struct ServerCtx {
     nest_serving: Option<NestServingConfig>,
 }
 
-/// Per-connection state. One `Arc<Mutex<ConnState>>` is created in the
+/// Per-connection state. One `Arc<Mutex<AuthStage>>` is created in the
 /// connection-handler task and cloned into every spawned stream task on
 /// that connection, so the handshake completed on stream 1 is visible to
 /// requests on stream 2+.
+///
+/// The three stages are mutually exclusive: `Idle` before any handshake,
+/// `Pending` after `NestHello` (carries the challenge issued to the
+/// client), and `Confirmed` once the client's signed response has
+/// verified and the signer is a recognised member of the nest.
 #[derive(Default)]
-struct ConnState {
-    pending: Option<PendingNestAuth>,
-    auth: Option<ConfirmedNestAuth>,
+enum AuthStage {
+    #[default]
+    Idle,
+    // Boxed because `PendingNestAuth` contains an optional CatalogEvent
+    // (membership proof), and only one connection in many is in the
+    // Pending stage at any moment — the heap allocation lives only for
+    // the handshake round-trip.
+    Pending(Box<PendingNestAuth>),
+    Confirmed(ConfirmedNestAuth),
 }
 
 struct PendingNestAuth {
@@ -417,7 +428,7 @@ async fn accept_loop(endpoint: Endpoint, ctx: ServerCtx) -> Result<()> {
         let ctx = ctx.clone();
         tokio::spawn(async move {
             if let Ok(connection) = incoming.await {
-                let conn_state = Arc::new(tokio::sync::Mutex::new(ConnState::default()));
+                let conn_state = Arc::new(tokio::sync::Mutex::new(AuthStage::default()));
                 while let Ok((send, recv)) = connection.accept_bi().await {
                     let ctx = ctx.clone();
                     let conn_state = conn_state.clone();
@@ -682,7 +693,7 @@ impl Client {
 
 async fn handle_stream(
     ctx: ServerCtx,
-    conn_state: Arc<tokio::sync::Mutex<ConnState>>,
+    conn_state: Arc<tokio::sync::Mutex<AuthStage>>,
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
@@ -699,7 +710,7 @@ async fn handle_stream(
 
 async fn handle_request(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<ConnState>>,
+    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
     request: Request,
 ) -> Response {
     if request_version(&request) != PROTOCOL_VERSION {
@@ -775,7 +786,7 @@ async fn handle_request(
 
 async fn handle_nest_hello(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<ConnState>>,
+    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
     nest_id: NestId,
     signer: NodeId,
     membership_proof: Option<CatalogEvent>,
@@ -788,31 +799,33 @@ async fn handle_nest_hello(
     }
     let mut challenge = [0u8; 32];
     OsRng.fill_bytes(&mut challenge);
-    let mut state = conn_state.lock().await;
-    state.pending = Some(PendingNestAuth {
+    // A new handshake on the same connection invalidates any prior
+    // auth — a peer rotating identity must complete the new handshake
+    // before issuing further nest requests. Replacing the enum
+    // unconditionally guarantees that.
+    *conn_state.lock().await = AuthStage::Pending(Box::new(PendingNestAuth {
         nest_id,
         signer,
         membership_proof,
         challenge,
-    });
-    // A new handshake on the same connection invalidates any prior
-    // auth — a peer rotating identity must complete the new handshake
-    // before issuing further nest requests.
-    state.auth = None;
+    }));
     Response::NestChallenge { challenge }
 }
 
 async fn handle_nest_auth_response(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<ConnState>>,
+    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
     signature: Signature,
 ) -> Response {
     let pending = {
         let mut state = conn_state.lock().await;
-        // Single-use: consume the pending challenge regardless of outcome
-        // so a captured response can't be replayed against a fresh
-        // challenge on the same connection.
-        state.pending.take()
+        // Single-use: drain the pending stage regardless of outcome so a
+        // captured response can't be replayed against a fresh challenge
+        // on the same connection.
+        match std::mem::replace(&mut *state, AuthStage::Idle) {
+            AuthStage::Pending(p) => Some(p),
+            _ => None,
+        }
     };
     let Some(pending) = pending else {
         return Response::NestUnauthorised;
@@ -863,8 +876,7 @@ async fn handle_nest_auth_response(
         return Response::NestUnauthorised;
     }
 
-    let mut state = conn_state.lock().await;
-    state.auth = Some(ConfirmedNestAuth {
+    *conn_state.lock().await = AuthStage::Confirmed(ConfirmedNestAuth {
         nest_id: pending.nest_id,
         member: pending.signer,
     });
@@ -886,9 +898,12 @@ fn membership_proof_member(event: &CatalogEvent) -> Option<NodeId> {
 
 async fn require_nest_auth(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<ConnState>>,
+    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
 ) -> Option<ConfirmedNestAuth> {
-    let auth = conn_state.lock().await.auth.clone()?;
+    let auth = match &*conn_state.lock().await {
+        AuthStage::Confirmed(a) => a.clone(),
+        _ => return None,
+    };
     let nest_id = ctx.nest_serving.as_ref().map(|n| n.nest_id)?;
     if auth.nest_id != nest_id {
         return None;
@@ -1149,7 +1164,7 @@ mod tests {
         let token = ClusterToken::random();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ctx = server_ctx_with_catalog(store, catalog, token);
-        let conn_state = Arc::new(tokio::sync::Mutex::new(ConnState::default()));
+        let conn_state = Arc::new(tokio::sync::Mutex::new(AuthStage::default()));
 
         let response = rt.block_on(handle_request(
             &ctx,
@@ -1177,7 +1192,7 @@ mod tests {
         let token = ClusterToken::random();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ctx = server_ctx_with_catalog(store, catalog, token);
-        let conn_state = Arc::new(tokio::sync::Mutex::new(ConnState::default()));
+        let conn_state = Arc::new(tokio::sync::Mutex::new(AuthStage::default()));
 
         let response = rt.block_on(handle_request(
             &ctx,
