@@ -20,6 +20,12 @@ use crate::nest::NestId;
 const CATALOG_DIR: &str = "catalog";
 const EVENTS_FILE: &str = "events.jsonl";
 const DEVICE_ID_FILE: &str = "device-id";
+/// Sentinel file written next to `events.jsonl` once a founding-member
+/// event has been stamped, so subsequent `ensure_founding_member` calls
+/// can short-circuit the events.jsonl scan. Self-healing: a missing
+/// sentinel only triggers one re-scan; if a founding event is found,
+/// the sentinel is re-created.
+const FOUNDING_STAMP_FILE: &str = ".founding-stamped";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CatalogPath(String);
@@ -701,20 +707,25 @@ impl CatalogIndex {
         nest_id: &NestId,
         identity: &Identity,
     ) -> Result<Option<CatalogEvent>> {
+        let stamp_path = self.root.join(FOUNDING_STAMP_FILE);
+        if stamp_path.exists() {
+            return Ok(None);
+        }
         let has_any_founding = self
             .load_events()?
             .iter()
             .any(|event| matches!(event.op, CatalogOp::MemberAdded { .. }));
         if has_any_founding {
+            // Pre-existing founding event without a sentinel (e.g. nest
+            // created before this file existed, or sentinel deleted).
+            // Stamp it now so the next call short-circuits.
+            let _ = fs::write(&stamp_path, b"");
             return Ok(None);
         }
         let me = identity.node_id();
-        Ok(Some(self.append_member_added(
-            nest_id,
-            identity,
-            me,
-            NestRole::Owner,
-        )?))
+        let event = self.append_member_added(nest_id, identity, me, NestRole::Owner)?;
+        let _ = fs::write(&stamp_path, b"");
+        Ok(Some(event))
     }
 
     pub fn move_path(&self, from: &str, to: &str, identity: &Identity) -> Result<CatalogEvent> {
