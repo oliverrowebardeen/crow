@@ -238,6 +238,21 @@ pub struct CatalogView {
 }
 
 impl CatalogView {
+    fn empty() -> Self {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            CatalogPath::root(),
+            CatalogEntry {
+                path: CatalogPath::root(),
+                kind: EntryKind::Dir,
+            },
+        );
+        Self {
+            entries,
+            members: Vec::new(),
+        }
+    }
+
     pub fn get(&self, path: &CatalogPath) -> Option<&CatalogEntry> {
         self.entries.get(path)
     }
@@ -495,11 +510,17 @@ impl CatalogIndex {
         origin: EventOrigin,
         nest_id: Option<&NestId>,
     ) -> Result<usize> {
-        let mut replay_events = self.load_events()?;
+        let replay_events = self.load_events()?;
         let mut known: HashSet<String> = replay_events
             .iter()
             .map(|event| event.event_id.clone())
             .collect();
+        // Member set is the only piece of catalog state needed to validate
+        // remote membership ops. Build it once up front, then keep it
+        // running with `apply_op` instead of re-materializing the whole
+        // event log per incoming event — that was O(n²) on membership-heavy
+        // syncs.
+        let mut members = MemberSet::from_events(&replay_events);
         let mut added = 0usize;
         for event in events {
             validate_event(&event)?;
@@ -516,11 +537,11 @@ impl CatalogIndex {
                 }
             };
             if origin == EventOrigin::Remote {
-                validate_remote_membership_event(&event, signer, nest_id, &replay_events)?;
+                validate_remote_membership_event(&event, signer, nest_id, &members)?;
             }
             if known.insert(event.event_id.clone()) {
                 self.append_event(&event)?;
-                replay_events.push(event);
+                members.apply_op(&event.op);
                 added += 1;
             }
         }
@@ -804,11 +825,69 @@ fn validate_event(event: &CatalogEvent) -> Result<()> {
     Ok(())
 }
 
+/// Running member set used during a merge to validate remote membership
+/// ops in O(1) per event. Initial construction is O(n) via
+/// [`CatalogView::materialize`]; subsequent `apply_op` calls update the
+/// set in place.
+struct MemberSet {
+    records: Vec<MemberRecord>,
+    idx: BTreeMap<NodeId, usize>,
+}
+
+impl MemberSet {
+    fn from_events(events: &[CatalogEvent]) -> Self {
+        let view =
+            CatalogView::materialize(events.to_vec()).unwrap_or_else(|_| CatalogView::empty());
+        let records = view.members().to_vec();
+        let idx = records
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.member, i))
+            .collect();
+        Self { records, idx }
+    }
+
+    fn members(&self) -> &[MemberRecord] {
+        &self.records
+    }
+
+    fn apply_op(&mut self, op: &CatalogOp) {
+        match op {
+            CatalogOp::MemberAdded {
+                member,
+                granter,
+                role,
+                added_at,
+                ..
+            } => {
+                if let std::collections::btree_map::Entry::Vacant(e) = self.idx.entry(*member) {
+                    e.insert(self.records.len());
+                    self.records.push(MemberRecord {
+                        member: *member,
+                        granter: *granter,
+                        role: *role,
+                        added_at: *added_at,
+                        revoked_at: None,
+                    });
+                }
+            }
+            CatalogOp::MemberRevoked { member, revoked_at } => {
+                if let Some(&slot) = self.idx.get(member)
+                    && self.records[slot].revoked_at.is_none()
+                {
+                    self.records[slot].revoked_at = Some(*revoked_at);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn validate_remote_membership_event(
     event: &CatalogEvent,
     signer: NodeId,
     nest_id: Option<&NestId>,
-    accepted_events: &[CatalogEvent],
+    members: &MemberSet,
 ) -> Result<()> {
     match &event.op {
         CatalogOp::MemberAdded {
@@ -824,10 +903,9 @@ fn validate_remote_membership_event(
             }
             verify_member_added_signature(event, nest_id)?;
 
-            let view = CatalogView::materialize(accepted_events.to_vec())?;
             if granter == member {
-                validate_remote_self_grant(&view, member)
-            } else if view.members().iter().any(|m| {
+                validate_remote_self_grant(members, member)
+            } else if members.members().iter().any(|m| {
                 m.member == *granter && matches!(m.role, NestRole::Owner) && m.revoked_at.is_none()
             }) {
                 Ok(())
@@ -842,8 +920,7 @@ fn validate_remote_membership_event(
             let _ = nest_id.ok_or_else(|| {
                 Error::Catalog("remote MemberRevoked validation requires a nest id".into())
             })?;
-            let view = CatalogView::materialize(accepted_events.to_vec())?;
-            if view.members().iter().any(|m| {
+            if members.members().iter().any(|m| {
                 m.member == signer && matches!(m.role, NestRole::Owner) && m.revoked_at.is_none()
             }) {
                 Ok(())
@@ -858,11 +935,11 @@ fn validate_remote_membership_event(
     }
 }
 
-fn validate_remote_self_grant(view: &CatalogView, member: &NodeId) -> Result<()> {
-    let members = view.members();
-    let allowed = members.is_empty()
-        || members.iter().any(|m| m.member == *member)
-        || members.iter().any(|m| m.granter == *member);
+fn validate_remote_self_grant(members: &MemberSet, member: &NodeId) -> Result<()> {
+    let m = members.members();
+    let allowed = m.is_empty()
+        || m.iter().any(|r| r.member == *member)
+        || m.iter().any(|r| r.granter == *member);
     if allowed {
         Ok(())
     } else {
