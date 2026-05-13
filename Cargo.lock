@@ -404,6 +404,7 @@ dependencies = [
 name = "crow-cli"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "crow",
  "crow-net",

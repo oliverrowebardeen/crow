@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use crow::{
     Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
@@ -3380,7 +3381,15 @@ fn cmd_fetch(
     let (socket_addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
 
     let mut counters = FetchCounters::default();
-    let manifest_state = fetch_manifest_object(crow, &rt, &client, token, &cap, &mut counters)?;
+    let mut fetch_remote = |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
+    let manifest_state = fetch_object(
+        crow,
+        Namespace::Manifests,
+        *cap.manifest_hash.inner(),
+        &mut counters.fetched_bytes,
+        &mut fetch_remote,
+    )?;
+    counters.count_object(&manifest_state);
     if matches!(manifest_state, FetchState::Missing) {
         println!("manifest      missing");
         println!("shares        0 local / 0 fetched / 0 missing");
@@ -3394,15 +3403,37 @@ fn cmd_fetch(
     pins.add(cap.clone(), pin_name, pin_comment)?;
 
     let mut visited = HashSet::from([*cap.manifest_hash.inner()]);
-    fetch_manifest_dependencies(
-        crow,
-        &rt,
-        &client,
-        token,
-        &manifest_kind,
-        &mut counters,
-        &mut visited,
-    )?;
+    match &manifest_kind {
+        ManifestKind::File(manifest) => {
+            for hash in manifest
+                .stripes
+                .iter()
+                .flat_map(|s| s.data.iter().chain(s.parity.iter()))
+                .map(|h| *h.inner())
+            {
+                let state = fetch_object(
+                    crow,
+                    Namespace::Chunks,
+                    hash,
+                    &mut counters.fetched_bytes,
+                    &mut fetch_remote,
+                )?;
+                counters.count_object(&state);
+                counters.count_share(&state);
+            }
+        }
+        ManifestKind::Directory(manifest) => {
+            for child_cap in manifest.file_caps()? {
+                fetch_cap_recursive(
+                    crow,
+                    &child_cap,
+                    &mut counters,
+                    &mut visited,
+                    &mut fetch_remote,
+                )?;
+            }
+        }
+    }
 
     println!("manifest      {}", manifest_state.as_str());
     if let ManifestKind::Directory(directory) = &manifest_kind {
@@ -3485,7 +3516,9 @@ fn cmd_sync(
                 let remote_events = rt.block_on(client.nest_catalog_events())?;
                 let catalog_report =
                     sync_catalog_events_from_peer(catalog, &nest_id, remote_events)?;
-                let object_report = sync_catalog_objects_scoped(crow, &rt, &client, catalog)?;
+                let mut fetch_remote =
+                    |ns, hash| rt.block_on(client.nest_get(ns, hash)).map_err(Into::into);
+                let object_report = sync_catalog_objects(crow, catalog, &mut fetch_remote)?;
                 (addr, catalog_report, object_report)
             }
             None => {
@@ -3556,16 +3589,14 @@ struct SyncObjectReport {
 
 fn sync_catalog_objects(
     crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    token: ClusterToken,
     catalog: &CatalogIndex,
+    fetch_remote: ObjectFetcher<'_>,
 ) -> DynResult<SyncObjectReport> {
     let caps = catalog.view()?.file_caps();
     let mut counters = FetchCounters::default();
     let mut visited = HashSet::new();
     for cap in &caps {
-        fetch_cap_recursive(crow, rt, client, token, cap, &mut counters, &mut visited)?;
+        fetch_cap_recursive(crow, cap, &mut counters, &mut visited, fetch_remote)?;
     }
 
     let mut failed_caps = 0usize;
@@ -3597,7 +3628,8 @@ fn sync_legacy_cluster_token(
     let (addr, client) = connect_peer(rt, token, peer, socket_addrs)?;
     let remote_events = rt.block_on(client.catalog_events(token))?;
     let catalog_report = sync_catalog_events(catalog, remote_events)?;
-    let object_report = sync_catalog_objects(crow, rt, &client, token, catalog)?;
+    let mut fetch_remote = |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
+    let object_report = sync_catalog_objects(crow, catalog, &mut fetch_remote)?;
     Ok((addr, catalog_report, object_report))
 }
 
@@ -3888,34 +3920,6 @@ fn sync_catalog_events_from_peer(
     })
 }
 
-fn sync_catalog_objects_scoped(
-    crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    catalog: &CatalogIndex,
-) -> DynResult<SyncObjectReport> {
-    let caps = catalog.view()?.file_caps();
-    let mut counters = FetchCounters::default();
-    let mut visited = HashSet::new();
-    for cap in &caps {
-        fetch_cap_recursive_scoped(crow, rt, client, cap, &mut counters, &mut visited)?;
-    }
-    let mut failed_caps = 0usize;
-    for cap in &caps {
-        if verify_cap_reconstructable(crow, cap).is_err() {
-            failed_caps += 1;
-        }
-    }
-    Ok(SyncObjectReport {
-        catalog_files: caps.len(),
-        fetched: counters.fetched,
-        already_local: counters.already_local,
-        remote_missing: counters.remote_missing,
-        fetched_bytes: counters.fetched_bytes,
-        failed_caps,
-    })
-}
-
 fn cmd_token(home: &Path, command: TokenCommand) -> DynResult<()> {
     let tokens = TokenStore::open(home);
     match command {
@@ -3988,58 +3992,34 @@ impl FetchCounters {
     }
 }
 
-fn fetch_manifest_object(
+/// Closure-like alias for "fetch one (namespace, hash) → bytes". Lets
+/// the recursive walk be agnostic to the transport: the legacy path
+/// passes a closure that calls `client.get(token, …)`; the nest-scoped
+/// path passes one that calls `client.nest_get(…)`.
+type ObjectFetcher<'a> = &'a mut dyn FnMut(Namespace, Hash) -> DynResult<Option<Bytes>>;
+
+fn fetch_cap_recursive(
     crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    token: ClusterToken,
     cap: &Cap,
     counters: &mut FetchCounters,
-) -> DynResult<FetchState> {
-    let state = fetch_object(
+    visited: &mut HashSet<Hash>,
+    fetch_remote: ObjectFetcher<'_>,
+) -> DynResult<()> {
+    if !visited.insert(*cap.manifest_hash.inner()) {
+        return Ok(());
+    }
+    let manifest_state = fetch_object(
         crow,
-        rt,
-        client,
-        token,
         Namespace::Manifests,
         *cap.manifest_hash.inner(),
         &mut counters.fetched_bytes,
+        fetch_remote,
     )?;
-    counters.count_object(&state);
-    Ok(state)
-}
-
-fn fetch_share_object(
-    crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    token: ClusterToken,
-    hash: Hash,
-    counters: &mut FetchCounters,
-) -> DynResult<()> {
-    let state = fetch_object(
-        crow,
-        rt,
-        client,
-        token,
-        Namespace::Chunks,
-        hash,
-        &mut counters.fetched_bytes,
-    )?;
-    counters.count_object(&state);
-    counters.count_share(&state);
-    Ok(())
-}
-
-fn fetch_manifest_dependencies(
-    crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    token: ClusterToken,
-    kind: &ManifestKind,
-    counters: &mut FetchCounters,
-    visited: &mut HashSet<Hash>,
-) -> DynResult<()> {
+    counters.count_object(&manifest_state);
+    if matches!(manifest_state, FetchState::Missing) {
+        return Ok(());
+    }
+    let kind = crow.open_manifest_kind(cap)?;
     match kind {
         ManifestKind::File(manifest) => {
             for hash in manifest
@@ -4048,38 +4028,24 @@ fn fetch_manifest_dependencies(
                 .flat_map(|s| s.data.iter().chain(s.parity.iter()))
                 .map(|h| *h.inner())
             {
-                fetch_share_object(crow, rt, client, token, hash, counters)?;
+                let state = fetch_object(
+                    crow,
+                    Namespace::Chunks,
+                    hash,
+                    &mut counters.fetched_bytes,
+                    fetch_remote,
+                )?;
+                counters.count_object(&state);
+                counters.count_share(&state);
             }
         }
         ManifestKind::Directory(manifest) => {
             for child_cap in manifest.file_caps()? {
-                fetch_cap_recursive(crow, rt, client, token, &child_cap, counters, visited)?;
+                fetch_cap_recursive(crow, &child_cap, counters, visited, fetch_remote)?;
             }
         }
     }
     Ok(())
-}
-
-fn fetch_cap_recursive(
-    crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    token: ClusterToken,
-    cap: &Cap,
-    counters: &mut FetchCounters,
-    visited: &mut HashSet<Hash>,
-) -> DynResult<()> {
-    if !visited.insert(*cap.manifest_hash.inner()) {
-        return Ok(());
-    }
-    if matches!(
-        fetch_manifest_object(crow, rt, client, token, cap, counters)?,
-        FetchState::Missing
-    ) {
-        return Ok(());
-    }
-    let kind = crow.open_manifest_kind(cap)?;
-    fetch_manifest_dependencies(crow, rt, client, token, &kind, counters, visited)
 }
 
 fn verify_cap_reconstructable(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<()> {
@@ -4110,17 +4076,15 @@ fn verify_cap_reconstructable_inner(
 
 fn fetch_object(
     crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    token: ClusterToken,
     namespace: Namespace,
     hash: Hash,
     fetched_bytes: &mut u64,
+    fetch_remote: ObjectFetcher<'_>,
 ) -> DynResult<FetchState> {
     if crow.store().has(namespace, &hash)? {
         return Ok(FetchState::Local);
     }
-    match rt.block_on(client.get(token, namespace, hash))? {
+    match fetch_remote(namespace, hash)? {
         Some(bytes) => {
             *fetched_bytes += bytes.len() as u64;
             crow.store().put_unverified(namespace, hash, bytes)?;
@@ -4128,80 +4092,6 @@ fn fetch_object(
         }
         None => Ok(FetchState::Missing),
     }
-}
-
-fn fetch_object_scoped(
-    crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    namespace: Namespace,
-    hash: Hash,
-    fetched_bytes: &mut u64,
-) -> DynResult<FetchState> {
-    if crow.store().has(namespace, &hash)? {
-        return Ok(FetchState::Local);
-    }
-    match rt.block_on(client.nest_get(namespace, hash))? {
-        Some(bytes) => {
-            *fetched_bytes += bytes.len() as u64;
-            crow.store().put_unverified(namespace, hash, bytes)?;
-            Ok(FetchState::Fetched)
-        }
-        None => Ok(FetchState::Missing),
-    }
-}
-
-fn fetch_cap_recursive_scoped(
-    crow: &Crow<FsStore>,
-    rt: &tokio::runtime::Runtime,
-    client: &Client,
-    cap: &Cap,
-    counters: &mut FetchCounters,
-    visited: &mut HashSet<Hash>,
-) -> DynResult<()> {
-    if !visited.insert(*cap.manifest_hash.inner()) {
-        return Ok(());
-    }
-    let manifest_state = fetch_object_scoped(
-        crow,
-        rt,
-        client,
-        Namespace::Manifests,
-        *cap.manifest_hash.inner(),
-        &mut counters.fetched_bytes,
-    )?;
-    counters.count_object(&manifest_state);
-    if matches!(manifest_state, FetchState::Missing) {
-        return Ok(());
-    }
-    let kind = crow.open_manifest_kind(cap)?;
-    match kind {
-        ManifestKind::File(manifest) => {
-            for hash in manifest
-                .stripes
-                .iter()
-                .flat_map(|s| s.data.iter().chain(s.parity.iter()))
-                .map(|h| *h.inner())
-            {
-                let state = fetch_object_scoped(
-                    crow,
-                    rt,
-                    client,
-                    Namespace::Chunks,
-                    hash,
-                    &mut counters.fetched_bytes,
-                )?;
-                counters.count_object(&state);
-                counters.count_share(&state);
-            }
-        }
-        ManifestKind::Directory(manifest) => {
-            for child_cap in manifest.file_caps()? {
-                fetch_cap_recursive_scoped(crow, rt, client, &child_cap, counters, visited)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn load_token(home: &Path) -> DynResult<ClusterToken> {
@@ -5104,8 +4994,10 @@ mod tests {
         let events = rt.block_on(client.catalog_events(token)).unwrap();
         sync_catalog_events(&dest_catalog, events).unwrap();
 
-        let first = sync_catalog_objects(&dest_crow, &rt, &client, token, &dest_catalog).unwrap();
-        let second = sync_catalog_objects(&dest_crow, &rt, &client, token, &dest_catalog).unwrap();
+        let mut fetch_remote =
+            |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
+        let first = sync_catalog_objects(&dest_crow, &dest_catalog, &mut fetch_remote).unwrap();
+        let second = sync_catalog_objects(&dest_crow, &dest_catalog, &mut fetch_remote).unwrap();
 
         assert_eq!(first.catalog_files, 1);
         assert!(first.fetched > 0);
@@ -5146,7 +5038,9 @@ mod tests {
         let events = rt.block_on(client.catalog_events(token)).unwrap();
         sync_catalog_events(&dest_catalog, events).unwrap();
 
-        let report = sync_catalog_objects(&dest_crow, &rt, &client, token, &dest_catalog).unwrap();
+        let mut fetch_remote =
+            |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
+        let report = sync_catalog_objects(&dest_crow, &dest_catalog, &mut fetch_remote).unwrap();
 
         assert_eq!(report.catalog_files, 1);
         assert_eq!(report.remote_missing, 1);

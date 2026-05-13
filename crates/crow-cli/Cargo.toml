@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 crow = { path = "../crow" }
 crow-net = { path = "../crow-net" }
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
