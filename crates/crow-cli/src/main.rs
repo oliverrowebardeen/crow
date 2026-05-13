@@ -3381,8 +3381,11 @@ fn cmd_fetch(
     let (socket_addr, client) = connect_peer(&rt, token, peer, &socket_addrs)?;
 
     let mut counters = FetchCounters::default();
-    let mut fetch_remote = |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
-    let manifest_state = fetch_object(
+    let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
+        rt.block_on(client.get_many(token, reqs))
+            .map_err(Into::into)
+    };
+    let manifest_state = fetch_one(
         crow,
         Namespace::Manifests,
         *cap.manifest_hash.inner(),
@@ -3405,22 +3408,7 @@ fn cmd_fetch(
     let mut visited = HashSet::from([*cap.manifest_hash.inner()]);
     match &manifest_kind {
         ManifestKind::File(manifest) => {
-            for hash in manifest
-                .stripes
-                .iter()
-                .flat_map(|s| s.data.iter().chain(s.parity.iter()))
-                .map(|h| *h.inner())
-            {
-                let state = fetch_object(
-                    crow,
-                    Namespace::Chunks,
-                    hash,
-                    &mut counters.fetched_bytes,
-                    &mut fetch_remote,
-                )?;
-                counters.count_object(&state);
-                counters.count_share(&state);
-            }
+            fetch_stripes_parallel(crow, manifest, &mut counters, &mut fetch_remote)?;
         }
         ManifestKind::Directory(manifest) => {
             for child_cap in manifest.file_caps()? {
@@ -3516,8 +3504,9 @@ fn cmd_sync(
                 let remote_events = rt.block_on(client.nest_catalog_events())?;
                 let catalog_report =
                     sync_catalog_events_from_peer(catalog, &nest_id, remote_events)?;
-                let mut fetch_remote =
-                    |ns, hash| rt.block_on(client.nest_get(ns, hash)).map_err(Into::into);
+                let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
+                    rt.block_on(client.nest_get_many(reqs)).map_err(Into::into)
+                };
                 let object_report = sync_catalog_objects(crow, catalog, &mut fetch_remote)?;
                 (addr, catalog_report, object_report)
             }
@@ -3628,7 +3617,10 @@ fn sync_legacy_cluster_token(
     let (addr, client) = connect_peer(rt, token, peer, socket_addrs)?;
     let remote_events = rt.block_on(client.catalog_events(token))?;
     let catalog_report = sync_catalog_events(catalog, remote_events)?;
-    let mut fetch_remote = |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
+    let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
+        rt.block_on(client.get_many(token, reqs))
+            .map_err(Into::into)
+    };
     let object_report = sync_catalog_objects(crow, catalog, &mut fetch_remote)?;
     Ok((addr, catalog_report, object_report))
 }
@@ -3992,11 +3984,14 @@ impl FetchCounters {
     }
 }
 
-/// Closure-like alias for "fetch one (namespace, hash) → bytes". Lets
-/// the recursive walk be agnostic to the transport: the legacy path
-/// passes a closure that calls `client.get(token, …)`; the nest-scoped
-/// path passes one that calls `client.nest_get(…)`.
-type ObjectFetcher<'a> = &'a mut dyn FnMut(Namespace, Hash) -> DynResult<Option<Bytes>>;
+/// Closure-like alias for "fetch a batch of (namespace, hash) → bytes
+/// concurrently." The single-object case is a one-element slice.
+///
+/// Lets the recursive walker be agnostic to transport: the legacy path
+/// wraps `client.get_many(token, …)`; the nest-scoped path wraps
+/// `client.nest_get_many(…)`. Both implementations pipeline the
+/// per-element requests onto separate QUIC streams.
+type ObjectFetcher<'a> = &'a mut dyn FnMut(&[(Namespace, Hash)]) -> DynResult<Vec<Option<Bytes>>>;
 
 fn fetch_cap_recursive(
     crow: &Crow<FsStore>,
@@ -4008,7 +4003,7 @@ fn fetch_cap_recursive(
     if !visited.insert(*cap.manifest_hash.inner()) {
         return Ok(());
     }
-    let manifest_state = fetch_object(
+    let manifest_state = fetch_one(
         crow,
         Namespace::Manifests,
         *cap.manifest_hash.inner(),
@@ -4022,26 +4017,61 @@ fn fetch_cap_recursive(
     let kind = crow.open_manifest_kind(cap)?;
     match kind {
         ManifestKind::File(manifest) => {
-            for hash in manifest
-                .stripes
-                .iter()
-                .flat_map(|s| s.data.iter().chain(s.parity.iter()))
-                .map(|h| *h.inner())
-            {
-                let state = fetch_object(
-                    crow,
-                    Namespace::Chunks,
-                    hash,
-                    &mut counters.fetched_bytes,
-                    fetch_remote,
-                )?;
-                counters.count_object(&state);
-                counters.count_share(&state);
-            }
+            fetch_stripes_parallel(crow, &manifest, counters, fetch_remote)?;
         }
         ManifestKind::Directory(manifest) => {
             for child_cap in manifest.file_caps()? {
                 fetch_cap_recursive(crow, &child_cap, counters, visited, fetch_remote)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fetch every share of a file manifest, batching missing shares across
+/// all stripes into one parallel batch. Shares already present locally
+/// are accounted but not re-fetched. The batch hits the transport's
+/// `*_get_many` path so the QUIC streams pipeline concurrently.
+fn fetch_stripes_parallel(
+    crow: &Crow<FsStore>,
+    manifest: &Manifest,
+    counters: &mut FetchCounters,
+    fetch_remote: ObjectFetcher<'_>,
+) -> DynResult<()> {
+    let all_shares: Vec<Hash> = manifest
+        .stripes
+        .iter()
+        .flat_map(|s| s.data.iter().chain(s.parity.iter()))
+        .map(|h| *h.inner())
+        .collect();
+    let mut missing_idx = Vec::new();
+    let mut missing_reqs: Vec<(Namespace, Hash)> = Vec::new();
+    for (i, hash) in all_shares.iter().enumerate() {
+        if crow.store().has(Namespace::Chunks, hash)? {
+            counters.count_object(&FetchState::Local);
+            counters.count_share(&FetchState::Local);
+        } else {
+            missing_idx.push(i);
+            missing_reqs.push((Namespace::Chunks, *hash));
+        }
+    }
+    if missing_reqs.is_empty() {
+        return Ok(());
+    }
+    let fetched = fetch_remote(&missing_reqs)?;
+    for (slot, bytes_opt) in missing_idx.into_iter().zip(fetched) {
+        let hash = all_shares[slot];
+        match bytes_opt {
+            Some(bytes) => {
+                counters.fetched_bytes += bytes.len() as u64;
+                crow.store()
+                    .put_unverified(Namespace::Chunks, hash, bytes)?;
+                counters.count_object(&FetchState::Fetched);
+                counters.count_share(&FetchState::Fetched);
+            }
+            None => {
+                counters.count_object(&FetchState::Missing);
+                counters.count_share(&FetchState::Missing);
             }
         }
     }
@@ -4074,7 +4104,7 @@ fn verify_cap_reconstructable_inner(
     Ok(())
 }
 
-fn fetch_object(
+fn fetch_one(
     crow: &Crow<FsStore>,
     namespace: Namespace,
     hash: Hash,
@@ -4084,7 +4114,8 @@ fn fetch_object(
     if crow.store().has(namespace, &hash)? {
         return Ok(FetchState::Local);
     }
-    match fetch_remote(namespace, hash)? {
+    let mut results = fetch_remote(&[(namespace, hash)])?;
+    match results.pop().flatten() {
         Some(bytes) => {
             *fetched_bytes += bytes.len() as u64;
             crow.store().put_unverified(namespace, hash, bytes)?;
@@ -5021,8 +5052,10 @@ mod tests {
         let events = rt.block_on(client.catalog_events(token)).unwrap();
         sync_catalog_events(&dest_catalog, events).unwrap();
 
-        let mut fetch_remote =
-            |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
+        let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
+            rt.block_on(client.get_many(token, reqs))
+                .map_err(Into::into)
+        };
         let first = sync_catalog_objects(&dest_crow, &dest_catalog, &mut fetch_remote).unwrap();
         let second = sync_catalog_objects(&dest_crow, &dest_catalog, &mut fetch_remote).unwrap();
 
@@ -5065,8 +5098,10 @@ mod tests {
         let events = rt.block_on(client.catalog_events(token)).unwrap();
         sync_catalog_events(&dest_catalog, events).unwrap();
 
-        let mut fetch_remote =
-            |ns, hash| rt.block_on(client.get(token, ns, hash)).map_err(Into::into);
+        let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
+            rt.block_on(client.get_many(token, reqs))
+                .map_err(Into::into)
+        };
         let report = sync_catalog_objects(&dest_crow, &dest_catalog, &mut fetch_remote).unwrap();
 
         assert_eq!(report.catalog_files, 1);

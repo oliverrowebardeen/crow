@@ -428,7 +428,7 @@ async fn accept_loop(endpoint: Endpoint, ctx: ServerCtx) -> Result<()> {
         let ctx = ctx.clone();
         tokio::spawn(async move {
             if let Ok(connection) = incoming.await {
-                let conn_state = Arc::new(tokio::sync::Mutex::new(AuthStage::default()));
+                let conn_state = Arc::new(tokio::sync::RwLock::new(AuthStage::default()));
                 while let Ok((send, recv)) = connection.accept_bi().await {
                     let ctx = ctx.clone();
                     let conn_state = conn_state.clone();
@@ -577,6 +577,31 @@ impl Client {
         }
     }
 
+    /// Fetch many objects concurrently over independent QUIC bi-streams
+    /// on this connection. Each request gets its own stream, so they
+    /// pipeline without serializing through `request_id`-style head-of-line
+    /// blocking. Returns results in the order they were requested.
+    pub async fn nest_get_many(
+        &self,
+        requests: &[(Namespace, Hash)],
+    ) -> Result<Vec<Option<Bytes>>> {
+        let futs = requests.iter().map(|(ns, hash)| self.nest_get(*ns, *hash));
+        futures::future::try_join_all(futs).await
+    }
+
+    /// Like [`Client::nest_get_many`] but for the legacy cluster-token
+    /// transport.
+    pub async fn get_many(
+        &self,
+        token: ClusterToken,
+        requests: &[(Namespace, Hash)],
+    ) -> Result<Vec<Option<Bytes>>> {
+        let futs = requests
+            .iter()
+            .map(|(ns, hash)| self.get(token, *ns, *hash));
+        futures::future::try_join_all(futs).await
+    }
+
     pub async fn nest_catalog_events(&self) -> Result<Vec<CatalogEvent>> {
         match self
             .request(Request::NestCatalogEvents {
@@ -693,7 +718,7 @@ impl Client {
 
 async fn handle_stream(
     ctx: ServerCtx,
-    conn_state: Arc<tokio::sync::Mutex<AuthStage>>,
+    conn_state: Arc<tokio::sync::RwLock<AuthStage>>,
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
@@ -710,7 +735,7 @@ async fn handle_stream(
 
 async fn handle_request(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
+    conn_state: &Arc<tokio::sync::RwLock<AuthStage>>,
     request: Request,
 ) -> Response {
     if request_version(&request) != PROTOCOL_VERSION {
@@ -786,7 +811,7 @@ async fn handle_request(
 
 async fn handle_nest_hello(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
+    conn_state: &Arc<tokio::sync::RwLock<AuthStage>>,
     nest_id: NestId,
     signer: NodeId,
     membership_proof: Option<CatalogEvent>,
@@ -803,7 +828,7 @@ async fn handle_nest_hello(
     // auth — a peer rotating identity must complete the new handshake
     // before issuing further nest requests. Replacing the enum
     // unconditionally guarantees that.
-    *conn_state.lock().await = AuthStage::Pending(Box::new(PendingNestAuth {
+    *conn_state.write().await = AuthStage::Pending(Box::new(PendingNestAuth {
         nest_id,
         signer,
         membership_proof,
@@ -814,11 +839,11 @@ async fn handle_nest_hello(
 
 async fn handle_nest_auth_response(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
+    conn_state: &Arc<tokio::sync::RwLock<AuthStage>>,
     signature: Signature,
 ) -> Response {
     let pending = {
-        let mut state = conn_state.lock().await;
+        let mut state = conn_state.write().await;
         // Single-use: drain the pending stage regardless of outcome so a
         // captured response can't be replayed against a fresh challenge
         // on the same connection.
@@ -876,7 +901,7 @@ async fn handle_nest_auth_response(
         return Response::NestUnauthorised;
     }
 
-    *conn_state.lock().await = AuthStage::Confirmed(ConfirmedNestAuth {
+    *conn_state.write().await = AuthStage::Confirmed(ConfirmedNestAuth {
         nest_id: pending.nest_id,
         member: pending.signer,
     });
@@ -898,9 +923,9 @@ fn membership_proof_member(event: &CatalogEvent) -> Option<NodeId> {
 
 async fn require_nest_auth(
     ctx: &ServerCtx,
-    conn_state: &Arc<tokio::sync::Mutex<AuthStage>>,
+    conn_state: &Arc<tokio::sync::RwLock<AuthStage>>,
 ) -> Option<ConfirmedNestAuth> {
-    let auth = match &*conn_state.lock().await {
+    let auth = match &*conn_state.read().await {
         AuthStage::Confirmed(a) => a.clone(),
         _ => return None,
     };
@@ -1164,7 +1189,7 @@ mod tests {
         let token = ClusterToken::random();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ctx = server_ctx_with_catalog(store, catalog, token);
-        let conn_state = Arc::new(tokio::sync::Mutex::new(AuthStage::default()));
+        let conn_state = Arc::new(tokio::sync::RwLock::new(AuthStage::default()));
 
         let response = rt.block_on(handle_request(
             &ctx,
@@ -1192,7 +1217,7 @@ mod tests {
         let token = ClusterToken::random();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ctx = server_ctx_with_catalog(store, catalog, token);
-        let conn_state = Arc::new(tokio::sync::Mutex::new(AuthStage::default()));
+        let conn_state = Arc::new(tokio::sync::RwLock::new(AuthStage::default()));
 
         let response = rt.block_on(handle_request(
             &ctx,
