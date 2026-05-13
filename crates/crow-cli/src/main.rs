@@ -4777,6 +4777,33 @@ mod tests {
         Identity::load_or_create(dir).unwrap()
     }
 
+    /// Build the standard tmpdir + identity + catalog scaffold most tests
+    /// open. Tests that also need `pins` / `crow` construct those inline.
+    /// Keeps the tmpdir handle returned so callers retain ownership.
+    fn cat_env() -> (tempfile::TempDir, Identity, CatalogIndex) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let identity = Identity::load_or_create(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        (tmp, identity, catalog)
+    }
+
+    /// Like [`cat_env`] but additionally opens `PinIndex` and `Crow<FsStore>`
+    /// for tests that exercise the full local store surface.
+    fn full_env() -> (
+        tempfile::TempDir,
+        Identity,
+        PinIndex,
+        CatalogIndex,
+        Crow<FsStore>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let identity = Identity::load_or_create(tmp.path()).unwrap();
+        let pins = PinIndex::open(tmp.path()).unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        (tmp, identity, pins, catalog, crow)
+    }
+
     #[test]
     fn fetch_without_name_preserves_existing_pin_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5201,9 +5228,7 @@ mod tests {
 
     #[test]
     fn tree_renders_nested_catalog() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let (_tmp, identity, catalog) = cat_env();
         catalog.mkdir("/docs/projects", true, &identity).unwrap();
         catalog.mkdir("/photos", false, &identity).unwrap();
         catalog
@@ -5241,9 +5266,7 @@ mod tests {
 
     #[test]
     fn tree_can_start_at_file_or_directory() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let (_tmp, identity, catalog) = cat_env();
         catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
             .put_file(
@@ -5279,9 +5302,7 @@ mod tests {
 
     #[test]
     fn find_matches_catalog_basenames() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let (_tmp, identity, catalog) = cat_env();
         catalog.mkdir("/docs/projects", true, &identity).unwrap();
         catalog
             .put_file(
@@ -5318,9 +5339,7 @@ mod tests {
 
     #[test]
     fn find_matches_question_mark_and_directories() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let (_tmp, identity, catalog) = cat_env();
         catalog.mkdir("/docs", false, &identity).unwrap();
         catalog.mkdir("/dogs", false, &identity).unwrap();
         catalog.mkdir("/docks", false, &identity).unwrap();
@@ -5371,11 +5390,7 @@ mod tests {
 
     #[test]
     fn grep_searches_single_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"alpha\nTODO one\nbeta\n");
         catalog
             .put_file("/notes.txt", cap, Some("notes.txt".into()), &identity)
@@ -5398,11 +5413,7 @@ mod tests {
 
     #[test]
     fn grep_recurses_catalog_directory() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let a = stored_cap(&crow, b"TODO root\n");
         let b = stored_cap(&crow, b"skip\nTODO nested\n");
         catalog.mkdir("/docs/nested", true, &identity).unwrap();
@@ -5432,11 +5443,7 @@ mod tests {
 
     #[test]
     fn grep_no_matches_success() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"nothing here\n");
         catalog
             .put_file("/notes.txt", cap, Some("notes.txt".into()), &identity)
@@ -5462,11 +5469,7 @@ mod tests {
 
     #[test]
     fn grep_reports_missing_files() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         catalog
             .put_file(
                 "/missing.txt",
@@ -5485,10 +5488,7 @@ mod tests {
 
     #[test]
     fn du_sums_logical_size_but_deduplicates_stored_objects() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, _pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"shared");
         catalog.mkdir("/docs/nested", true, &identity).unwrap();
         catalog
@@ -5512,10 +5512,7 @@ mod tests {
 
     #[test]
     fn du_reports_file_targets_and_missing_manifests() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, _pins, catalog, crow) = full_env();
         let missing = cap_with_hash_byte(0x48);
         catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
@@ -5560,11 +5557,7 @@ mod tests {
 
     #[test]
     fn cat_reads_catalog_path_and_full_cap() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"hello from cat\n");
         catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
@@ -5605,11 +5598,7 @@ mod tests {
 
     #[test]
     fn cat_rejects_directories() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         catalog.mkdir("/docs", false, &identity).unwrap();
 
         let err = cat_bytes(&crow, &pins, &catalog, "/docs").unwrap_err();
@@ -5772,11 +5761,7 @@ mod tests {
 
     #[test]
     fn receive_catalogs_file_to_explicit_path_and_creates_parents() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"received");
 
         let report = catalog_received_cap(
@@ -5813,11 +5798,7 @@ mod tests {
 
     #[test]
     fn receive_catalogs_file_into_directory_from_pin_name() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"received");
         pins.add(cap.clone(), Some("report.txt".into()), None)
             .unwrap();
@@ -5836,11 +5817,7 @@ mod tests {
 
     #[test]
     fn receive_rejects_directory_destination_without_name_and_overwrites() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"received");
         catalog.mkdir("/inbox", false, &identity).unwrap();
         catalog
@@ -5872,11 +5849,7 @@ mod tests {
 
     #[test]
     fn receive_rejects_bad_inferred_file_name() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"received");
         pins.add(cap.clone(), Some("bad/name.txt".into()), None)
             .unwrap();
@@ -6083,11 +6056,7 @@ mod tests {
 
     #[test]
     fn stat_catalog_file_includes_cap_pin_and_mime() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"stat bytes");
         pins.add(cap.clone(), Some("note.txt".into()), None)
             .unwrap();
@@ -6113,11 +6082,7 @@ mod tests {
 
     #[test]
     fn stat_catalog_dir_summarizes_subtree() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let a = stored_cap(&crow, b"abc");
         let b = stored_cap(&crow, b"de");
         catalog.mkdir("/docs/nested", true, &identity).unwrap();
@@ -6156,11 +6121,7 @@ mod tests {
 
     #[test]
     fn unpin_catalog_file_detaches_without_deleting_chunks() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"keep bytes");
         catalog
             .put_file("/note.txt", cap.clone(), Some("note.txt".into()), &identity)
@@ -6257,11 +6218,7 @@ mod tests {
 
     #[test]
     fn cap_dir_creates_pinned_directory_snapshot() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let identity = test_identity(tmp.path());
-        let pins = PinIndex::open(tmp.path()).unwrap();
-        let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let (_tmp, identity, pins, catalog, crow) = full_env();
         let child = stored_cap(&crow, b"snapshot bytes");
         catalog.mkdir("/docs/empty", true, &identity).unwrap();
         catalog
