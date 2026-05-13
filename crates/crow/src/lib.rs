@@ -28,7 +28,9 @@ pub mod fs_store;
 pub mod gc;
 pub mod hash;
 pub mod identity;
+pub mod invite;
 pub mod manifest;
+pub mod member;
 pub mod nest;
 pub mod pin;
 pub mod pipeline;
@@ -36,6 +38,7 @@ pub mod pipeline;
 pub use cap::{CAP_HRP, CAP_VERSION, Cap, Permission};
 pub use catalog::{
     CatalogEntry, CatalogEvent, CatalogIndex, CatalogOp, CatalogPath, CatalogView, EntryKind,
+    verify_member_added_signature,
 };
 pub use chunk::{ChunkStore, MemStore, Namespace};
 pub use crypto::{FileKey, ManifestKey};
@@ -52,10 +55,12 @@ pub use gc::{
 };
 pub use hash::{ChunkHash, Hash, ManifestHash};
 pub use identity::{Identity, NodeId};
+pub use invite::{INVITE_HRP, INVITE_VERSION, Invite};
 pub use manifest::{
     Aead, Algorithm, ErasureCode, Kdf, MANIFEST_VERSION, Manifest, Signature, SignatureStatus,
     Stripe,
 };
+pub use member::{MemberRecord, NestRole, member_grant_canonical_bytes};
 pub use nest::{Nest, NestId, NestIndex};
 pub use pin::{PinIndex, PinRecord};
 pub use pipeline::{Crow, ManifestKind};

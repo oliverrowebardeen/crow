@@ -8,12 +8,24 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
+use ed25519_dalek::{Signature as Ed25519Signature, Signer, Verifier, VerifyingKey};
+
 use crate::cap::Cap;
 use crate::error::{Error, Result};
+use crate::identity::{Identity, NodeId};
+use crate::manifest::Signature;
+use crate::member::{MemberRecord, NestRole, member_grant_canonical_bytes};
+use crate::nest::NestId;
 
 const CATALOG_DIR: &str = "catalog";
 const EVENTS_FILE: &str = "events.jsonl";
 const DEVICE_ID_FILE: &str = "device-id";
+/// Sentinel file written next to `events.jsonl` once a founding-member
+/// event has been stamped, so subsequent `ensure_founding_member` calls
+/// can short-circuit the events.jsonl scan. Self-healing: a missing
+/// sentinel only triggers one re-scan; if a founding event is found,
+/// the sentinel is re-created.
+const FOUNDING_STAMP_FILE: &str = ".founding-stamped";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CatalogPath(String);
@@ -98,6 +110,68 @@ pub struct CatalogEvent {
     pub seq: u64,
     pub created_at: u64,
     pub op: CatalogOp,
+    /// Ed25519 public key of the device that produced this event. `None`
+    /// for legacy unsigned events — accepted on local replay, rejected
+    /// when arriving from a peer.
+    #[serde(default)]
+    pub signer: Option<NodeId>,
+    /// Ed25519 signature over the canonical postcard encoding of this
+    /// event with `signature` zeroed. Verified against `signer`.
+    #[serde(default)]
+    pub signature: Option<Signature>,
+}
+
+/// Whether an event arrived from our own log or from a peer. Unsigned
+/// events are tolerated on `Local` replay (for legacy on-disk events) but
+/// rejected on `Remote` merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventOrigin {
+    Local,
+    Remote,
+}
+
+impl CatalogEvent {
+    /// Sign with `identity`. The signing payload is this event's postcard
+    /// encoding with the `signature` field zeroed; the verifier
+    /// reconstructs the same bytes.
+    pub fn sign(&mut self, identity: &Identity) -> Result<()> {
+        let signer = identity.node_id();
+        self.signer = Some(signer);
+        self.signature = None;
+        let payload = self.signing_payload(signer)?;
+        let signature: Ed25519Signature = identity.signing.sign(&payload);
+        self.signature = Some(Signature(signature.to_bytes()));
+        Ok(())
+    }
+
+    /// Verify the event's signature, if any. Returns `Ok(Some(signer))` for a
+    /// signed-and-valid event, `Ok(None)` for an unsigned legacy event, and
+    /// an error for tampered or malformed events.
+    pub fn verify(&self) -> Result<Option<NodeId>> {
+        match (self.signer, self.signature) {
+            (None, None) => Ok(None),
+            (Some(signer), Some(signature)) => {
+                let payload = self.signing_payload(signer)?;
+                let verifying_key = VerifyingKey::from_bytes(signer.as_bytes())
+                    .map_err(|e| Error::Catalog(format!("invalid signer pubkey: {e}")))?;
+                let signature = Ed25519Signature::from_bytes(&signature.0);
+                verifying_key
+                    .verify(&payload, &signature)
+                    .map_err(|_| Error::Catalog("invalid catalog event signature".into()))?;
+                Ok(Some(signer))
+            }
+            _ => Err(Error::Catalog(
+                "malformed catalog event signature fields".into(),
+            )),
+        }
+    }
+
+    fn signing_payload(&self, signer: NodeId) -> Result<Vec<u8>> {
+        let mut canonical = self.clone();
+        canonical.signer = Some(signer);
+        canonical.signature = None;
+        postcard::to_allocvec(&canonical).map_err(|e| Error::Catalog(format!("encode: {e}")))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +190,25 @@ pub enum CatalogOp {
     Move {
         from: String,
         to: String,
+    },
+    /// A member was added to the nest. `granter` must already be a member
+    /// (founding case: `granter == member`, self-grant). `invite_signature`
+    /// is the granter's Ed25519 signature over
+    /// [`member_grant_canonical_bytes`]; a verifier rebuilds those bytes
+    /// from the event and checks the signature against `granter`.
+    MemberAdded {
+        member: NodeId,
+        granter: NodeId,
+        role: NestRole,
+        added_at: u64,
+        invite_signature: Signature,
+    },
+    /// A member was revoked. Wire shape only — [`CatalogView::members`]
+    /// still returns revoked entries with `revoked_at` populated; CRDT
+    /// merge semantics for revocation are not yet implemented.
+    MemberRevoked {
+        member: NodeId,
+        revoked_at: u64,
     },
 }
 
@@ -147,9 +240,25 @@ impl CatalogEntry {
 #[derive(Clone, Debug)]
 pub struct CatalogView {
     entries: BTreeMap<CatalogPath, CatalogEntry>,
+    members: Vec<MemberRecord>,
 }
 
 impl CatalogView {
+    fn empty() -> Self {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            CatalogPath::root(),
+            CatalogEntry {
+                path: CatalogPath::root(),
+                kind: EntryKind::Dir,
+            },
+        );
+        Self {
+            entries,
+            members: Vec::new(),
+        }
+    }
+
     pub fn get(&self, path: &CatalogPath) -> Option<&CatalogEntry> {
         self.entries.get(path)
     }
@@ -193,6 +302,13 @@ impl CatalogView {
             .collect()
     }
 
+    /// Members derived from the event log, in the order they were added.
+    /// Revoked members are still returned with `revoked_at` populated;
+    /// the merge layer does not yet treat revocation as removal.
+    pub fn members(&self) -> &[MemberRecord] {
+        &self.members
+    }
+
     fn materialize(mut events: Vec<CatalogEvent>) -> Result<Self> {
         events.sort_by(|a, b| {
             a.created_at
@@ -210,6 +326,12 @@ impl CatalogView {
                 kind: EntryKind::Dir,
             },
         );
+
+        // Member ops are walked in the same time-ordered pass. We keep an
+        // index from NodeId to slot so MemberRevoked can stamp the matching
+        // record's `revoked_at` without scanning.
+        let mut members: Vec<MemberRecord> = Vec::new();
+        let mut member_idx: BTreeMap<NodeId, usize> = BTreeMap::new();
 
         for event in events {
             match event.op {
@@ -266,10 +388,41 @@ impl CatalogView {
                         entries.insert(new_path, entry);
                     }
                 }
+                CatalogOp::MemberAdded {
+                    member,
+                    granter,
+                    role,
+                    added_at,
+                    ..
+                } => {
+                    // Duplicate MemberAdded for the same member is a no-op;
+                    // the first add wins so re-merging doesn't reshuffle
+                    // the granter/role recorded the first time.
+                    if let std::collections::btree_map::Entry::Vacant(e) = member_idx.entry(member)
+                    {
+                        e.insert(members.len());
+                        members.push(MemberRecord {
+                            member,
+                            granter,
+                            role,
+                            added_at,
+                            revoked_at: None,
+                        });
+                    }
+                }
+                CatalogOp::MemberRevoked { member, revoked_at } => {
+                    if let Some(&slot) = member_idx.get(&member) {
+                        // Earliest revocation wins so a later add+revoke
+                        // pair can't undo an earlier one.
+                        if members[slot].revoked_at.is_none() {
+                            members[slot].revoked_at = Some(revoked_at);
+                        }
+                    }
+                }
             }
         }
 
-        Ok(Self { entries })
+        Ok(Self { entries, members })
     }
 }
 
@@ -330,24 +483,83 @@ impl CatalogIndex {
         Ok(out)
     }
 
+    /// Merge events from a remote peer. Signatures are required and verified;
+    /// unsigned events are rejected. Use `merge_events` for the wider API
+    /// that lets the caller declare origin explicitly.
+    pub fn merge_events_from_peer(
+        &self,
+        events: impl IntoIterator<Item = CatalogEvent>,
+    ) -> Result<usize> {
+        self.merge_events_with_origin(events, EventOrigin::Remote, None)
+    }
+
+    /// Merge nest-scoped events from a remote peer. In addition to outer
+    /// catalog-event signatures, membership operations are validated against
+    /// `nest_id` before being trusted.
+    pub fn merge_events_from_peer_for_nest(
+        &self,
+        nest_id: &NestId,
+        events: impl IntoIterator<Item = CatalogEvent>,
+    ) -> Result<usize> {
+        self.merge_events_with_origin(events, EventOrigin::Remote, Some(nest_id))
+    }
+
+    /// Local replay of events (e.g. import from another local file). Legacy
+    /// unsigned events are tolerated; tampered signatures still reject.
     pub fn merge_events(&self, events: impl IntoIterator<Item = CatalogEvent>) -> Result<usize> {
-        let mut known: HashSet<String> = self
-            .load_events()?
-            .into_iter()
-            .map(|event| event.event_id)
+        self.merge_events_with_origin(events, EventOrigin::Local, None)
+    }
+
+    fn merge_events_with_origin(
+        &self,
+        events: impl IntoIterator<Item = CatalogEvent>,
+        origin: EventOrigin,
+        nest_id: Option<&NestId>,
+    ) -> Result<usize> {
+        let replay_events = self.load_events()?;
+        let mut known: HashSet<String> = replay_events
+            .iter()
+            .map(|event| event.event_id.clone())
             .collect();
+        // Member set is the only piece of catalog state needed to validate
+        // remote membership ops. Build it once up front, then keep it
+        // running with `apply_op` instead of re-materializing the whole
+        // event log per incoming event — that was O(n²) on membership-heavy
+        // syncs.
+        let mut members = MemberSet::from_events(&replay_events);
         let mut added = 0usize;
         for event in events {
             validate_event(&event)?;
+            let signer = match event.verify()? {
+                Some(signer) => signer,
+                None => {
+                    if origin == EventOrigin::Remote {
+                        return Err(Error::Catalog(format!(
+                            "unsigned catalog event {} rejected from peer",
+                            event.event_id
+                        )));
+                    }
+                    NodeId::from_bytes([0u8; 32])
+                }
+            };
+            if origin == EventOrigin::Remote {
+                validate_remote_membership_event(&event, signer, nest_id, &members)?;
+            }
             if known.insert(event.event_id.clone()) {
                 self.append_event(&event)?;
+                members.apply_op(&event.op);
                 added += 1;
             }
         }
         Ok(added)
     }
 
-    pub fn mkdir(&self, path: &str, parents: bool) -> Result<Vec<CatalogEvent>> {
+    pub fn mkdir(
+        &self,
+        path: &str,
+        parents: bool,
+        identity: &Identity,
+    ) -> Result<Vec<CatalogEvent>> {
         let target = CatalogPath::normalize(path)?;
         if target == CatalogPath::root() {
             return Ok(Vec::new());
@@ -355,14 +567,23 @@ impl CatalogIndex {
         let view = self.view()?;
         let mut events = Vec::new();
         for dir in missing_dirs(&view, &target, parents)? {
-            events.push(self.append(CatalogOp::Mkdir {
-                path: dir.to_string(),
-            })?);
+            events.push(self.append(
+                CatalogOp::Mkdir {
+                    path: dir.to_string(),
+                },
+                identity,
+            )?);
         }
         Ok(events)
     }
 
-    pub fn put_file(&self, path: &str, cap: Cap, name: Option<String>) -> Result<CatalogEvent> {
+    pub fn put_file(
+        &self,
+        path: &str,
+        cap: Cap,
+        name: Option<String>,
+        identity: &Identity,
+    ) -> Result<CatalogEvent> {
         let path = CatalogPath::normalize(path)?;
         if path == CatalogPath::root() {
             return Err(Error::Catalog("cannot put a file at /".into()));
@@ -372,14 +593,17 @@ impl CatalogIndex {
         if view.get(&path).is_some_and(CatalogEntry::is_dir) {
             return Err(Error::Catalog(format!("{path} is a directory")));
         }
-        self.append(CatalogOp::PutFile {
-            path: path.to_string(),
-            cap: cap.encode(),
-            name,
-        })
+        self.append(
+            CatalogOp::PutFile {
+                path: path.to_string(),
+                cap: cap.encode(),
+                name,
+            },
+            identity,
+        )
     }
 
-    pub fn remove(&self, path: &str) -> Result<CatalogEvent> {
+    pub fn remove(&self, path: &str, identity: &Identity) -> Result<CatalogEvent> {
         let path = CatalogPath::normalize(path)?;
         if path == CatalogPath::root() {
             return Err(Error::Catalog("cannot remove /".into()));
@@ -388,12 +612,123 @@ impl CatalogIndex {
         if !view.contains(&path) {
             return Err(Error::Catalog(format!("{path} does not exist")));
         }
-        self.append(CatalogOp::Remove {
-            path: path.to_string(),
-        })
+        self.append(
+            CatalogOp::Remove {
+                path: path.to_string(),
+            },
+            identity,
+        )
     }
 
-    pub fn move_path(&self, from: &str, to: &str) -> Result<CatalogEvent> {
+    /// Append a `MemberAdded` event signed by `granter` (`identity`). The
+    /// embedded `invite_signature` is produced over
+    /// [`member_grant_canonical_bytes`] so a third device can verify the
+    /// grant independent of `Invite` semantics.
+    pub fn append_member_added(
+        &self,
+        nest_id: &NestId,
+        identity: &Identity,
+        member: NodeId,
+        role: NestRole,
+    ) -> Result<CatalogEvent> {
+        let added_at = unix_now();
+        let granter = identity.node_id();
+        let payload = member_grant_canonical_bytes(nest_id, &granter, &member, role, added_at);
+        let signature: Ed25519Signature = identity.signing.sign(&payload);
+        self.append(
+            CatalogOp::MemberAdded {
+                member,
+                granter,
+                role,
+                added_at,
+                invite_signature: Signature(signature.to_bytes()),
+            },
+            identity,
+        )
+    }
+
+    /// Append a `MemberAdded` event whose `invite_signature` was produced
+    /// elsewhere (e.g. by decoding an Invite). The local device is the
+    /// event's outer signer (the new member); `granter` is whoever
+    /// authorised the grant. Caller is responsible for verifying the
+    /// invite signature; the merge path re-verifies on peer ingest.
+    pub fn append_member_added_with_signature(
+        &self,
+        identity: &Identity,
+        member: NodeId,
+        granter: NodeId,
+        role: NestRole,
+        added_at: u64,
+        invite_signature: Signature,
+    ) -> Result<CatalogEvent> {
+        self.append(
+            CatalogOp::MemberAdded {
+                member,
+                granter,
+                role,
+                added_at,
+                invite_signature,
+            },
+            identity,
+        )
+    }
+
+    /// Append a `MemberRevoked` event. Wire-format only — revocation
+    /// surfaces as `MemberRecord::revoked_at` but does not yet remove
+    /// the member from [`CatalogView::members`]; merge-aware revocation
+    /// is not implemented.
+    pub fn append_member_revoked(
+        &self,
+        identity: &Identity,
+        member: NodeId,
+    ) -> Result<CatalogEvent> {
+        self.append(
+            CatalogOp::MemberRevoked {
+                member,
+                revoked_at: unix_now(),
+            },
+            identity,
+        )
+    }
+
+    /// Idempotently stamp a founding-member event for *this nest* (not
+    /// necessarily for this identity).
+    ///
+    /// - If the catalog already has at least one `MemberAdded` event, no-op.
+    /// - Otherwise, append a self-granting event for the local identity.
+    ///
+    /// The second branch is the migration bridge for nests created
+    /// before catalog events were signed: the first device to open such
+    /// a nest becomes the founding member. A *different* device opening
+    /// a nest that already has a founding event does NOT silently
+    /// self-grant — non-founders must join via an invite.
+    pub fn ensure_founding_member(
+        &self,
+        nest_id: &NestId,
+        identity: &Identity,
+    ) -> Result<Option<CatalogEvent>> {
+        let stamp_path = self.root.join(FOUNDING_STAMP_FILE);
+        if stamp_path.exists() {
+            return Ok(None);
+        }
+        let has_any_founding = self
+            .load_events()?
+            .iter()
+            .any(|event| matches!(event.op, CatalogOp::MemberAdded { .. }));
+        if has_any_founding {
+            // Pre-existing founding event without a sentinel (e.g. nest
+            // created before this file existed, or sentinel deleted).
+            // Stamp it now so the next call short-circuits.
+            let _ = fs::write(&stamp_path, b"");
+            return Ok(None);
+        }
+        let me = identity.node_id();
+        let event = self.append_member_added(nest_id, identity, me, NestRole::Owner)?;
+        let _ = fs::write(&stamp_path, b"");
+        Ok(Some(event))
+    }
+
+    pub fn move_path(&self, from: &str, to: &str, identity: &Identity) -> Result<CatalogEvent> {
         let from = CatalogPath::normalize(from)?;
         let to = CatalogPath::normalize(to)?;
         if from == CatalogPath::root() || to == CatalogPath::root() {
@@ -407,21 +742,27 @@ impl CatalogIndex {
             return Err(Error::Catalog(format!("{from} does not exist")));
         }
         ensure_parent_exists(&view, &to)?;
-        self.append(CatalogOp::Move {
-            from: from.to_string(),
-            to: to.to_string(),
-        })
+        self.append(
+            CatalogOp::Move {
+                from: from.to_string(),
+                to: to.to_string(),
+            },
+            identity,
+        )
     }
 
-    fn append(&self, op: CatalogOp) -> Result<CatalogEvent> {
+    fn append(&self, op: CatalogOp, identity: &Identity) -> Result<CatalogEvent> {
         let seq = self.next_seq()?;
-        let event = CatalogEvent {
+        let mut event = CatalogEvent {
             event_id: format!("{}:{seq}", self.device_id),
             device_id: self.device_id.clone(),
             seq,
             created_at: unix_now(),
             op,
+            signer: None,
+            signature: None,
         };
+        event.sign(identity)?;
         self.append_event(&event)?;
         Ok(event)
     }
@@ -485,8 +826,167 @@ fn validate_event(event: &CatalogEvent) -> Result<()> {
             CatalogPath::normalize(from)?;
             CatalogPath::normalize(to)?;
         }
+        CatalogOp::MemberAdded { .. } | CatalogOp::MemberRevoked { .. } => {
+            // Member ops carry no paths to normalise. Cryptographic
+            // verification of `invite_signature` is left to callers that
+            // know the nest_id (it isn't in the event), via
+            // [`verify_member_added_signature`].
+        }
     }
     Ok(())
+}
+
+/// Running member set used during a merge to validate remote membership
+/// ops in O(1) per event. Initial construction is O(n) via
+/// [`CatalogView::materialize`]; subsequent `apply_op` calls update the
+/// set in place.
+struct MemberSet {
+    records: Vec<MemberRecord>,
+    idx: BTreeMap<NodeId, usize>,
+}
+
+impl MemberSet {
+    fn from_events(events: &[CatalogEvent]) -> Self {
+        let view =
+            CatalogView::materialize(events.to_vec()).unwrap_or_else(|_| CatalogView::empty());
+        let records = view.members().to_vec();
+        let idx = records
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.member, i))
+            .collect();
+        Self { records, idx }
+    }
+
+    fn members(&self) -> &[MemberRecord] {
+        &self.records
+    }
+
+    fn apply_op(&mut self, op: &CatalogOp) {
+        match op {
+            CatalogOp::MemberAdded {
+                member,
+                granter,
+                role,
+                added_at,
+                ..
+            } => {
+                if let std::collections::btree_map::Entry::Vacant(e) = self.idx.entry(*member) {
+                    e.insert(self.records.len());
+                    self.records.push(MemberRecord {
+                        member: *member,
+                        granter: *granter,
+                        role: *role,
+                        added_at: *added_at,
+                        revoked_at: None,
+                    });
+                }
+            }
+            CatalogOp::MemberRevoked { member, revoked_at } => {
+                if let Some(&slot) = self.idx.get(member)
+                    && self.records[slot].revoked_at.is_none()
+                {
+                    self.records[slot].revoked_at = Some(*revoked_at);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_remote_membership_event(
+    event: &CatalogEvent,
+    signer: NodeId,
+    nest_id: Option<&NestId>,
+    members: &MemberSet,
+) -> Result<()> {
+    match &event.op {
+        CatalogOp::MemberAdded {
+            member, granter, ..
+        } => {
+            let nest_id = nest_id.ok_or_else(|| {
+                Error::Catalog("remote MemberAdded validation requires a nest id".into())
+            })?;
+            if signer != *member && signer != *granter {
+                return Err(Error::Catalog(
+                    "remote MemberAdded event signer must match member or granter".into(),
+                ));
+            }
+            verify_member_added_signature(event, nest_id)?;
+
+            if granter == member {
+                validate_remote_self_grant(members, member)
+            } else if members.members().iter().any(|m| {
+                m.member == *granter && matches!(m.role, NestRole::Owner) && m.revoked_at.is_none()
+            }) {
+                Ok(())
+            } else {
+                Err(Error::Catalog(format!(
+                    "remote MemberAdded granter {} is not a current Owner",
+                    granter.short()
+                )))
+            }
+        }
+        CatalogOp::MemberRevoked { .. } => {
+            let _ = nest_id.ok_or_else(|| {
+                Error::Catalog("remote MemberRevoked validation requires a nest id".into())
+            })?;
+            if members.members().iter().any(|m| {
+                m.member == signer && matches!(m.role, NestRole::Owner) && m.revoked_at.is_none()
+            }) {
+                Ok(())
+            } else {
+                Err(Error::Catalog(format!(
+                    "remote MemberRevoked signer {} is not a current Owner",
+                    signer.short()
+                )))
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_remote_self_grant(members: &MemberSet, member: &NodeId) -> Result<()> {
+    let m = members.members();
+    let allowed = m.is_empty()
+        || m.iter().any(|r| r.member == *member)
+        || m.iter().any(|r| r.granter == *member);
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::Catalog(format!(
+            "remote MemberAdded self-grant for {} is not a founding grant",
+            member.short()
+        )))
+    }
+}
+
+/// Verify that a `MemberAdded` event's `invite_signature` is a valid
+/// Ed25519 signature by `granter` over the canonical member-grant payload
+/// for the given `nest_id`.
+///
+/// Returns `Ok(true)` for a valid signature, `Ok(false)` if the event is
+/// not a `MemberAdded` op, and an error on signature failure or malformed
+/// signer key bytes.
+pub fn verify_member_added_signature(event: &CatalogEvent, nest_id: &NestId) -> Result<bool> {
+    let CatalogOp::MemberAdded {
+        member,
+        granter,
+        role,
+        added_at,
+        invite_signature,
+    } = &event.op
+    else {
+        return Ok(false);
+    };
+    let payload = member_grant_canonical_bytes(nest_id, granter, member, *role, *added_at);
+    let granter_key = VerifyingKey::from_bytes(granter.as_bytes())
+        .map_err(|e| Error::Catalog(format!("invalid granter pubkey: {e}")))?;
+    let sig = Ed25519Signature::from_bytes(&invite_signature.0);
+    granter_key
+        .verify(&payload, &sig)
+        .map_err(|_| Error::Catalog("invalid MemberAdded invite signature".into()))?;
+    Ok(true)
 }
 
 fn missing_dirs(
@@ -564,14 +1064,44 @@ mod tests {
         )
     }
 
-    fn remote_event(device_id: &str, seq: u64, created_at: u64, op: CatalogOp) -> CatalogEvent {
+    fn fresh_identity(tmp: &TempDir) -> Identity {
+        Identity::load_or_create(tmp.path()).unwrap()
+    }
+
+    /// Build an unsigned (legacy) event — used for backward-compat replay
+    /// tests of `merge_events` (the local-origin API).
+    fn legacy_event(device_id: &str, seq: u64, created_at: u64, op: CatalogOp) -> CatalogEvent {
         CatalogEvent {
             event_id: format!("{device_id}:{seq}"),
             device_id: device_id.into(),
             seq,
             created_at,
             op,
+            signer: None,
+            signature: None,
         }
+    }
+
+    /// Build a signed event from a peer identity, mimicking what a real
+    /// remote append would produce.
+    fn signed_event(
+        identity: &Identity,
+        device_id: &str,
+        seq: u64,
+        created_at: u64,
+        op: CatalogOp,
+    ) -> CatalogEvent {
+        let mut event = CatalogEvent {
+            event_id: format!("{device_id}:{seq}"),
+            device_id: device_id.into(),
+            seq,
+            created_at,
+            op,
+            signer: None,
+            signature: None,
+        };
+        event.sign(identity).unwrap();
+        event
     }
 
     #[test]
@@ -588,13 +1118,15 @@ mod tests {
     #[test]
     fn mkdir_put_remove_roundtrip() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
             .put_file(
                 "/docs/report.pdf",
                 cap_with_hash_byte(1),
                 Some("report.pdf".into()),
+                &identity,
             )
             .unwrap();
 
@@ -611,7 +1143,7 @@ mod tests {
                 .is_some()
         );
 
-        catalog.remove("/docs").unwrap();
+        catalog.remove("/docs", &identity).unwrap();
         let view = catalog.view().unwrap();
         assert!(
             view.get(&CatalogPath::normalize("/docs").unwrap())
@@ -626,9 +1158,10 @@ mod tests {
     #[test]
     fn mkdir_requires_parents_unless_requested() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        assert!(catalog.mkdir("/a/b", false).is_err());
-        catalog.mkdir("/a/b", true).unwrap();
+        assert!(catalog.mkdir("/a/b", false, &identity).is_err());
+        catalog.mkdir("/a/b", true, &identity).unwrap();
         let view = catalog.view().unwrap();
         assert!(
             view.get(&CatalogPath::normalize("/a").unwrap())
@@ -645,12 +1178,13 @@ mod tests {
     #[test]
     fn move_path_moves_subtree() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
-        catalog.mkdir("/docs", false).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
-            .put_file("/docs/report.pdf", cap_with_hash_byte(2), None)
+            .put_file("/docs/report.pdf", cap_with_hash_byte(2), None, &identity)
             .unwrap();
-        catalog.move_path("/docs", "/archive").unwrap();
+        catalog.move_path("/docs", "/archive", &identity).unwrap();
         let view = catalog.view().unwrap();
         assert!(
             view.get(&CatalogPath::normalize("/docs").unwrap())
@@ -671,6 +1205,8 @@ mod tests {
             seq: 1,
             created_at: 1,
             op: CatalogOp::Mkdir { path: "/x".into() },
+            signer: None,
+            signature: None,
         };
         let b = CatalogEvent {
             event_id: "a:1".into(),
@@ -682,6 +1218,8 @@ mod tests {
                 cap,
                 name: None,
             },
+            signer: None,
+            signature: None,
         };
         let view = CatalogView::materialize(vec![b, a]).unwrap();
         assert!(view.get(&CatalogPath::normalize("/x/f").unwrap()).is_some());
@@ -690,10 +1228,13 @@ mod tests {
     #[test]
     fn file_caps_returns_live_file_caps() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let cap = cap_with_hash_byte(4);
-        catalog.mkdir("/docs", false).unwrap();
-        catalog.put_file("/docs/a", cap.clone(), None).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
+        catalog
+            .put_file("/docs/a", cap.clone(), None, &identity)
+            .unwrap();
         let caps = catalog.view().unwrap().file_caps();
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].manifest_hash, cap.manifest_hash);
@@ -706,7 +1247,7 @@ mod tests {
         let device = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let cap = cap_with_hash_byte(5);
         let events = vec![
-            remote_event(
+            legacy_event(
                 device,
                 1,
                 1,
@@ -714,7 +1255,7 @@ mod tests {
                     path: "/docs".into(),
                 },
             ),
-            remote_event(
+            legacy_event(
                 device,
                 2,
                 2,
@@ -749,7 +1290,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let device = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let event = remote_event(
+        let event = legacy_event(
             device,
             1,
             1,
@@ -777,7 +1318,7 @@ mod tests {
 
         catalog
             .merge_events(vec![
-                remote_event(
+                legacy_event(
                     a,
                     1,
                     1,
@@ -787,7 +1328,7 @@ mod tests {
                         name: Some("a".into()),
                     },
                 ),
-                remote_event(
+                legacy_event(
                     b,
                     1,
                     1,
@@ -813,19 +1354,308 @@ mod tests {
     #[test]
     fn rejects_file_where_parent_missing_or_file_parent() {
         let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         assert!(
             catalog
-                .put_file("/missing/a", cap_with_hash_byte(1), None)
+                .put_file("/missing/a", cap_with_hash_byte(1), None, &identity)
                 .is_err()
         );
         catalog
-            .put_file("/file", cap_with_hash_byte(2), None)
+            .put_file("/file", cap_with_hash_byte(2), None, &identity)
             .unwrap();
         assert!(
             catalog
-                .put_file("/file/child", cap_with_hash_byte(3), None)
+                .put_file("/file/child", cap_with_hash_byte(3), None, &identity)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn sign_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        catalog.mkdir("/docs", false, &identity).unwrap();
+        catalog
+            .put_file("/docs/a.txt", cap_with_hash_byte(8), None, &identity)
+            .unwrap();
+
+        let events = catalog.load_events().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let signer = event.verify().unwrap().expect("event is signed");
+            assert_eq!(signer, identity.node_id());
+        }
+    }
+
+    #[test]
+    fn merge_rejects_tampered_event() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let device = "cccccccccccccccccccccccccccccccc";
+        let mut event = signed_event(
+            &identity_a,
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/orig".into(),
+            },
+        );
+        // Tamper with the op without re-signing.
+        event.op = CatalogOp::Mkdir {
+            path: "/evil".into(),
+        };
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let err = catalog.merge_events_from_peer(vec![event]).unwrap_err();
+        assert!(err.to_string().contains("invalid catalog event signature"));
+    }
+
+    #[test]
+    fn merge_rejects_unsigned_from_peer() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let device = "dddddddddddddddddddddddddddddddd";
+        let event = legacy_event(
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/legacy".into(),
+            },
+        );
+        let err = catalog.merge_events_from_peer(vec![event]).unwrap_err();
+        assert!(
+            err.to_string().contains("unsigned"),
+            "expected unsigned-rejection, got: {err}"
+        );
+        assert!(catalog.load_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_accepts_legacy_unsigned_local() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let device = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let event = legacy_event(
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/legacy".into(),
+            },
+        );
+        assert_eq!(catalog.merge_events(vec![event]).unwrap(), 1);
+        let view = catalog.view().unwrap();
+        assert!(
+            view.get(&CatalogPath::normalize("/legacy").unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn merge_accepts_signed_from_peer() {
+        // Sanity: a properly-signed remote event from a peer identity is
+        // accepted by `merge_events_from_peer`.
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let device = "ffffffffffffffffffffffffffffffff";
+        let event = signed_event(
+            &identity_a,
+            device,
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/peer".into(),
+            },
+        );
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        assert_eq!(catalog.merge_events_from_peer(vec![event]).unwrap(), 1);
+    }
+
+    #[test]
+    fn merge_from_peer_for_nest_validates_member_grants() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let identity_b = Identity::random();
+        let nest_id = NestId::random();
+        let source = CatalogIndex::open(tmp_a.path()).unwrap();
+        source
+            .ensure_founding_member(&nest_id, &identity_a)
+            .unwrap();
+        source
+            .append_member_added(&nest_id, &identity_a, identity_b.node_id(), NestRole::Owner)
+            .unwrap();
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let events = source.load_events().unwrap();
+        assert_eq!(
+            catalog
+                .merge_events_from_peer_for_nest(&nest_id, events)
+                .unwrap(),
+            2
+        );
+        let members = catalog.view().unwrap().members().to_vec();
+        assert!(members.iter().any(|m| m.member == identity_a.node_id()));
+        assert!(members.iter().any(|m| m.member == identity_b.node_id()));
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_member_added_without_nest_id() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let nest_id = NestId::random();
+        let source = CatalogIndex::open(tmp_a.path()).unwrap();
+        let event = source
+            .ensure_founding_member(&nest_id, &identity_a)
+            .unwrap()
+            .unwrap();
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let err = catalog.merge_events_from_peer(vec![event]).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a nest id"),
+            "expected nest-id validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_invalid_member_grant() {
+        let tmp_a = TempDir::new().unwrap();
+        let identity_a = fresh_identity(&tmp_a);
+        let identity_b = Identity::random();
+        let nest_id = NestId::random();
+        let source = CatalogIndex::open(tmp_a.path()).unwrap();
+        let founder = source
+            .ensure_founding_member(&nest_id, &identity_a)
+            .unwrap()
+            .unwrap();
+        let bad_member = signed_event(
+            &identity_b,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            1,
+            2,
+            CatalogOp::MemberAdded {
+                member: identity_b.node_id(),
+                granter: identity_a.node_id(),
+                role: NestRole::Owner,
+                added_at: 2,
+                invite_signature: Signature([0xAAu8; 64]),
+            },
+        );
+
+        let tmp_b = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
+        let err = catalog
+            .merge_events_from_peer_for_nest(&nest_id, vec![founder, bad_member])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid MemberAdded invite signature"),
+            "expected bad grant rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_founding_member_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+
+        let first = catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        assert!(first.is_some(), "first call must append the founding event");
+        let second = catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        assert!(second.is_none(), "second call must be a no-op");
+        assert_eq!(
+            catalog
+                .load_events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.op, CatalogOp::MemberAdded { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_founding_member_signature_verifies() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let event = catalog
+            .ensure_founding_member(&nest_id, &identity)
+            .unwrap()
+            .unwrap();
+        // Outer event signature verifies.
+        let signer = event.verify().unwrap().expect("event is signed");
+        assert_eq!(signer, identity.node_id());
+        // Inner invite_signature verifies against the canonical bytes.
+        assert!(verify_member_added_signature(&event, &nest_id).unwrap());
+        // ...and fails under a different nest_id.
+        let other_nest = NestId::random();
+        assert!(verify_member_added_signature(&event, &other_nest).is_err());
+    }
+
+    #[test]
+    fn view_members_replay() {
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+
+        // Founder self-grants.
+        catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        // Founder grants a second member.
+        let other_a = NodeId::from_bytes([0xAAu8; 32]);
+        catalog
+            .append_member_added(&nest_id, &identity, other_a, NestRole::Owner)
+            .unwrap();
+        // Founder revokes the second member.
+        catalog.append_member_revoked(&identity, other_a).unwrap();
+
+        let view = catalog.view().unwrap();
+        let members = view.members();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].member, identity.node_id());
+        assert_eq!(members[0].granter, identity.node_id(), "self-grant");
+        assert!(members[0].revoked_at.is_none());
+        assert_eq!(members[1].member, other_a);
+        assert!(members[1].revoked_at.is_some());
+    }
+
+    #[test]
+    fn revoked_at_does_not_remove_yet() {
+        // Phase 3 ships `MemberRevoked` for wire-format stability but
+        // `members()` still returns revoked members as current (with
+        // revoked_at populated). Phase 5 will treat this as a CRDT remove.
+        let tmp = TempDir::new().unwrap();
+        let identity = fresh_identity(&tmp);
+        let nest_id = NestId::random();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+
+        catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        let to_revoke = NodeId::from_bytes([0xBBu8; 32]);
+        catalog
+            .append_member_added(&nest_id, &identity, to_revoke, NestRole::Owner)
+            .unwrap();
+        catalog.append_member_revoked(&identity, to_revoke).unwrap();
+
+        let members = catalog.view().unwrap().members().to_vec();
+        let revoked = members.iter().find(|m| m.member == to_revoke).unwrap();
+        assert!(revoked.revoked_at.is_some(), "revoked_at must be populated");
+        // …but they are still in the returned list (Phase-3 invariant).
+        assert!(
+            members.iter().any(|m| m.member == to_revoke),
+            "revoked member still appears in members() in Phase 3"
         );
     }
 }

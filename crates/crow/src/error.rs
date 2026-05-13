@@ -39,6 +39,9 @@ pub enum Error {
     #[error("nest error: {0}")]
     Nest(String),
 
+    #[error("invite error: {0}")]
+    Invite(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

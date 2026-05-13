@@ -507,7 +507,9 @@ fn populate_legacy_home<P: AsRef<std::path::Path>>(
     let pins = PinIndex::open(home).expect("PinIndex::open(home)");
     // Touch the catalog so the migration covers all four legacy directories.
     let catalog = CatalogIndex::open(home).expect("CatalogIndex::open(home)");
-    catalog.mkdir("/inbox", false).expect("catalog mkdir");
+    catalog
+        .mkdir("/inbox", false, identity)
+        .expect("catalog mkdir");
     let crow = Crow::new(store);
     let cap = crow
         .put_bytes_with(
@@ -519,7 +521,7 @@ fn populate_legacy_home<P: AsRef<std::path::Path>>(
         )
         .expect("put_bytes_with");
     catalog
-        .put_file("/inbox/file", cap.clone(), Some("file".into()))
+        .put_file("/inbox/file", cap.clone(), Some("file".into()), identity)
         .expect("catalog put_file");
     pins.add(cap.clone(), Some("legacy-file".into()), None)
         .expect("pin add");
@@ -596,9 +598,16 @@ fn nest_isolation_keeps_pins_and_catalogs_separate() {
     personal_pins
         .add(personal_cap.clone(), Some("personal".into()), None)
         .unwrap();
-    personal_catalog.mkdir("/personal", false).unwrap();
     personal_catalog
-        .put_file("/personal/file", personal_cap.clone(), Some("file".into()))
+        .mkdir("/personal", false, &identity)
+        .unwrap();
+    personal_catalog
+        .put_file(
+            "/personal/file",
+            personal_cap.clone(),
+            Some("file".into()),
+            &identity,
+        )
         .unwrap();
 
     let work_cap = work_crow
@@ -613,9 +622,14 @@ fn nest_isolation_keeps_pins_and_catalogs_separate() {
     work_pins
         .add(work_cap.clone(), Some("work".into()), None)
         .unwrap();
-    work_catalog.mkdir("/work", false).unwrap();
+    work_catalog.mkdir("/work", false, &identity).unwrap();
     work_catalog
-        .put_file("/work/file", work_cap.clone(), Some("file".into()))
+        .put_file(
+            "/work/file",
+            work_cap.clone(),
+            Some("file".into()),
+            &identity,
+        )
         .unwrap();
 
     // Personal nest only sees personal pin + path.
@@ -637,6 +651,49 @@ fn nest_isolation_keeps_pins_and_catalogs_separate() {
     // The encrypted chunks live in disjoint directories on disk.
     assert!(personal_dir.join("chunks").exists());
     assert!(work_dir.join("chunks").exists());
+}
+
+#[test]
+fn ensure_founding_member_backfills_phase2_nest() {
+    // A Phase-2 nest's catalog has no MemberAdded events. The first time a
+    // Phase-3 build opens it, ensure_founding_member must stamp a
+    // founding event for the local identity without touching the
+    // filesystem state (pins, chunks, paths) it inherited.
+    let tmp = TempDir::new().unwrap();
+    let identity = Identity::random();
+    let payload = b"hello phase 2";
+    let cap = populate_legacy_home(tmp.path(), payload, &identity);
+
+    let nests = NestIndex::ensure_default(tmp.path(), "test-device").unwrap();
+    let nest_id = nests.active().id;
+    let nest_dir = nests.nest_dir(&nest_id);
+
+    let catalog = CatalogIndex::open(&nest_dir).unwrap();
+    // Pre-condition: no founding event before we run the migration.
+    assert!(catalog.view().unwrap().members().is_empty());
+
+    let appended = catalog
+        .ensure_founding_member(&nest_id, &identity)
+        .expect("ensure_founding_member appends on Phase-2 nest");
+    assert!(appended.is_some(), "first call writes the founding event");
+
+    let members = catalog.view().unwrap().members().to_vec();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].member, identity.node_id());
+    assert_eq!(members[0].granter, identity.node_id());
+    assert!(members[0].revoked_at.is_none());
+
+    // Calling again is a no-op.
+    let second = catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+    assert!(
+        second.is_none(),
+        "re-running ensure_founding_member is idempotent"
+    );
+    assert_eq!(catalog.view().unwrap().members().len(), 1);
+
+    // Existing pre-migration data still reconstructs.
+    let crow = Crow::new(FsStore::open(&nest_dir).unwrap());
+    assert_eq!(crow.get_bytes(&cap).unwrap(), payload);
 }
 
 #[test]
