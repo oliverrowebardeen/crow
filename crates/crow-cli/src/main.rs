@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -10,9 +10,9 @@ use clap::{Parser, Subcommand};
 use crow::{
     Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
-    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, Namespace, Nest,
-    NestId, NestIndex, NestRole, NodeId, PinIndex, PinRecord, SignatureStatus, compute_live_set,
-    compute_live_set_from_roots,
+    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, MemberRecord,
+    Namespace, Nest, NestId, NestIndex, NestRole, NodeId, PinIndex, PinRecord, SignatureStatus,
+    compute_live_set, compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
@@ -652,7 +652,8 @@ enum Command {
                       crow nest list\n  \
                       crow nest create work\n  \
                       crow nest use work\n  \
-                      crow nest current"
+                      crow nest current\n  \
+                      crow nest devices"
     )]
     Nest {
         #[command(subcommand)]
@@ -666,6 +667,23 @@ enum NestCommand {
     List,
     /// Print the currently active nest.
     Current,
+    /// List trusted devices in the selected nest.
+    #[command(
+        long_about = "Show the signed member list for the active nest (or --nest N). \
+                      This is the trusted device view: membership comes from the nest \
+                      catalog, while online/offline status is only a best-effort hint \
+                      from the local peer snapshot written by `crow serve`.\n\
+                      \n\
+                      Use `crow peers` for raw LAN discovery diagnostics."
+    )]
+    Devices {
+        /// Print one verbose block per trusted device.
+        #[arg(long)]
+        long: bool,
+        /// Emit a machine-readable JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new nest with the given name. Does not change the active nest.
     #[command(
         long_about = "Add a new nest with NAME. The name must be 1-32 characters drawn \
@@ -1068,6 +1086,7 @@ fn cmd_nest(home: &Path, nest_override: Option<&str>, command: NestCommand) -> D
     match command {
         NestCommand::List => cmd_nest_list(home),
         NestCommand::Current => cmd_nest_current(home),
+        NestCommand::Devices { long, json } => cmd_nest_devices(home, nest_override, long, json),
         NestCommand::Create { name } => cmd_nest_create(home, &name),
         NestCommand::Use { reference } => cmd_nest_use(home, &reference),
         NestCommand::Invite {
@@ -1099,6 +1118,276 @@ fn cmd_nest_current(home: &Path) -> DynResult<()> {
     let active = nests.active();
     println!("{}  {}", active.name, active.id);
     Ok(())
+}
+
+fn cmd_nest_devices(
+    home: &Path,
+    nest_override: Option<&str>,
+    long: bool,
+    json: bool,
+) -> DynResult<()> {
+    let report = load_nest_devices_report(home, nest_override)?;
+    if json {
+        let pretty = serde_json::to_string_pretty(&report)
+            .map_err(|e| format!("encode nest devices report: {e}"))?;
+        println!("{pretty}");
+    } else if long {
+        print_nest_devices_long(&report);
+    } else {
+        print_nest_devices_table(&report);
+    }
+    Ok(())
+}
+
+fn load_nest_devices_report(
+    home: &Path,
+    nest_override: Option<&str>,
+) -> DynResult<NestDevicesReport> {
+    let identity = Identity::load_or_create(home)?;
+    let nests = open_nest_index(home)?;
+    let nest = match nest_override {
+        Some(reference) => nests.resolve(reference)?,
+        None => nests.active(),
+    }
+    .clone();
+    let catalog = CatalogIndex::open(nests.nest_dir(&nest.id))?;
+    catalog.ensure_founding_member(&nest.id, &identity)?;
+    let view = catalog.view()?;
+    let snapshot = peer_snapshot::load(&peer_snapshot::snapshot_path(home))?;
+    let local_name = DeviceConfig::load(home)?.name;
+    Ok(build_nest_devices_report(
+        &nest,
+        identity.node_id(),
+        local_name,
+        view.members(),
+        snapshot.as_ref(),
+    ))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NestDevicesReport {
+    nest: NestDevicesNest,
+    snapshot_at: Option<u64>,
+    devices: Vec<NestDeviceRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NestDevicesNest {
+    id: NestId,
+    short_id: String,
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct NestDeviceRow {
+    node_id: NodeId,
+    short_node_id: String,
+    name: Option<String>,
+    role: String,
+    status: String,
+    granter: NodeId,
+    short_granter: String,
+    added_at: u64,
+    added_at_iso: String,
+    revoked_at: Option<u64>,
+    revoked_at_iso: Option<String>,
+    last_seen_unix: Option<u64>,
+    addresses: Vec<String>,
+    is_self: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DevicePresence {
+    name: Option<String>,
+    addresses: Vec<SocketAddr>,
+    last_seen_unix: Option<u64>,
+}
+
+fn build_nest_devices_report(
+    nest: &Nest,
+    local_node: NodeId,
+    local_name: Option<String>,
+    members: &[MemberRecord],
+    snapshot: Option<&PeerSnapshot>,
+) -> NestDevicesReport {
+    let presence = device_presence_by_node(local_node, local_name.clone(), snapshot);
+    let mut devices = members
+        .iter()
+        .map(|member| {
+            let is_self = member.member == local_node;
+            let observed = presence.get(&member.member);
+            let name = if is_self {
+                local_name
+                    .clone()
+                    .or_else(|| observed.and_then(|p| p.name.clone()))
+            } else {
+                observed.and_then(|p| p.name.clone())
+            };
+            let status = if member.revoked_at.is_some() {
+                "revoked"
+            } else if is_self {
+                "self"
+            } else if observed.is_some() {
+                "online"
+            } else {
+                "offline"
+            };
+            let last_seen_unix = if is_self {
+                None
+            } else {
+                observed.and_then(|p| p.last_seen_unix)
+            };
+            let addresses = observed
+                .map(|p| p.addresses.iter().map(ToString::to_string).collect())
+                .unwrap_or_default();
+
+            NestDeviceRow {
+                node_id: member.member,
+                short_node_id: member.member.short(),
+                name,
+                role: nest_role_label(member.role).into(),
+                status: status.into(),
+                granter: member.granter,
+                short_granter: member.granter.short(),
+                added_at: member.added_at,
+                added_at_iso: format_iso_timestamp(member.added_at),
+                revoked_at: member.revoked_at,
+                revoked_at_iso: member.revoked_at.map(format_iso_timestamp),
+                last_seen_unix,
+                addresses,
+                is_self,
+            }
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by(|a, b| {
+        a.added_at
+            .cmp(&b.added_at)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+
+    NestDevicesReport {
+        nest: NestDevicesNest {
+            id: nest.id,
+            short_id: nest.id.short(),
+            name: nest.name.clone(),
+        },
+        snapshot_at: snapshot.map(|snap| snap.snapshot_at),
+        devices,
+    }
+}
+
+fn device_presence_by_node(
+    local_node: NodeId,
+    local_name: Option<String>,
+    snapshot: Option<&PeerSnapshot>,
+) -> BTreeMap<NodeId, DevicePresence> {
+    let mut by_node = BTreeMap::new();
+    let Some(snapshot) = snapshot else {
+        return by_node;
+    };
+
+    if snapshot.self_info.node_id == local_node {
+        by_node.insert(
+            local_node,
+            DevicePresence {
+                name: local_name.or_else(|| snapshot.self_info.friendly_name.clone()),
+                addresses: vec![snapshot.self_info.address],
+                last_seen_unix: None,
+            },
+        );
+    }
+    for peer in &snapshot.peers {
+        by_node.insert(
+            peer.node_id,
+            DevicePresence {
+                name: peer.friendly_name.clone(),
+                addresses: peer.addresses.clone(),
+                last_seen_unix: Some(peer.last_seen_unix),
+            },
+        );
+    }
+    by_node
+}
+
+fn print_nest_devices_table(report: &NestDevicesReport) {
+    println!(
+        "{:<16}  {:<16}  {:<6}  {:<8}  {:<10}  {:<10}  ADDRESS",
+        "NODE", "NAME", "ROLE", "STATUS", "ADDED", "LAST SEEN"
+    );
+    for device in &report.devices {
+        let name = truncate(device.name.as_deref().unwrap_or("(unnamed)"), 16);
+        let address = device
+            .addresses
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<16}  {:<16}  {:<6}  {:<8}  {:<10}  {:<10}  {}",
+            device.short_node_id,
+            name,
+            device.role,
+            device.status,
+            format_short_date(device.added_at),
+            nest_device_last_seen(device),
+            address
+        );
+    }
+}
+
+fn print_nest_devices_long(report: &NestDevicesReport) {
+    println!("nest       {} ({})", report.nest.name, report.nest.short_id);
+    println!(
+        "snapshot   {}",
+        report
+            .snapshot_at
+            .map(|ts| format!("{} ({})", format_iso_timestamp(ts), humanize_age(ts)))
+            .unwrap_or_else(|| "missing".into())
+    );
+    println!("devices    {}", report.devices.len());
+
+    for (i, device) in report.devices.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("node       {}", device.node_id);
+        println!(
+            "name       {}",
+            device.name.as_deref().unwrap_or("(unnamed)")
+        );
+        println!("role       {}", device.role);
+        println!("status     {}", device.status);
+        println!("granter    {}", device.granter);
+        println!("added      {}", device.added_at_iso);
+        println!(
+            "revoked    {}",
+            device.revoked_at_iso.as_deref().unwrap_or("-")
+        );
+        println!("last seen  {}", nest_device_last_seen(device));
+        if device.addresses.is_empty() {
+            println!("address    -");
+        } else {
+            for (j, address) in device.addresses.iter().enumerate() {
+                let label = if j == 0 { "address    " } else { "           " };
+                println!("{label}{address}");
+            }
+        }
+    }
+}
+
+fn nest_role_label(role: NestRole) -> &'static str {
+    match role {
+        NestRole::Owner => "owner",
+    }
+}
+
+fn nest_device_last_seen(device: &NestDeviceRow) -> String {
+    if device.is_self {
+        "-".into()
+    } else if let Some(last_seen) = device.last_seen_unix {
+        humanize_age(last_seen)
+    } else {
+        "never".into()
+    }
 }
 
 fn cmd_nest_create(home: &Path, name: &str) -> DynResult<()> {
@@ -6422,6 +6711,132 @@ mod tests {
         assert!(cmd_nest_create(tmp.path(), "").is_err());
         assert!(cmd_nest_create(tmp.path(), "bad/name").is_err());
         assert!(cmd_nest_create(tmp.path(), &"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn nest_devices_report_merges_members_with_peer_snapshot() {
+        let nest = Nest {
+            id: NestId::from_bytes([0x11; 16]),
+            name: "team".into(),
+            created_at: 100,
+            creator_device_id: "creator".into(),
+        };
+        let self_id = NodeId::from_bytes([0x22; 32]);
+        let online_id = NodeId::from_bytes([0x33; 32]);
+        let offline_id = NodeId::from_bytes([0x44; 32]);
+        let revoked_id = NodeId::from_bytes([0x55; 32]);
+        let members = vec![
+            MemberRecord {
+                member: self_id,
+                granter: self_id,
+                role: NestRole::Owner,
+                added_at: 10,
+                revoked_at: None,
+            },
+            MemberRecord {
+                member: online_id,
+                granter: self_id,
+                role: NestRole::Owner,
+                added_at: 20,
+                revoked_at: None,
+            },
+            MemberRecord {
+                member: offline_id,
+                granter: self_id,
+                role: NestRole::Owner,
+                added_at: 30,
+                revoked_at: None,
+            },
+            MemberRecord {
+                member: revoked_id,
+                granter: self_id,
+                role: NestRole::Owner,
+                added_at: 40,
+                revoked_at: Some(50),
+            },
+        ];
+        let snap = PeerSnapshot {
+            snapshot_at: 1_000,
+            self_info: SelfInfo {
+                node_id: self_id,
+                friendly_name: Some("served-self".into()),
+                address: "127.0.0.1:7000".parse().unwrap(),
+            },
+            peers: vec![PeerInfo {
+                node_id: online_id,
+                friendly_name: Some("phone".into()),
+                addresses: vec![
+                    "192.168.1.10:7000".parse().unwrap(),
+                    "192.168.1.11:7000".parse().unwrap(),
+                ],
+                last_seen_unix: 900,
+            }],
+        };
+
+        let report =
+            build_nest_devices_report(&nest, self_id, Some("laptop".into()), &members, Some(&snap));
+
+        let self_row = report
+            .devices
+            .iter()
+            .find(|d| d.node_id == self_id)
+            .unwrap();
+        assert_eq!(self_row.status, "self");
+        assert_eq!(self_row.name.as_deref(), Some("laptop"));
+        assert_eq!(self_row.addresses, vec!["127.0.0.1:7000"]);
+        assert_eq!(self_row.last_seen_unix, None);
+
+        let online_row = report
+            .devices
+            .iter()
+            .find(|d| d.node_id == online_id)
+            .unwrap();
+        assert_eq!(online_row.status, "online");
+        assert_eq!(online_row.name.as_deref(), Some("phone"));
+        assert_eq!(online_row.last_seen_unix, Some(900));
+        assert_eq!(
+            online_row.addresses,
+            vec!["192.168.1.10:7000", "192.168.1.11:7000"]
+        );
+
+        let offline_row = report
+            .devices
+            .iter()
+            .find(|d| d.node_id == offline_id)
+            .unwrap();
+        assert_eq!(offline_row.status, "offline");
+        assert!(offline_row.addresses.is_empty());
+
+        let revoked_row = report
+            .devices
+            .iter()
+            .find(|d| d.node_id == revoked_id)
+            .unwrap();
+        assert_eq!(revoked_row.status, "revoked");
+        assert_eq!(revoked_row.revoked_at, Some(50));
+    }
+
+    #[test]
+    fn nest_devices_load_stamps_default_founding_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let identity = test_identity(tmp.path());
+
+        let report = load_nest_devices_report(tmp.path(), None).unwrap();
+
+        assert_eq!(report.nest.name, "personal");
+        assert!(report.devices.iter().any(|d| {
+            d.node_id == identity.node_id() && d.status == "self" && d.role == "owner"
+        }));
+    }
+
+    #[test]
+    fn nest_devices_load_honors_nest_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        cmd_nest_create(tmp.path(), "work").unwrap();
+
+        let report = load_nest_devices_report(tmp.path(), Some("work")).unwrap();
+
+        assert_eq!(report.nest.name, "work");
     }
 
     #[test]

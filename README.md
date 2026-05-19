@@ -105,6 +105,7 @@ crow fetch <peer> <cap-or-prefix> [--name NAME]
 crow sync <peer>
 crow nest list
 crow nest current
+crow nest devices [--long] [--json]
 crow nest create <name>
 crow nest use <name-or-id-prefix>
 crow nest invite <recipient-node-id> [--expires-in DUR]
@@ -121,7 +122,7 @@ Catalog folders are mutable local organization. To share a folder, freeze it int
 
 Device names are local convenience metadata. `crow serve` advertises the saved name on LAN mDNS, but caps never contain device names, IP addresses, or other locators.
 
-Nests are named encrypted vaults on the local device. Each nest has its own catalog, pins, encrypted shares, and **member list** under `<home>/nests/<id>/`, so files in different nests can never see each other. Use `crow nest list` / `create` / `use` to switch between them and `--nest <name>` to target a non-active nest for a single command. Two devices in the same nest authenticate to each other via a signed-challenge handshake bound to each device's Ed25519 identity — there is no shared per-nest password to copy. The legacy `cluster-token` still works for any nest as a fallback, but new sharing should go through recipient-bound `crow nest invite <node-id>` / `crow nest join`.
+Nests are named encrypted vaults on the local device. Each nest has its own catalog, pins, encrypted shares, and **member list** under `<home>/nests/<id>/`, so files in different nests can never see each other. Use `crow nest list` / `create` / `use` to switch between them and `--nest <name>` to target a non-active nest for a single command. Use `crow nest devices` to see the trusted devices in a nest; it combines signed membership with best-effort LAN presence from `crow serve`. `crow peers` remains the lower-level discovery diagnostic. Two devices in the same nest authenticate to each other via a signed-challenge handshake bound to each device's Ed25519 identity — there is no shared per-nest password to copy. The legacy `cluster-token` still works for any nest as a fallback, but new sharing should go through recipient-bound `crow nest invite <node-id>` / `crow nest join`.
 
 ### Walkthrough
 
@@ -249,6 +250,17 @@ $ crow --nest personal ls /docs # one-shot override; active stays `work`
 $ crow nest current
 work  b09af1adba05923fc3e3961ade0cec3f
 ```
+
+See trusted devices in a nest:
+
+```sh
+$ crow nest devices
+NODE              NAME              ROLE    STATUS    ADDED       LAST SEEN   ADDRESS
+8dad17fbe7b1f81c  laptop            owner   self      2026-05-09  -           192.168.1.8:7070
+14a0f9d55e63b2a1  phone             owner   online    2026-05-09  8s ago      192.168.1.12:7070
+```
+
+`crow nest devices` is the membership view: it tells you which device identities are trusted in the nest. Online/offline status is a convenience hint from the local `crow serve` peer snapshot, not an authorization source. Use `crow peers --long` when debugging raw LAN discovery addresses.
 
 Nests are isolated both on disk and on the network. Files, pins, and catalog entries in one nest can never be seen from another, and `crow sync` between two devices in the same nest goes through a signed challenge-response handshake — the server admits a peer iff the peer's Ed25519 identity is a current `MemberAdded` in that nest's catalog.
 
@@ -580,7 +592,7 @@ shares, shard indexes, or peer addresses during normal use.
 | `share`, `receive` | Transitional cap handoff | Keep now; later route normal sharing through offer/inbox/accept while preserving raw cap mode. |
 | `cap-dir`, `add-dir` | Immutable directory snapshots | Keep as snapshot tools; long-term add first-class mutable shared directories. |
 | `serve` | Local daemon | Keep; future app or service should run it automatically. |
-| `peers` | Discovered network endpoints | Keep as diagnostic; future daily command is `crow nest devices`. |
+| `peers` | Discovered network endpoints | Keep as diagnostic; daily trusted-device view is `crow nest devices`. |
 | `device` | Local identity/name | Keep; nest membership should reference device identities, not just friendly names. |
 | `setup` | Bootstrap wrapper | Keep; future `setup` should create or join a default nest. |
 | `token` | Shared personal-cluster secret | Replace with nest invites and scoped keys. Keep temporarily as an advanced LAN testing bridge. |
@@ -624,7 +636,7 @@ Turn the single local catalog into explicit named encrypted spaces without break
 2. **Storage layout migration — shipped.** First nest-aware command on a legacy `<home>` moves `catalog/`, `pins/`, `chunks/`, and `manifests/` under `<home>/nests/<id>/`. Partial migrations recover by writing `nests.json` for the existing nest dir without re-moving data. Refuses to silently merge legacy directories into an existing index.
 3. **Active nest selection — shipped.** `crow nest list`, `crow nest current`, `crow nest create <name>`, `crow nest use <name-or-id>`, and the global `--nest <name-or-id>` flag. Existing commands operate inside the active nest.
 4. **Nest-safe setup — shipped.** `crow setup` now ensures the default `personal` nest exists (creating it on a fresh home, or migrating a legacy layout) and surfaces it in the success banner.
-5. **Nest devices view.** Add `crow nest devices` as the user-facing trusted-device list. Keep `crow peers` as lower-level LAN/network discovery. Deferred to Phase 3 — needs nest membership.
+5. **Nest devices view — shipped.** `crow nest devices [--long] [--json]` is the user-facing trusted-device list. It reads signed nest membership from the catalog and overlays best-effort LAN presence from the `crow serve` peer snapshot. `crow peers` stays as lower-level network discovery.
 6. **Migration tests — shipped.** Unit tests in `crow::nest` cover fresh/legacy/partial/idempotent migration paths plus create/use/resolve validation. Integration tests verify that legacy data reconstructs through the migrated nest, that two nests stay isolated, and that partial-migration crashes recover without data loss.
 
 Acceptance criteria: existing README workflows still work; new users see a default nest; multiple
