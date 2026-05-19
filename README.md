@@ -102,7 +102,7 @@ crow token init|show|set
 crow serve [--bind ADDR] [--name NAME]
 crow peers [--long] [--json]
 crow fetch <peer> <cap-or-prefix> [--name NAME]
-crow sync [--full] <peer>
+crow sync [--full] [peer]
 crow nest list
 crow nest current
 crow nest devices [--long] [--json]
@@ -296,7 +296,7 @@ crow get /docs/report.pdf report.pdf      # fetch bytes when you read the file
 
 `crow nest invite <recipient-node-id>` requires the local device to already be an Owner of the named nest. `--expires-in` accepts `s` / `m` / `h` / `d` / `w` units (default `7d`); pass `0` or `never` to disable expiry. `crow nest join` verifies the granter's signature, checks the expiry (with a 5-minute clock-skew window), confirms the invite is bound to this device's NodeId, and writes a signed `MemberAdded` event into the new nest's catalog. The invite string is still sensitive in transit, but it cannot be redeemed by a different device key.
 
-`crow sync <peer>` is metadata-first: it pulls signed catalog/member events but does not clone every file's bytes. Use `crow sync --full <peer>` when you explicitly want the active nest's cataloged files to become locally reconstructable. Sync is nest-scoped only; a freshly joined invitee sends its signed membership proof during the first handshake so the inviter can authorize it before any prior sync.
+`crow sync` is metadata-first: it pulls signed catalog/member events from every visible trusted device in the active nest, but does not clone every file's bytes. Use `crow sync <peer>` to target one device, or `crow sync --full [peer]` when you explicitly want the active nest's cataloged files to become locally reconstructable. Sync is nest-scoped only; a freshly joined invitee sends its signed membership proof during the first handshake so the inviter can authorize it before any prior sync.
 
 ### Two-device test
 

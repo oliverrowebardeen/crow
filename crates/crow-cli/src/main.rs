@@ -554,6 +554,7 @@ enum Command {
                       locally reconstructable on this device.\n\
                       \n\
                       Examples:\n  \
+                      crow sync\n  \
                       crow sync laptop\n  \
                       crow sync --full laptop\n  \
                       crow sync 192.168.1.42:7070"
@@ -562,8 +563,9 @@ enum Command {
         /// Also fetch missing manifests/chunks for every cataloged file.
         #[arg(long)]
         full: bool,
-        /// Peer: IP:port, node-id hex prefix, or friendly name.
-        peer: String,
+        /// Optional peer: IP:port, node-id hex prefix, or friendly name. If omitted,
+        /// Crow syncs every visible trusted device in the active nest.
+        peer: Option<String>,
     },
     /// Fetch a cap from a peer, then optionally catalog it.
     #[command(
@@ -1010,9 +1012,15 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
-                Command::Sync { full, peer } => {
-                    cmd_sync(&home, &crow, &catalog, &identity, nest_id, &peer, full)
-                }
+                Command::Sync { full, peer } => cmd_sync(
+                    &home,
+                    &crow,
+                    &catalog,
+                    &identity,
+                    nest_id,
+                    peer.as_deref(),
+                    full,
+                ),
                 Command::Receive {
                     peer,
                     cap_or_prefix,
@@ -3805,13 +3813,29 @@ struct SyncPeerReport {
     objects: Option<SyncObjectReport>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedSyncPeer {
+    node_id: NodeId,
+    name: Option<String>,
+    addresses: Vec<SocketAddr>,
+}
+
+impl TrustedSyncPeer {
+    fn label(&self) -> String {
+        self.name
+            .as_ref()
+            .map(|name| format!("{} ({})", self.node_id.short(), name))
+            .unwrap_or_else(|| self.node_id.short())
+    }
+}
+
 fn cmd_sync(
     home: &Path,
     crow: &Crow<FsStore>,
     catalog: &CatalogIndex,
     identity: &Identity,
     nest_id: NestId,
-    peer: &str,
+    peer: Option<&str>,
     full: bool,
 ) -> DynResult<()> {
     let mode = if full {
@@ -3819,9 +3843,13 @@ fn cmd_sync(
     } else {
         SyncMode::MetadataOnly
     };
-    let report = sync_peer(home, crow, catalog, identity, nest_id, peer, mode)?;
-    print_sync_peer_report(&report);
-    sync_peer_result(&report)
+    if let Some(peer) = peer {
+        let report = sync_peer(home, crow, catalog, identity, nest_id, peer, mode)?;
+        print_sync_peer_report(&report);
+        sync_peer_result(&report)
+    } else {
+        sync_visible_trusted_peers(home, crow, catalog, identity, nest_id, mode)
+    }
 }
 
 fn sync_peer(
@@ -3834,6 +3862,18 @@ fn sync_peer(
     mode: SyncMode,
 ) -> DynResult<SyncPeerReport> {
     let socket_addrs = resolve_peer(home, peer)?;
+    sync_peer_addresses(crow, catalog, identity, nest_id, peer, &socket_addrs, mode)
+}
+
+fn sync_peer_addresses(
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    nest_id: NestId,
+    peer: &str,
+    socket_addrs: &[SocketAddr],
+    mode: SyncMode,
+) -> DynResult<SyncPeerReport> {
     let rt = runtime()?;
 
     // Sync is nest-scoped only: metadata convergence is a trust operation,
@@ -3854,6 +3894,104 @@ fn sync_peer(
         return Err(format!("nest-scoped sync with '{peer}' failed").into());
     };
     sync_nest_scoped_peer(crow, catalog, nest_id, &rt, addr, client, mode)
+}
+
+fn sync_visible_trusted_peers(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    nest_id: NestId,
+    mode: SyncMode,
+) -> DynResult<()> {
+    let snapshot_path = peer_snapshot::snapshot_path(home);
+    let snapshot = peer_snapshot::load(&snapshot_path)?.ok_or_else(|| -> DynError {
+        format!(
+            "no peer snapshot found at {}; start `crow serve` to discover trusted devices",
+            snapshot_path.display()
+        )
+        .into()
+    })?;
+    let view = catalog.view()?;
+    let peers = trusted_sync_peers(&view, identity.node_id(), &snapshot);
+    if peers.is_empty() {
+        return Err(
+            "no visible trusted devices in this nest; run `crow nest devices` to inspect membership and LAN presence"
+                .into(),
+        );
+    }
+
+    let mut successes = 0usize;
+    let mut failures = Vec::new();
+    for (idx, peer) in peers.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+        println!("device        {}", peer.label());
+        match sync_peer_addresses(
+            crow,
+            catalog,
+            identity,
+            nest_id,
+            &peer.label(),
+            &peer.addresses,
+            mode,
+        ) {
+            Ok(report) => {
+                print_sync_peer_report(&report);
+                match sync_peer_result(&report) {
+                    Ok(()) => successes += 1,
+                    Err(e) => failures.push(format!("{}: {e}", peer.label())),
+                }
+            }
+            Err(e) => {
+                println!("status        failed ({e})");
+                failures.push(format!("{}: {e}", peer.label()));
+            }
+        }
+    }
+
+    println!();
+    println!("peers attempted {}", peers.len());
+    println!("peers synced    {successes}");
+    println!("peer failures   {}", failures.len());
+    for failure in &failures {
+        eprintln!("crow sync: {failure}");
+    }
+
+    if successes > 0 {
+        Ok(())
+    } else {
+        Err("sync failed: no trusted peers synced".into())
+    }
+}
+
+fn trusted_sync_peers(
+    view: &CatalogView,
+    local_node: NodeId,
+    snapshot: &PeerSnapshot,
+) -> Vec<TrustedSyncPeer> {
+    let current_members = view
+        .members()
+        .iter()
+        .filter(|member| member.revoked_at.is_none())
+        .map(|member| member.member)
+        .collect::<HashSet<_>>();
+
+    let mut peers = snapshot
+        .peers
+        .iter()
+        .filter(|peer| peer.node_id != local_node)
+        .filter(|peer| current_members.contains(&peer.node_id))
+        .filter(|peer| !peer.addresses.is_empty())
+        .map(|peer| TrustedSyncPeer {
+            node_id: peer.node_id,
+            name: peer.friendly_name.clone(),
+            addresses: peer.addresses.clone(),
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    peers
 }
 
 fn sync_nest_scoped_peer(
@@ -5610,6 +5748,65 @@ mod tests {
         assert_eq!(objects.remote_missing, 0);
         assert_eq!(objects.failed_caps, 0);
         assert_eq!(env.dest_crow.get_bytes(&env.cap).unwrap(), b"cloud bytes");
+    }
+
+    #[test]
+    fn trusted_sync_peers_include_only_visible_current_members() {
+        let (_tmp, owner, catalog) = cat_env();
+        let nest_id = NestId::random();
+        catalog.ensure_founding_member(&nest_id, &owner).unwrap();
+        let trusted = Identity::random();
+        let revoked = Identity::random();
+        let unknown = Identity::random();
+        catalog
+            .append_member_added(&nest_id, &owner, trusted.node_id(), NestRole::Owner)
+            .unwrap();
+        catalog
+            .append_member_added(&nest_id, &owner, revoked.node_id(), NestRole::Owner)
+            .unwrap();
+        catalog
+            .append_member_revoked(&owner, revoked.node_id())
+            .unwrap();
+        let snapshot = PeerSnapshot {
+            snapshot_at: 1_000,
+            self_info: SelfInfo {
+                node_id: owner.node_id(),
+                friendly_name: Some("self".into()),
+                address: "127.0.0.1:7000".parse().unwrap(),
+            },
+            peers: vec![
+                PeerInfo {
+                    node_id: trusted.node_id(),
+                    friendly_name: Some("laptop".into()),
+                    addresses: vec!["192.168.1.10:7000".parse().unwrap()],
+                    last_seen_unix: 990,
+                },
+                PeerInfo {
+                    node_id: revoked.node_id(),
+                    friendly_name: Some("old-phone".into()),
+                    addresses: vec!["192.168.1.11:7000".parse().unwrap()],
+                    last_seen_unix: 990,
+                },
+                PeerInfo {
+                    node_id: unknown.node_id(),
+                    friendly_name: Some("stranger".into()),
+                    addresses: vec!["192.168.1.12:7000".parse().unwrap()],
+                    last_seen_unix: 990,
+                },
+                PeerInfo {
+                    node_id: owner.node_id(),
+                    friendly_name: Some("self-peer".into()),
+                    addresses: vec!["192.168.1.13:7000".parse().unwrap()],
+                    last_seen_unix: 990,
+                },
+            ],
+        };
+
+        let peers = trusted_sync_peers(&catalog.view().unwrap(), owner.node_id(), &snapshot);
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, trusted.node_id());
+        assert_eq!(peers[0].name.as_deref(), Some("laptop"));
     }
 
     #[test]
