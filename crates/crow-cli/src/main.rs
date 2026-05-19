@@ -3764,6 +3764,44 @@ struct SyncCatalogReport {
     catalog_files: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncMode {
+    Full,
+}
+
+impl SyncMode {
+    fn fetches_objects(self) -> bool {
+        match self {
+            Self::Full => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncAuthMode {
+    NestScoped,
+    LegacyClusterToken,
+    LegacyClusterTokenFallback,
+}
+
+impl SyncAuthMode {
+    fn label(self) -> &'static str {
+        match self {
+            SyncAuthMode::NestScoped => "nest-scoped (signed challenge)",
+            SyncAuthMode::LegacyClusterToken => "cluster-token (legacy)",
+            SyncAuthMode::LegacyClusterTokenFallback => "cluster-token (legacy fallback)",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SyncPeerReport {
+    socket_addr: SocketAddr,
+    auth_mode: SyncAuthMode,
+    catalog: SyncCatalogReport,
+    objects: Option<SyncObjectReport>,
+}
+
 fn cmd_sync(
     home: &Path,
     crow: &Crow<FsStore>,
@@ -3772,6 +3810,20 @@ fn cmd_sync(
     nest_id: NestId,
     peer: &str,
 ) -> DynResult<()> {
+    let report = sync_peer(home, crow, catalog, identity, nest_id, peer, SyncMode::Full)?;
+    print_sync_peer_report(&report);
+    sync_peer_result(&report)
+}
+
+fn sync_peer(
+    home: &Path,
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    identity: &Identity,
+    nest_id: NestId,
+    peer: &str,
+    mode: SyncMode,
+) -> DynResult<SyncPeerReport> {
     let socket_addrs = resolve_peer(home, peer)?;
     let rt = runtime()?;
 
@@ -3785,57 +3837,113 @@ fn cmd_sync(
         .iter()
         .any(|m| m.member == identity.node_id() && m.revoked_at.is_none());
 
-    let (socket_addr, catalog_report, object_report) = if am_member {
+    if am_member {
         let proof = local_membership_proof(catalog, identity.node_id())?;
         match connect_peer_for_nest(&rt, peer, &socket_addrs, nest_id, identity, proof)? {
             Some((addr, client)) => {
-                println!("auth          nest-scoped (signed challenge)");
-                let remote_events = rt.block_on(client.nest_catalog_events())?;
-                let catalog_report =
-                    sync_catalog_events_from_peer(catalog, &nest_id, remote_events)?;
-                let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
-                    rt.block_on(client.nest_get_many(reqs)).map_err(Into::into)
-                };
-                let object_report = sync_catalog_objects(crow, catalog, &mut fetch_remote)?;
-                (addr, catalog_report, object_report)
+                sync_nest_scoped_peer(crow, catalog, nest_id, &rt, addr, client, mode)
             }
-            None => {
-                println!("auth          cluster-token (legacy fallback)");
-                sync_legacy_cluster_token(home, crow, catalog, &rt, peer, &socket_addrs)?
-            }
+            None => sync_legacy_cluster_token(
+                home,
+                crow,
+                catalog,
+                &rt,
+                peer,
+                &socket_addrs,
+                SyncAuthMode::LegacyClusterTokenFallback,
+                mode,
+            ),
         }
     } else {
-        println!("auth          cluster-token (legacy)");
-        sync_legacy_cluster_token(home, crow, catalog, &rt, peer, &socket_addrs)?
-    };
+        sync_legacy_cluster_token(
+            home,
+            crow,
+            catalog,
+            &rt,
+            peer,
+            &socket_addrs,
+            SyncAuthMode::LegacyClusterToken,
+            mode,
+        )
+    }
+}
 
-    println!("peer          {socket_addr}");
-    println!("remote events {}", catalog_report.remote_events);
-    println!("new events    {}", catalog_report.new_events);
-    println!("local events  {}", catalog_report.local_events);
-    println!("catalog files {}", object_report.catalog_files);
-    println!(
-        "objects       {} local / {} fetched / {} missing",
-        object_report.already_local, object_report.fetched, object_report.remote_missing
-    );
-    println!(
-        "stored        {}",
-        format_size_u64(object_report.fetched_bytes)
-    );
-    if object_report.failed_caps == 0 && object_report.remote_missing == 0 {
-        println!("status        synced");
-        Ok(())
+fn sync_nest_scoped_peer(
+    crow: &Crow<FsStore>,
+    catalog: &CatalogIndex,
+    nest_id: NestId,
+    rt: &tokio::runtime::Runtime,
+    socket_addr: SocketAddr,
+    client: Client,
+    mode: SyncMode,
+) -> DynResult<SyncPeerReport> {
+    let remote_events = rt.block_on(client.nest_catalog_events())?;
+    let catalog_report = sync_catalog_events_from_peer(catalog, &nest_id, remote_events)?;
+    let objects = if mode.fetches_objects() {
+        let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
+            rt.block_on(client.nest_get_many(reqs)).map_err(Into::into)
+        };
+        Some(sync_catalog_objects(crow, catalog, &mut fetch_remote)?)
     } else {
-        println!(
-            "status        incomplete ({} unreconstructable catalog file{})",
-            object_report.failed_caps,
-            if object_report.failed_caps == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
-        Err("sync incomplete: some catalog files are not reconstructable".into())
+        None
+    };
+    Ok(SyncPeerReport {
+        socket_addr,
+        auth_mode: SyncAuthMode::NestScoped,
+        catalog: catalog_report,
+        objects,
+    })
+}
+
+fn print_sync_peer_report(report: &SyncPeerReport) {
+    println!("auth          {}", report.auth_mode.label());
+    println!("peer          {}", report.socket_addr);
+    println!("remote events {}", report.catalog.remote_events);
+    println!("new events    {}", report.catalog.new_events);
+    println!("local events  {}", report.catalog.local_events);
+    match &report.objects {
+        Some(object_report) => {
+            println!("catalog files {}", object_report.catalog_files);
+            println!(
+                "objects       {} local / {} fetched / {} missing",
+                object_report.already_local, object_report.fetched, object_report.remote_missing
+            );
+            println!(
+                "stored        {}",
+                format_size_u64(object_report.fetched_bytes)
+            );
+        }
+        None => {
+            println!("catalog files {}", report.catalog.catalog_files);
+            println!("objects       skipped (metadata-only)");
+        }
+    }
+}
+
+fn sync_peer_result(report: &SyncPeerReport) -> DynResult<()> {
+    match &report.objects {
+        Some(object_report)
+            if object_report.failed_caps == 0 && object_report.remote_missing == 0 =>
+        {
+            println!("status        synced");
+            Ok(())
+        }
+        Some(object_report) => {
+            println!(
+                "status        incomplete ({} unreconstructable catalog file{})",
+                object_report.failed_caps,
+                if object_report.failed_caps == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            Err("sync incomplete: some catalog files are not reconstructable".into())
+        }
+        None => {
+            println!("status        metadata synced");
+            Ok(())
+        }
     }
 }
 
@@ -3901,17 +4009,28 @@ fn sync_legacy_cluster_token(
     rt: &tokio::runtime::Runtime,
     peer: &str,
     socket_addrs: &[SocketAddr],
-) -> DynResult<(SocketAddr, SyncCatalogReport, SyncObjectReport)> {
+    auth_mode: SyncAuthMode,
+    mode: SyncMode,
+) -> DynResult<SyncPeerReport> {
     let token = load_token(home)?;
-    let (addr, client) = connect_peer(rt, token, peer, socket_addrs)?;
+    let (socket_addr, client) = connect_peer(rt, token, peer, socket_addrs)?;
     let remote_events = rt.block_on(client.catalog_events(token))?;
     let catalog_report = sync_catalog_events(catalog, remote_events)?;
-    let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
-        rt.block_on(client.get_many(token, reqs))
-            .map_err(Into::into)
+    let objects = if mode.fetches_objects() {
+        let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
+            rt.block_on(client.get_many(token, reqs))
+                .map_err(Into::into)
+        };
+        Some(sync_catalog_objects(crow, catalog, &mut fetch_remote)?)
+    } else {
+        None
     };
-    let object_report = sync_catalog_objects(crow, catalog, &mut fetch_remote)?;
-    Ok((addr, catalog_report, object_report))
+    Ok(SyncPeerReport {
+        socket_addr,
+        auth_mode,
+        catalog: catalog_report,
+        objects,
+    })
 }
 
 fn local_membership_proof(
