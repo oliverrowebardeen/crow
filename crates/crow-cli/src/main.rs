@@ -545,18 +545,23 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Pull catalog metadata and missing objects from a trusted peer.
+    /// Pull nest metadata from a trusted peer.
     #[command(
         long_about = "Connect to a trusted Crow peer, pull its catalog event log, \
-                      merge any new path metadata locally, then fetch missing \
+                      and merge any new path/member metadata locally. By default this \
+                      does not download file bytes. Pass --full to also fetch missing \
                       manifests/chunks for every cataloged file so synced paths are \
-                      locally reconstructable.\n\
+                      locally reconstructable on this device.\n\
                       \n\
                       Examples:\n  \
                       crow sync laptop\n  \
+                      crow sync --full laptop\n  \
                       crow sync 192.168.1.42:7070"
     )]
     Sync {
+        /// Also fetch missing manifests/chunks for every cataloged file.
+        #[arg(long)]
+        full: bool,
         /// Peer: IP:port, node-id hex prefix, or friendly name.
         peer: String,
     },
@@ -1005,8 +1010,8 @@ fn run(cli: Cli) -> DynResult<()> {
                     cap_or_prefix,
                     name,
                 } => cmd_fetch(&home, &crow, &pins, &peer, &cap_or_prefix, name),
-                Command::Sync { peer } => {
-                    cmd_sync(&home, &crow, &catalog, &identity, nest_id, &peer)
+                Command::Sync { full, peer } => {
+                    cmd_sync(&home, &crow, &catalog, &identity, nest_id, &peer, full)
                 }
                 Command::Receive {
                     peer,
@@ -3766,12 +3771,14 @@ struct SyncCatalogReport {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyncMode {
+    MetadataOnly,
     Full,
 }
 
 impl SyncMode {
     fn fetches_objects(self) -> bool {
         match self {
+            Self::MetadataOnly => false,
             Self::Full => true,
         }
     }
@@ -3780,16 +3787,12 @@ impl SyncMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyncAuthMode {
     NestScoped,
-    LegacyClusterToken,
-    LegacyClusterTokenFallback,
 }
 
 impl SyncAuthMode {
     fn label(self) -> &'static str {
         match self {
             SyncAuthMode::NestScoped => "nest-scoped (signed challenge)",
-            SyncAuthMode::LegacyClusterToken => "cluster-token (legacy)",
-            SyncAuthMode::LegacyClusterTokenFallback => "cluster-token (legacy fallback)",
         }
     }
 }
@@ -3809,8 +3812,14 @@ fn cmd_sync(
     identity: &Identity,
     nest_id: NestId,
     peer: &str,
+    full: bool,
 ) -> DynResult<()> {
-    let report = sync_peer(home, crow, catalog, identity, nest_id, peer, SyncMode::Full)?;
+    let mode = if full {
+        SyncMode::Full
+    } else {
+        SyncMode::MetadataOnly
+    };
+    let report = sync_peer(home, crow, catalog, identity, nest_id, peer, mode)?;
     print_sync_peer_report(&report);
     sync_peer_result(&report)
 }
@@ -3827,45 +3836,24 @@ fn sync_peer(
     let socket_addrs = resolve_peer(home, peer)?;
     let rt = runtime()?;
 
-    // Prefer nest-scoped auth when this device is a recognised member of
-    // the active nest. If the peer cannot authenticate this nest (common
-    // during mixed Phase-2/Phase-3 upgrades with different local NestIds),
-    // fall back to the legacy cluster-token bridge.
+    // Sync is nest-scoped only: metadata convergence is a trust operation,
+    // so membership must be explicit rather than a legacy bearer token.
     let view = catalog.view()?;
     let am_member = view
         .members()
         .iter()
         .any(|m| m.member == identity.node_id() && m.revoked_at.is_none());
-
-    if am_member {
-        let proof = local_membership_proof(catalog, identity.node_id())?;
-        match connect_peer_for_nest(&rt, peer, &socket_addrs, nest_id, identity, proof)? {
-            Some((addr, client)) => {
-                sync_nest_scoped_peer(crow, catalog, nest_id, &rt, addr, client, mode)
-            }
-            None => sync_legacy_cluster_token(
-                home,
-                crow,
-                catalog,
-                &rt,
-                peer,
-                &socket_addrs,
-                SyncAuthMode::LegacyClusterTokenFallback,
-                mode,
-            ),
-        }
-    } else {
-        sync_legacy_cluster_token(
-            home,
-            crow,
-            catalog,
-            &rt,
-            peer,
-            &socket_addrs,
-            SyncAuthMode::LegacyClusterToken,
-            mode,
-        )
+    if !am_member {
+        return Err(format!("this device is not a current member of nest {nest_id}").into());
     }
+
+    let proof = local_membership_proof(catalog, identity.node_id())?;
+    let Some((addr, client)) =
+        connect_peer_for_nest(&rt, peer, &socket_addrs, nest_id, identity, proof)?
+    else {
+        return Err(format!("nest-scoped sync with '{peer}' failed").into());
+    };
+    sync_nest_scoped_peer(crow, catalog, nest_id, &rt, addr, client, mode)
 }
 
 fn sync_nest_scoped_peer(
@@ -3999,37 +3987,6 @@ fn sync_catalog_objects(
         remote_missing: counters.remote_missing,
         fetched_bytes: counters.fetched_bytes,
         failed_caps,
-    })
-}
-
-fn sync_legacy_cluster_token(
-    home: &Path,
-    crow: &Crow<FsStore>,
-    catalog: &CatalogIndex,
-    rt: &tokio::runtime::Runtime,
-    peer: &str,
-    socket_addrs: &[SocketAddr],
-    auth_mode: SyncAuthMode,
-    mode: SyncMode,
-) -> DynResult<SyncPeerReport> {
-    let token = load_token(home)?;
-    let (socket_addr, client) = connect_peer(rt, token, peer, socket_addrs)?;
-    let remote_events = rt.block_on(client.catalog_events(token))?;
-    let catalog_report = sync_catalog_events(catalog, remote_events)?;
-    let objects = if mode.fetches_objects() {
-        let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
-            rt.block_on(client.get_many(token, reqs))
-                .map_err(Into::into)
-        };
-        Some(sync_catalog_objects(crow, catalog, &mut fetch_remote)?)
-    } else {
-        None
-    };
-    Ok(SyncPeerReport {
-        socket_addr,
-        auth_mode,
-        catalog: catalog_report,
-        objects,
     })
 }
 
@@ -5515,6 +5472,144 @@ mod tests {
         assert_eq!(report.catalog_files, 1);
         assert_eq!(report.remote_missing, 1);
         assert_eq!(report.failed_caps, 1);
+    }
+
+    struct SyncTestEnv {
+        _source: tempfile::TempDir,
+        dest: tempfile::TempDir,
+        dest_identity: Identity,
+        dest_catalog: CatalogIndex,
+        dest_crow: Crow<FsStore>,
+        cap: Cap,
+        nest_id: NestId,
+        server_addr: SocketAddr,
+        _server: crow_net::Server,
+        _rt: tokio::runtime::Runtime,
+    }
+
+    fn nest_sync_test_env() -> SyncTestEnv {
+        let source = tempfile::TempDir::new().unwrap();
+        let dest = tempfile::TempDir::new().unwrap();
+        let source_identity = test_identity(source.path());
+        let dest_identity = test_identity(dest.path());
+        let nest_id = NestId::random();
+
+        let source_catalog = CatalogIndex::open(source.path()).unwrap();
+        source_catalog
+            .ensure_founding_member(&nest_id, &source_identity)
+            .unwrap();
+        source_catalog
+            .append_member_added(
+                &nest_id,
+                &source_identity,
+                dest_identity.node_id(),
+                NestRole::Owner,
+            )
+            .unwrap();
+
+        let dest_catalog = CatalogIndex::open(dest.path()).unwrap();
+        dest_catalog
+            .merge_events_from_peer_for_nest(&nest_id, source_catalog.load_events().unwrap())
+            .unwrap();
+
+        let source_crow = Crow::new(FsStore::open(source.path()).unwrap());
+        let cap = stored_cap(&source_crow, b"cloud bytes");
+        source_catalog
+            .mkdir("/docs", false, &source_identity)
+            .unwrap();
+        source_catalog
+            .put_file(
+                "/docs/report.txt",
+                cap.clone(),
+                Some("report.txt".into()),
+                &source_identity,
+            )
+            .unwrap();
+
+        let rt = runtime().unwrap();
+        let token = ClusterToken::random();
+        let mut config = crow_net::ServeConfig::new(
+            FsStore::open(source.path()).unwrap(),
+            token,
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        config.nest_serving = Some(crow_net::NestServingConfig {
+            nest_id,
+            catalog: std::sync::Arc::new(CatalogIndex::open(source.path()).unwrap()),
+        });
+        let server = rt.block_on(crow_net::serve_with_config(config)).unwrap();
+        let server_addr = server.local_addr();
+        let dest_crow = Crow::new(FsStore::open(dest.path()).unwrap());
+
+        SyncTestEnv {
+            _source: source,
+            dest,
+            dest_identity,
+            dest_catalog,
+            dest_crow,
+            cap,
+            nest_id,
+            server_addr,
+            _server: server,
+            _rt: rt,
+        }
+    }
+
+    #[test]
+    fn sync_peer_metadata_only_imports_catalog_without_objects() {
+        let env = nest_sync_test_env();
+        let peer = env.server_addr.to_string();
+
+        let report = sync_peer(
+            env.dest.path(),
+            &env.dest_crow,
+            &env.dest_catalog,
+            &env.dest_identity,
+            env.nest_id,
+            &peer,
+            SyncMode::MetadataOnly,
+        )
+        .unwrap();
+
+        assert_eq!(report.auth_mode, SyncAuthMode::NestScoped);
+        assert!(report.objects.is_none());
+        assert!(
+            env.dest_catalog
+                .view()
+                .unwrap()
+                .get(&CatalogPath::normalize("/docs/report.txt").unwrap())
+                .is_some()
+        );
+        assert!(
+            !env.dest_crow
+                .store()
+                .has(Namespace::Manifests, env.cap.manifest_hash.inner())
+                .unwrap()
+        );
+        assert!(env.dest_crow.get_bytes(&env.cap).is_err());
+    }
+
+    #[test]
+    fn sync_peer_full_imports_catalog_and_objects() {
+        let env = nest_sync_test_env();
+        let peer = env.server_addr.to_string();
+
+        let report = sync_peer(
+            env.dest.path(),
+            &env.dest_crow,
+            &env.dest_catalog,
+            &env.dest_identity,
+            env.nest_id,
+            &peer,
+            SyncMode::Full,
+        )
+        .unwrap();
+
+        let objects = report.objects.expect("full sync reports objects");
+        assert!(objects.fetched > 0);
+        assert_eq!(objects.remote_missing, 0);
+        assert_eq!(objects.failed_caps, 0);
+        assert_eq!(env.dest_crow.get_bytes(&env.cap).unwrap(), b"cloud bytes");
     }
 
     #[test]
