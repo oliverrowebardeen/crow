@@ -10,9 +10,9 @@ use clap::{Parser, Subcommand};
 use crow::{
     Cap, CatalogEntry, CatalogEvent, CatalogIndex, CatalogPath, CatalogView, ChunkStore, Crow,
     DEFAULT_CHUNK_SIZE, DirectoryEntry, DirectoryEntryKind, DirectoryManifest, EntryKind,
-    ErasureParams, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind, MemberRecord,
-    Namespace, Nest, NestId, NestIndex, NestRole, NodeId, PinIndex, PinRecord, SignatureStatus,
-    compute_live_set, compute_live_set_from_roots,
+    ErasureParams, Error as CrowError, FsStore, GcOptions, Hash, Identity, Manifest, ManifestKind,
+    MemberRecord, Namespace, Nest, NestId, NestIndex, NestRole, NodeId, PinIndex, PinRecord,
+    SignatureStatus, compute_live_set, compute_live_set_from_roots,
     erasure::{AEAD_TAG_LEN, RS_ALIGN},
     sweep, targeted_remove,
 };
@@ -794,6 +794,15 @@ struct StoreContext<'a> {
     identity: &'a Identity,
 }
 
+#[derive(Clone, Copy)]
+struct LazyFetchContext<'a> {
+    home: &'a Path,
+    crow: &'a Crow<FsStore>,
+    catalog: &'a CatalogIndex,
+    identity: &'a Identity,
+    nest_id: NestId,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct DeviceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -942,10 +951,29 @@ fn run(cli: Cli) -> DynResult<()> {
                         chunk_size,
                     },
                 ),
-                Command::Get { cap_or_prefix, out } => {
-                    cmd_get(&crow, &pins, &catalog, &cap_or_prefix, &out)
-                }
-                Command::Cat { cap_or_prefix } => cmd_cat(&crow, &pins, &catalog, &cap_or_prefix),
+                Command::Get { cap_or_prefix, out } => cmd_get(
+                    LazyFetchContext {
+                        home: &home,
+                        crow: &crow,
+                        catalog: &catalog,
+                        identity: &identity,
+                        nest_id,
+                    },
+                    &pins,
+                    &cap_or_prefix,
+                    &out,
+                ),
+                Command::Cat { cap_or_prefix } => cmd_cat(
+                    LazyFetchContext {
+                        home: &home,
+                        crow: &crow,
+                        catalog: &catalog,
+                        identity: &identity,
+                        nest_id,
+                    },
+                    &pins,
+                    &cap_or_prefix,
+                ),
                 Command::Cap { cap_or_prefix } => cmd_cap(&pins, &catalog, &cap_or_prefix),
                 Command::Share {
                     cap_or_prefix,
@@ -976,15 +1004,36 @@ fn run(cli: Cli) -> DynResult<()> {
                 Command::Grep {
                     pattern,
                     cap_or_prefix,
-                } => cmd_grep(&crow, &pins, &catalog, &pattern, &cap_or_prefix),
+                } => cmd_grep(
+                    LazyFetchContext {
+                        home: &home,
+                        crow: &crow,
+                        catalog: &catalog,
+                        identity: &identity,
+                        nest_id,
+                    },
+                    &pins,
+                    &pattern,
+                    &cap_or_prefix,
+                ),
                 Command::Du { path } => cmd_du(&crow, &catalog, path.as_deref()),
                 Command::Mkdir { path, parents } => cmd_mkdir(&catalog, &identity, &path, parents),
                 Command::PutDir { source, dest, yes } => {
                     cmd_put_dir(&crow, &catalog, &identity, &source, dest.as_deref(), yes)
                 }
-                Command::GetDir { path, out, yes } => {
-                    cmd_get_dir(&crow, &pins, &catalog, &path, &out, yes)
-                }
+                Command::GetDir { path, out, yes } => cmd_get_dir(
+                    LazyFetchContext {
+                        home: &home,
+                        crow: &crow,
+                        catalog: &catalog,
+                        identity: &identity,
+                        nest_id,
+                    },
+                    &pins,
+                    &path,
+                    &out,
+                    yes,
+                ),
                 Command::CapDir { path, name } => {
                     cmd_cap_dir(&crow, &pins, &catalog, &identity, &path, name)
                 }
@@ -1658,40 +1707,24 @@ fn cmd_put(
     Ok(())
 }
 
-fn cmd_get(
-    crow: &Crow<FsStore>,
-    pins: &PinIndex,
-    catalog: &CatalogIndex,
-    arg: &str,
-    out: &str,
-) -> DynResult<()> {
-    let target = resolve_file_ref(catalog, pins, arg)?;
+fn cmd_get(lazy: LazyFetchContext<'_>, pins: &PinIndex, arg: &str, out: &str) -> DynResult<()> {
+    let target = resolve_file_ref(lazy.catalog, pins, arg)?;
     let cap = target.cap;
-    let bytes = crow.get_bytes(&cap)?;
+    let bytes = read_file_bytes_with_lazy(lazy, &cap)?;
     write_all(out, &bytes)?;
     Ok(())
 }
 
-fn cmd_cat(
-    crow: &Crow<FsStore>,
-    pins: &PinIndex,
-    catalog: &CatalogIndex,
-    arg: &str,
-) -> DynResult<()> {
-    let bytes = cat_bytes(crow, pins, catalog, arg)?;
+fn cmd_cat(lazy: LazyFetchContext<'_>, pins: &PinIndex, arg: &str) -> DynResult<()> {
+    let bytes = cat_bytes(lazy, pins, arg)?;
     io::stdout().lock().write_all(&bytes)?;
     Ok(())
 }
 
-fn cat_bytes(
-    crow: &Crow<FsStore>,
-    pins: &PinIndex,
-    catalog: &CatalogIndex,
-    arg: &str,
-) -> DynResult<Vec<u8>> {
-    let target = resolve_file_ref(catalog, pins, arg)?;
-    match crow.open_manifest_kind(&target.cap)? {
-        ManifestKind::File(_) => Ok(crow.get_bytes(&target.cap)?),
+fn cat_bytes(lazy: LazyFetchContext<'_>, pins: &PinIndex, arg: &str) -> DynResult<Vec<u8>> {
+    let target = resolve_file_ref(lazy.catalog, pins, arg)?;
+    match open_manifest_kind_with_lazy(lazy, &target.cap)? {
+        ManifestKind::File(_) => read_file_bytes_with_lazy(lazy, &target.cap),
         ManifestKind::Directory(_) => Err(format!("{} is a directory", arg.trim()).into()),
     }
 }
@@ -2151,13 +2184,12 @@ struct GrepTarget {
 }
 
 fn cmd_grep(
-    crow: &Crow<FsStore>,
+    lazy: LazyFetchContext<'_>,
     pins: &PinIndex,
-    catalog: &CatalogIndex,
     pattern: &str,
     arg: &str,
 ) -> DynResult<()> {
-    let report = grep_report(crow, pins, catalog, pattern, arg)?;
+    let report = grep_report(lazy, pins, pattern, arg)?;
     for hit in &report.matches {
         println!("{}:{}:{}", hit.display, hit.line, hit.text);
     }
@@ -2172,19 +2204,18 @@ fn cmd_grep(
 }
 
 fn grep_report(
-    crow: &Crow<FsStore>,
+    lazy: LazyFetchContext<'_>,
     pins: &PinIndex,
-    catalog: &CatalogIndex,
     pattern: &str,
     arg: &str,
 ) -> DynResult<GrepReport> {
     let regex = Regex::new(pattern)?;
-    let targets = grep_targets(catalog, pins, arg)?;
+    let targets = grep_targets(lazy.catalog, pins, arg)?;
     let mut matches = Vec::new();
     let mut errors = Vec::new();
 
     for target in targets {
-        let bytes = match grep_file_bytes(crow, &target.cap) {
+        let bytes = match grep_file_bytes(lazy, &target.cap) {
             Ok(bytes) => bytes,
             Err(e) => {
                 errors.push(format!("{}: {e}", target.display));
@@ -2246,9 +2277,9 @@ fn grep_targets(catalog: &CatalogIndex, pins: &PinIndex, arg: &str) -> DynResult
     }])
 }
 
-fn grep_file_bytes(crow: &Crow<FsStore>, cap: &Cap) -> DynResult<Vec<u8>> {
-    match crow.open_manifest_kind(cap)? {
-        ManifestKind::File(_) => Ok(crow.get_bytes(cap)?),
+fn grep_file_bytes(lazy: LazyFetchContext<'_>, cap: &Cap) -> DynResult<Vec<u8>> {
+    match open_manifest_kind_with_lazy(lazy, cap)? {
+        ManifestKind::File(_) => read_file_bytes_with_lazy(lazy, cap),
         ManifestKind::Directory(_) => Err("is a directory snapshot".into()),
     }
 }
@@ -2573,9 +2604,8 @@ fn add_directory_cap_to_catalog(
 }
 
 fn cmd_get_dir(
-    crow: &Crow<FsStore>,
+    lazy: LazyFetchContext<'_>,
     pins: &PinIndex,
-    catalog: &CatalogIndex,
     path: &str,
     out: &str,
     yes: bool,
@@ -2584,13 +2614,13 @@ fn cmd_get_dir(
     let out = Path::new(out);
     prepare_get_dir_output(out, yes)?;
 
-    let view = catalog.view()?;
+    let view = lazy.catalog.view()?;
     if let Ok(path) = CatalogPath::normalize(raw_source) {
         if let Some(entry) = view.get(&path) {
             if !entry.is_dir() {
                 return Err(format!("{path} is a file; use `crow get`").into());
             }
-            let restored_files = restore_catalog_dir(crow, &view, &path, out)?;
+            let restored_files = restore_catalog_dir(lazy, &view, &path, out)?;
             println!(
                 "restored {} file{} from {path} into {}",
                 restored_files,
@@ -2606,8 +2636,8 @@ fn cmd_get_dir(
 
     let cap = resolve_cap(pins, raw_source)
         .map_err(|_| "directory source must be a catalog path or directory cap/prefix")?;
-    let manifest = crow.open_directory_manifest(&cap)?;
-    let restored_files = restore_directory_manifest(crow, &manifest, out)?;
+    let manifest = open_directory_manifest_with_lazy(lazy, &cap)?;
+    let restored_files = restore_directory_manifest(lazy, &manifest, out)?;
     println!(
         "restored {} file{} from directory cap into {}",
         restored_files,
@@ -2637,7 +2667,7 @@ fn prepare_get_dir_output(out: &Path, yes: bool) -> DynResult<()> {
 }
 
 fn restore_catalog_dir(
-    crow: &Crow<FsStore>,
+    lazy: LazyFetchContext<'_>,
     view: &CatalogView,
     path: &CatalogPath,
     out: &Path,
@@ -2666,7 +2696,7 @@ fn restore_catalog_dir(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = crow.get_bytes(cap)?;
+        let bytes = read_file_bytes_with_lazy(lazy, cap)?;
         fs::write(&target, bytes)?;
         restored_files += 1;
     }
@@ -2674,7 +2704,7 @@ fn restore_catalog_dir(
 }
 
 fn restore_directory_manifest(
-    crow: &Crow<FsStore>,
+    lazy: LazyFetchContext<'_>,
     manifest: &DirectoryManifest,
     out: &Path,
 ) -> DynResult<usize> {
@@ -2703,7 +2733,7 @@ fn restore_directory_manifest(
             fs::create_dir_all(parent)?;
         }
         let cap = Cap::decode(cap)?;
-        let bytes = crow.get_bytes(&cap)?;
+        let bytes = read_file_bytes_with_lazy(lazy, &cap)?;
         fs::write(&target, bytes)?;
         restored_files += 1;
     }
@@ -3889,7 +3919,7 @@ fn sync_peer_addresses(
 
     let proof = local_membership_proof(catalog, identity.node_id())?;
     let Some((addr, client)) =
-        connect_peer_for_nest(&rt, peer, &socket_addrs, nest_id, identity, proof)?
+        connect_peer_for_nest(&rt, peer, &socket_addrs, nest_id, identity, proof, true)?
     else {
         return Err(format!("nest-scoped sync with '{peer}' failed").into());
     };
@@ -3992,6 +4022,152 @@ fn trusted_sync_peers(
         .collect::<Vec<_>>();
     peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     peers
+}
+
+fn read_file_bytes_with_lazy(lazy: LazyFetchContext<'_>, cap: &Cap) -> DynResult<Vec<u8>> {
+    match lazy.crow.get_bytes(cap) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if is_lazy_fetch_error(&e) => {
+            lazy_fetch_cap(lazy, cap).map_err(|fetch_err| -> DynError {
+                format!("{e}; lazy fetch failed: {fetch_err}").into()
+            })?;
+            lazy.crow.get_bytes(cap).map_err(Into::into)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn open_manifest_kind_with_lazy(lazy: LazyFetchContext<'_>, cap: &Cap) -> DynResult<ManifestKind> {
+    match lazy.crow.open_manifest_kind(cap) {
+        Ok(kind) => Ok(kind),
+        Err(e) if is_lazy_fetch_error(&e) => {
+            lazy_fetch_cap(lazy, cap).map_err(|fetch_err| -> DynError {
+                format!("{e}; lazy fetch failed: {fetch_err}").into()
+            })?;
+            lazy.crow.open_manifest_kind(cap).map_err(Into::into)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn open_directory_manifest_with_lazy(
+    lazy: LazyFetchContext<'_>,
+    cap: &Cap,
+) -> DynResult<DirectoryManifest> {
+    match lazy.crow.open_directory_manifest(cap) {
+        Ok(manifest) => Ok(manifest),
+        Err(e) if is_lazy_fetch_error(&e) => {
+            lazy_fetch_cap(lazy, cap).map_err(|fetch_err| -> DynError {
+                format!("{e}; lazy fetch failed: {fetch_err}").into()
+            })?;
+            lazy.crow.open_directory_manifest(cap).map_err(Into::into)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn is_lazy_fetch_error(error: &CrowError) -> bool {
+    matches!(
+        error,
+        CrowError::MissingChunk(_) | CrowError::NotEnoughShares { .. }
+    )
+}
+
+fn lazy_fetch_cap(lazy: LazyFetchContext<'_>, cap: &Cap) -> DynResult<()> {
+    let snapshot_path = peer_snapshot::snapshot_path(lazy.home);
+    let snapshot = peer_snapshot::load(&snapshot_path)?.ok_or_else(|| -> DynError {
+        format!(
+            "local bytes are missing and no peer snapshot exists at {}; start `crow serve` to discover trusted devices",
+            snapshot_path.display()
+        )
+        .into()
+    })?;
+    let view = lazy.catalog.view()?;
+    let peers = trusted_sync_peers(&view, lazy.identity.node_id(), &snapshot);
+    if peers.is_empty() {
+        return Err(
+            "local bytes are missing and no visible trusted devices in this nest can serve them"
+                .into(),
+        );
+    }
+
+    let cap_label = cap_manifest_short(cap);
+    let mut failures = Vec::new();
+    for peer in &peers {
+        eprintln!(
+            "crow: fetching missing bytes for {cap_label} from {}",
+            peer.label()
+        );
+        match fetch_cap_from_trusted_peer(lazy, peer, cap) {
+            Ok(_) if verify_cap_reconstructable(lazy.crow, cap).is_ok() => return Ok(()),
+            Ok(report) => failures.push(format!(
+                "{}: fetched {} object(s), {} still missing",
+                peer.label(),
+                report.fetched,
+                report.remote_missing
+            )),
+            Err(e) => failures.push(format!("{}: {e}", peer.label())),
+        }
+    }
+
+    Err(format!(
+        "could not reconstruct {cap_label} from {} visible trusted peer{}{}",
+        peers.len(),
+        if peers.len() == 1 { "" } else { "s" },
+        if failures.is_empty() {
+            String::new()
+        } else {
+            format!(":\n  {}", failures.join("\n  "))
+        }
+    )
+    .into())
+}
+
+fn fetch_cap_from_trusted_peer(
+    lazy: LazyFetchContext<'_>,
+    peer: &TrustedSyncPeer,
+    cap: &Cap,
+) -> DynResult<SyncObjectReport> {
+    let rt = runtime()?;
+    let proof = local_membership_proof(lazy.catalog, lazy.identity.node_id())?;
+    let label = peer.label();
+    let Some((_addr, client)) = connect_peer_for_nest(
+        &rt,
+        &label,
+        &peer.addresses,
+        lazy.nest_id,
+        lazy.identity,
+        proof,
+        false,
+    )?
+    else {
+        return Err(format!("nest-scoped connection to {label} failed").into());
+    };
+
+    let mut counters = FetchCounters::default();
+    let mut visited = HashSet::new();
+    let mut fetch_remote =
+        |reqs: &[(Namespace, Hash)]| rt.block_on(client.nest_get_many(reqs)).map_err(Into::into);
+    fetch_cap_recursive(
+        lazy.crow,
+        cap,
+        &mut counters,
+        &mut visited,
+        &mut fetch_remote,
+    )?;
+    let failed_caps = usize::from(verify_cap_reconstructable(lazy.crow, cap).is_err());
+    Ok(SyncObjectReport {
+        catalog_files: 1,
+        fetched: counters.fetched,
+        already_local: counters.already_local,
+        remote_missing: counters.remote_missing,
+        fetched_bytes: counters.fetched_bytes,
+        failed_caps,
+    })
+}
+
+fn cap_manifest_short(cap: &Cap) -> String {
+    cap.manifest_hash.to_string()[..16].to_string()
 }
 
 fn sync_nest_scoped_peer(
@@ -4364,6 +4540,7 @@ fn connect_peer_for_nest(
     nest_id: NestId,
     identity: &Identity,
     membership_proof: Option<CatalogEvent>,
+    emit_failure_details: bool,
 ) -> DynResult<Option<(SocketAddr, Client)>> {
     let mut failures = Vec::new();
     for addr in addresses {
@@ -4391,9 +4568,11 @@ fn connect_peer_for_nest(
         msg.push_str("\n  ");
         msg.push_str(&failure);
     }
-    println!("auth          nest-scoped failed");
-    for line in msg.lines() {
-        println!("auth detail   {line}");
+    if emit_failure_details {
+        println!("auth          nest-scoped failed");
+        for line in msg.lines() {
+            println!("auth detail   {line}");
+        }
     }
     Ok(None)
 }
@@ -5338,6 +5517,21 @@ mod tests {
         (tmp, identity, pins, catalog, crow)
     }
 
+    fn test_lazy_ctx<'a>(
+        home: &'a std::path::Path,
+        crow: &'a Crow<FsStore>,
+        catalog: &'a CatalogIndex,
+        identity: &'a Identity,
+    ) -> LazyFetchContext<'a> {
+        LazyFetchContext {
+            home,
+            crow,
+            catalog,
+            identity,
+            nest_id: NestId::random(),
+        }
+    }
+
     #[test]
     fn fetch_without_name_preserves_existing_pin_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5616,6 +5810,7 @@ mod tests {
         _source: tempfile::TempDir,
         dest: tempfile::TempDir,
         dest_identity: Identity,
+        source_node: NodeId,
         dest_catalog: CatalogIndex,
         dest_crow: Crow<FsStore>,
         cap: Cap,
@@ -5683,6 +5878,7 @@ mod tests {
             _source: source,
             dest,
             dest_identity,
+            source_node: source_identity.node_id(),
             dest_catalog,
             dest_crow,
             cap,
@@ -5748,6 +5944,49 @@ mod tests {
         assert_eq!(objects.remote_missing, 0);
         assert_eq!(objects.failed_caps, 0);
         assert_eq!(env.dest_crow.get_bytes(&env.cap).unwrap(), b"cloud bytes");
+    }
+
+    #[test]
+    fn lazy_fetch_reads_missing_cap_from_visible_trusted_peer() {
+        let env = nest_sync_test_env();
+        peer_snapshot::save(
+            &peer_snapshot::snapshot_path(env.dest.path()),
+            &PeerSnapshot {
+                snapshot_at: peer_snapshot::now_unix(),
+                self_info: SelfInfo {
+                    node_id: env.dest_identity.node_id(),
+                    friendly_name: Some("dest".into()),
+                    address: "127.0.0.1:7000".parse().unwrap(),
+                },
+                peers: vec![PeerInfo {
+                    node_id: env.source_node,
+                    friendly_name: Some("source".into()),
+                    addresses: vec![env.server_addr],
+                    last_seen_unix: peer_snapshot::now_unix(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let bytes = read_file_bytes_with_lazy(
+            LazyFetchContext {
+                home: env.dest.path(),
+                crow: &env.dest_crow,
+                catalog: &env.dest_catalog,
+                identity: &env.dest_identity,
+                nest_id: env.nest_id,
+            },
+            &env.cap,
+        )
+        .unwrap();
+
+        assert_eq!(bytes, b"cloud bytes");
+        assert!(
+            env.dest_crow
+                .store()
+                .has(Namespace::Manifests, env.cap.manifest_hash.inner())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -6125,13 +6364,19 @@ mod tests {
 
     #[test]
     fn grep_searches_single_file() {
-        let (_tmp, identity, pins, catalog, crow) = full_env();
+        let (tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"alpha\nTODO one\nbeta\n");
         catalog
             .put_file("/notes.txt", cap, Some("notes.txt".into()), &identity)
             .unwrap();
 
-        let report = grep_report(&crow, &pins, &catalog, "TODO", "/notes.txt").unwrap();
+        let report = grep_report(
+            test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+            &pins,
+            "TODO",
+            "/notes.txt",
+        )
+        .unwrap();
 
         assert_eq!(
             report,
@@ -6148,7 +6393,7 @@ mod tests {
 
     #[test]
     fn grep_recurses_catalog_directory() {
-        let (_tmp, identity, pins, catalog, crow) = full_env();
+        let (tmp, identity, pins, catalog, crow) = full_env();
         let a = stored_cap(&crow, b"TODO root\n");
         let b = stored_cap(&crow, b"skip\nTODO nested\n");
         catalog.mkdir("/docs/nested", true, &identity).unwrap();
@@ -6159,7 +6404,13 @@ mod tests {
             .put_file("/docs/nested/b.txt", b, Some("b.txt".into()), &identity)
             .unwrap();
 
-        let report = grep_report(&crow, &pins, &catalog, "TODO", "/docs").unwrap();
+        let report = grep_report(
+            test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+            &pins,
+            "TODO",
+            "/docs",
+        )
+        .unwrap();
         let displays = report
             .matches
             .iter()
@@ -6178,13 +6429,19 @@ mod tests {
 
     #[test]
     fn grep_no_matches_success() {
-        let (_tmp, identity, pins, catalog, crow) = full_env();
+        let (tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"nothing here\n");
         catalog
             .put_file("/notes.txt", cap, Some("notes.txt".into()), &identity)
             .unwrap();
 
-        let report = grep_report(&crow, &pins, &catalog, "TODO", "/notes.txt").unwrap();
+        let report = grep_report(
+            test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+            &pins,
+            "TODO",
+            "/notes.txt",
+        )
+        .unwrap();
 
         assert!(report.matches.is_empty());
         assert!(report.errors.is_empty());
@@ -6197,14 +6454,21 @@ mod tests {
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
 
-        let err = grep_report(&crow, &pins, &catalog, "[", "/notes.txt").unwrap_err();
+        let identity = test_identity(tmp.path());
+        let err = grep_report(
+            test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+            &pins,
+            "[",
+            "/notes.txt",
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("regex parse error"));
     }
 
     #[test]
     fn grep_reports_missing_files() {
-        let (_tmp, identity, pins, catalog, crow) = full_env();
+        let (tmp, identity, pins, catalog, crow) = full_env();
         catalog
             .put_file(
                 "/missing.txt",
@@ -6214,7 +6478,13 @@ mod tests {
             )
             .unwrap();
 
-        let report = grep_report(&crow, &pins, &catalog, "TODO", "/missing.txt").unwrap();
+        let report = grep_report(
+            test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+            &pins,
+            "TODO",
+            "/missing.txt",
+        )
+        .unwrap();
 
         assert!(report.matches.is_empty());
         assert_eq!(report.errors.len(), 1);
@@ -6292,7 +6562,7 @@ mod tests {
 
     #[test]
     fn cat_reads_catalog_path_and_full_cap() {
-        let (_tmp, identity, pins, catalog, crow) = full_env();
+        let (tmp, identity, pins, catalog, crow) = full_env();
         let cap = stored_cap(&crow, b"hello from cat\n");
         catalog.mkdir("/docs", false, &identity).unwrap();
         catalog
@@ -6305,11 +6575,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            cat_bytes(&crow, &pins, &catalog, "/docs/note.txt").unwrap(),
+            cat_bytes(
+                test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+                &pins,
+                "/docs/note.txt"
+            )
+            .unwrap(),
             b"hello from cat\n"
         );
         assert_eq!(
-            cat_bytes(&crow, &pins, &catalog, &cap.encode()).unwrap(),
+            cat_bytes(
+                test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+                &pins,
+                &cap.encode()
+            )
+            .unwrap(),
             b"hello from cat\n"
         );
     }
@@ -6320,23 +6600,34 @@ mod tests {
         let pins = PinIndex::open(tmp.path()).unwrap();
         let catalog = CatalogIndex::open(tmp.path()).unwrap();
         let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+        let identity = test_identity(tmp.path());
         let cap = stored_cap(&crow, b"prefix bytes");
         pins.add(cap.clone(), Some("prefix.txt".into()), None)
             .unwrap();
         let prefix = &cap.manifest_hash.to_string()[..8];
 
         assert_eq!(
-            cat_bytes(&crow, &pins, &catalog, prefix).unwrap(),
+            cat_bytes(
+                test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+                &pins,
+                prefix
+            )
+            .unwrap(),
             b"prefix bytes"
         );
     }
 
     #[test]
     fn cat_rejects_directories() {
-        let (_tmp, identity, pins, catalog, crow) = full_env();
+        let (tmp, identity, pins, catalog, crow) = full_env();
         catalog.mkdir("/docs", false, &identity).unwrap();
 
-        let err = cat_bytes(&crow, &pins, &catalog, "/docs").unwrap_err();
+        let err = cat_bytes(
+            test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+            &pins,
+            "/docs",
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("is a directory"));
     }
@@ -7002,9 +7293,8 @@ mod tests {
 
         let out = tmp.path().join("out");
         cmd_get_dir(
-            &crow,
+            test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
             &pins,
-            &catalog,
             &cap.encode(),
             out.to_str().unwrap(),
             true,
