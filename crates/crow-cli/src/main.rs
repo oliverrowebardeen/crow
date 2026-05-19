@@ -3926,7 +3926,7 @@ fn sync_peer_addresses(
 
     let proof = local_membership_proof(catalog, identity.node_id())?;
     let Some((addr, client)) =
-        connect_peer_for_nest(&rt, peer, &socket_addrs, nest_id, identity, proof, true)?
+        connect_peer_for_nest(&rt, peer, socket_addrs, nest_id, identity, proof, true)?
     else {
         return Err(format!("nest-scoped sync with '{peer}' failed").into());
     };
@@ -4256,6 +4256,7 @@ fn sync_peer_result(report: &SyncPeerReport) -> DynResult<()> {
     }
 }
 
+#[cfg(test)]
 fn sync_catalog_events(
     catalog: &CatalogIndex,
     remote_events: Vec<CatalogEvent>,
