@@ -51,7 +51,8 @@ use serde::{Deserialize, Serialize};
                   crow gc                          # sweep anything not pinned\n  \
                   crow serve                       # serve chunks + advertise on mDNS\n  \
                   crow peers                       # list LAN peers `crow serve` discovered\n  \
-                  crow sync laptop                 # pull catalog + chunks from your device\n  \
+                  crow sync                        # pull nest metadata from visible devices\n  \
+                  crow sync --full laptop          # explicitly cache every cataloged file\n  \
                   crow receive laptop <cap> /docs/report.pdf # fetch + catalog\n\
                   \n\
                   File commands accept catalog paths, full crow1… capabilities, or \
@@ -125,7 +126,8 @@ enum Command {
         long_about = "Resolve a full crow1… capability or a hex prefix of the manifest \
                       hash, fetch the encrypted manifest, decrypt it, reconstruct the \
                       file (using parity to recover any missing data shares), and \
-                      write it to <OUT>.\n\
+                      write it to <OUT>. If bytes are missing locally, Crow tries \
+                      visible trusted devices in the active nest before failing.\n\
                       \n\
                       <OUT> may be \"-\" for stdout, useful in pipelines.\n\
                       \n\
@@ -144,8 +146,10 @@ enum Command {
     #[command(
         long_about = "Resolve a local catalog path, full crow1… capability, or pinned \
                       hash prefix; reconstruct the file; and write raw bytes to \
-                      stdout. This is intentionally Unix-like and does not guard \
-                      against binary or large output.\n\
+                      stdout. If bytes are missing locally, Crow tries visible \
+                      trusted devices in the active nest; lazy-fetch diagnostics \
+                      go to stderr so stdout stays pipe-safe. This is intentionally \
+                      Unix-like and does not guard against binary or large output.\n\
                       \n\
                       Examples:\n  \
                       crow cat /docs/notes.md\n  \
@@ -262,7 +266,9 @@ enum Command {
         long_about = "Resolve a catalog file, catalog directory, full crow1… capability, \
                       or pinned hash prefix; reconstruct file bytes; and print matching \
                       lines as TARGET:LINE:TEXT. Directory targets recurse through \
-                      cataloged files. This decrypts and reads file contents, so use \
+                      cataloged files. If bytes are missing locally, Crow tries \
+                      visible trusted devices in the active nest before recording a \
+                      per-file error. This decrypts and reads file contents, so use \
                       `crow find` for cheap name-only searches.\n\
                       \n\
                       Examples:\n  \
@@ -331,8 +337,9 @@ enum Command {
     /// Export a catalog directory tree to the local filesystem.
     #[command(
         long_about = "Recursively reconstruct files from a local catalog directory into \
-                      a regular filesystem directory. Existing files are never \
-                      overwritten.\n\
+                      a regular filesystem directory. If bytes are missing locally, \
+                      Crow tries visible trusted devices in the active nest before \
+                      failing. Existing files are never overwritten.\n\
                       \n\
                       If OUT exists and is non-empty, Crow asks for y/N confirmation \
                       unless --yes is passed.\n\
