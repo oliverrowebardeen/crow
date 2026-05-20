@@ -4008,18 +4008,18 @@ fn trusted_sync_peers(
     local_node: NodeId,
     snapshot: &PeerSnapshot,
 ) -> Vec<TrustedSyncPeer> {
-    let current_members = view
+    let trusted_nodes = view
         .members()
         .iter()
         .filter(|member| member.revoked_at.is_none())
-        .map(|member| member.member)
+        .flat_map(|member| [member.member, member.granter])
         .collect::<HashSet<_>>();
 
     let mut peers = snapshot
         .peers
         .iter()
         .filter(|peer| peer.node_id != local_node)
-        .filter(|peer| current_members.contains(&peer.node_id))
+        .filter(|peer| trusted_nodes.contains(&peer.node_id))
         .filter(|peer| !peer.addresses.is_empty())
         .map(|peer| TrustedSyncPeer {
             node_id: peer.node_id,
@@ -6053,6 +6053,53 @@ mod tests {
 
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].node_id, trusted.node_id());
+        assert_eq!(peers[0].name.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn trusted_sync_peers_include_visible_granter_for_invitee_bootstrap() {
+        let (_tmp, local, catalog) = cat_env();
+        let granter = Identity::random();
+        let nest_id = NestId::random();
+        let mut invite = crow::Invite::new_unsigned(
+            nest_id,
+            "team".into(),
+            granter.node_id(),
+            local.node_id(),
+            NestRole::Owner,
+            0,
+            vec![],
+        );
+        invite.sign(&granter).unwrap();
+        catalog
+            .append_member_added_with_signature(
+                &local,
+                local.node_id(),
+                granter.node_id(),
+                NestRole::Owner,
+                invite.created_at,
+                invite.grant_signature,
+            )
+            .unwrap();
+        let snapshot = PeerSnapshot {
+            snapshot_at: 1_000,
+            self_info: SelfInfo {
+                node_id: local.node_id(),
+                friendly_name: Some("local".into()),
+                address: "127.0.0.1:7000".parse().unwrap(),
+            },
+            peers: vec![PeerInfo {
+                node_id: granter.node_id(),
+                friendly_name: Some("laptop".into()),
+                addresses: vec!["192.168.1.10:7000".parse().unwrap()],
+                last_seen_unix: 990,
+            }],
+        };
+
+        let peers = trusted_sync_peers(&catalog.view().unwrap(), local.node_id(), &snapshot);
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, granter.node_id());
         assert_eq!(peers[0].name.as_deref(), Some("laptop"));
     }
 
