@@ -1,2 +1,10 @@
 /target
 .DS_Store
+.env
+.env.*
+!.env.example
+.crow/
+*.cap
+identity.json
+cluster-token
+*.jsonl

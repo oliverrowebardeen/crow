@@ -1,0 +1,17 @@
+title = "Crow secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "crow-read-capability"
+description = "Crow bearer capability containing a manifest decryption key"
+regex = '(crow1[023456789acdefghjklmnpqrstuvwxyz]{80,})'
+keywords = ["crow1"]
+
+[[rules]]
+id = "crow-identity-secret"
+description = "Serialized Crow private identity key"
+regex = '''(?:signing_secret|kx_secret)[\"'\s]*[:=][\"'\s]*([a-fA-F0-9]{64})'''
+secretGroup = 1
+keywords = ["signing_secret", "kx_secret"]

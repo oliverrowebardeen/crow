@@ -211,7 +211,10 @@ impl<S: ChunkStore> Crow<S> {
         let k = manifest.erasure.k as usize;
         let parity_count = manifest.erasure.parity_count() as usize;
 
-        let mut plaintext = Vec::with_capacity(manifest.file_size as usize);
+        let file_size = usize::try_from(manifest.file_size)
+            .map_err(|_| Error::Manifest("file is too large for this platform".into()))?;
+        // Do not allocate the advertised file size before any shares arrive.
+        let mut plaintext = Vec::new();
 
         for (stripe_idx, stripe) in manifest.stripes.iter().enumerate() {
             if stripe.data.len() != k || stripe.parity.len() != parity_count {
@@ -264,11 +267,19 @@ impl<S: ChunkStore> Crow<S> {
             for (data_idx, ct) in data_ciphertexts.iter().enumerate() {
                 let plain =
                     crypto::open_chunk(&manifest.file_key, stripe_idx as u64, data_idx as u32, ct)?;
-                plaintext.extend_from_slice(&plain);
+                if plain.len() != manifest.chunk_size as usize {
+                    return Err(Error::Manifest(
+                        "share size does not match chunk size".into(),
+                    ));
+                }
+                let take = plain.len().min(file_size - plaintext.len());
+                plaintext
+                    .try_reserve(take)
+                    .map_err(|_| Error::Manifest("not enough memory to reconstruct file".into()))?;
+                plaintext.extend_from_slice(&plain[..take]);
             }
         }
 
-        plaintext.truncate(manifest.file_size as usize);
         Ok(plaintext)
     }
 }

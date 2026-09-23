@@ -65,7 +65,7 @@ impl Identity {
         } else {
             let identity = Self::random();
             identity.save(home)?;
-            Ok(identity)
+            Self::load(&path)
         }
     }
 
@@ -92,7 +92,7 @@ impl Identity {
     fn save(&self, home: &Path) -> Result<()> {
         fs::create_dir_all(home)?;
         let target = home.join(IDENTITY_FILE);
-        let tmp = home.join(format!("{IDENTITY_FILE}.{}.tmp", std::process::id()));
+
         let json = IdentityJson {
             version: IDENTITY_VERSION,
             signing_secret: hex(&self.signing.to_bytes()),
@@ -100,9 +100,15 @@ impl Identity {
         };
         let bytes = serde_json::to_vec_pretty(&json)
             .map_err(|e| Error::Identity(format!("serialize: {e}")))?;
-        write_private(&tmp, &bytes)?;
-        fs::rename(&tmp, &target)?;
-        Ok(())
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new_in(home)?;
+        tmp.write_all(&bytes)?;
+        tmp.as_file().sync_all()?;
+        match tmp.persist_noclobber(&target) {
+            Ok(_) => Ok(()),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(Error::Io(e.error)),
+        }
     }
 }
 
@@ -241,7 +247,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -251,28 +257,40 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut opts = fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true).mode(0o600);
-    let mut file = opts.open(path)?;
-    file.write_all(bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn concurrent_initialization_keeps_one_identity() {
+        use std::sync::Barrier;
+        let tmp = TempDir::new().unwrap();
+        let barrier = Barrier::new(16);
+        let ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let barrier = &barrier;
+                    let home = tmp.path();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        Identity::load_or_create(home).unwrap().node_id()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let persisted = Identity::load_or_create(tmp.path()).unwrap().node_id();
+        assert!(ids.iter().all(|id| *id == persisted));
+    }
+
+    #[test]
+    fn malformed_unicode_hex_is_rejected_without_panicking() {
+        assert!(decode_hex32(&format!("{}a", "€".repeat(21))).is_none());
+    }
 
     #[test]
     fn random_produces_distinct_identities() {

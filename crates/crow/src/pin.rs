@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,6 +50,11 @@ impl PinIndex {
     pub fn open(home: impl AsRef<Path>) -> Result<Self> {
         let root = home.as_ref().join(PIN_DIR);
         fs::create_dir_all(&root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
         Ok(Self { root })
     }
 
@@ -58,13 +64,6 @@ impl PinIndex {
 
     fn pin_path(&self, manifest_hash: &Hash) -> PathBuf {
         self.root.join(format!("{manifest_hash}.{PIN_EXT}"))
-    }
-
-    fn tmp_path(&self, manifest_hash: &Hash) -> PathBuf {
-        self.root.join(format!(
-            "{manifest_hash}.{PIN_EXT}.{}.tmp",
-            std::process::id()
-        ))
     }
 
     /// Add or replace a pin record for the cap. Idempotent — pinning the same
@@ -89,9 +88,10 @@ impl PinIndex {
             .map_err(|e| Error::Manifest(format!("pin serialize: {e}")))?;
         let manifest_hash = cap.manifest_hash;
         let target = self.pin_path(manifest_hash.inner());
-        let tmp = self.tmp_path(manifest_hash.inner());
-        fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, &target)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.root)?;
+        tmp.write_all(&bytes)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&target).map_err(|e| Error::Io(e.error))?;
         Ok(PinRecord {
             manifest_hash_hex: manifest_hash.to_string(),
             cap,
@@ -193,6 +193,24 @@ mod tests {
     use crate::crypto::ManifestKey;
     use crate::hash::ManifestHash;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_metadata_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = PinIndex::open(tmp.path()).unwrap();
+        assert_eq!(
+            fs::metadata(index.root()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::set_permissions(index.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        let reopened = PinIndex::open(tmp.path()).unwrap();
+        assert_eq!(
+            fs::metadata(reopened.root()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     fn cap_with_hash_byte(b: u8) -> Cap {
         Cap::new_read(

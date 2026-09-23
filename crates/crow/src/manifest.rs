@@ -117,8 +117,30 @@ impl Manifest {
                 manifest.version, MANIFEST_VERSION
             )));
         }
+        manifest.validate()?;
         manifest.signature_status()?;
         Ok(manifest)
+    }
+
+    /// Reject inconsistent layouts before consumers allocate or decode shares.
+    pub fn validate(&self) -> Result<()> {
+        self.erasure.validate()?;
+        crate::erasure::validate_chunk_size(self.chunk_size)?;
+        let stripe_bytes = u64::from(self.chunk_size) * u64::from(self.erasure.k);
+        let expected_stripes = self.file_size.div_ceil(stripe_bytes);
+        if expected_stripes != self.stripes.len() as u64 {
+            return Err(Error::Manifest(
+                "file size does not match stripe count".into(),
+            ));
+        }
+        for stripe in &self.stripes {
+            if stripe.data.len() != usize::from(self.erasure.k)
+                || stripe.parity.len() != usize::from(self.erasure.parity_count())
+            {
+                return Err(Error::Manifest("stripe has an invalid share count".into()));
+            }
+        }
+        Ok(())
     }
 
     pub fn seal(&self, key: &ManifestKey) -> Result<Vec<u8>> {
@@ -175,6 +197,44 @@ mod tests {
     use super::*;
     use crate::erasure::DEFAULT_CHUNK_SIZE;
     use crate::hash::ChunkHash;
+
+    #[test]
+    fn malformed_manifest_layouts_are_rejected() {
+        let mut bad = Vec::new();
+        let mut m = sample();
+        m.erasure.k = 0;
+        bad.push(m);
+        let mut m = sample();
+        m.erasure.n = 1;
+        bad.push(m);
+        let mut m = sample();
+        m.chunk_size = 0;
+        bad.push(m);
+        let mut m = sample();
+        m.chunk_size = 1;
+        bad.push(m);
+        let mut m = sample();
+        m.file_size = u64::MAX;
+        bad.push(m);
+        let mut m = sample();
+        m.file_size = 0;
+        bad.push(m);
+        let mut m = sample();
+        m.stripes.clear();
+        bad.push(m);
+        let mut m = sample();
+        m.stripes[0].data.pop();
+        bad.push(m);
+        let mut m = sample();
+        m.stripes[0].parity.clear();
+        bad.push(m);
+        for manifest in bad {
+            assert!(
+                Manifest::deserialize(&manifest.serialize().unwrap()).is_err(),
+                "accepted malformed manifest: {manifest:?}"
+            );
+        }
+    }
 
     fn sample() -> Manifest {
         Manifest {

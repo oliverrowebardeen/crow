@@ -53,7 +53,7 @@ pub fn validate_chunk_size(chunk_size: u32) -> Result<()> {
         return Err(Error::Erasure("chunk_size must be positive".into()));
     }
     let shard = chunk_size as usize + AEAD_TAG_LEN;
-    if shard % RS_ALIGN != 0 {
+    if !shard.is_multiple_of(RS_ALIGN) {
         return Err(Error::Erasure(format!(
             "(chunk_size + AEAD tag) = {shard} must be a multiple of {RS_ALIGN}"
         )));
@@ -73,7 +73,7 @@ pub fn encode_parity(params: ErasureParams, data_shards: &[Vec<u8>]) -> Result<V
         )));
     }
     let shard_bytes = data_shards[0].len();
-    if shard_bytes == 0 || shard_bytes % RS_ALIGN != 0 {
+    if shard_bytes == 0 || !shard_bytes.is_multiple_of(RS_ALIGN) {
         return Err(Error::Erasure(format!(
             "shard size {shard_bytes} must be a positive multiple of {RS_ALIGN}"
         )));
@@ -143,7 +143,7 @@ pub fn decode_data(
         .chain(parity.iter())
         .find_map(|s| s.as_ref().map(|v| v.len()))
         .ok_or_else(|| Error::Erasure("no shares provided".into()))?;
-    if shard_bytes == 0 || shard_bytes % RS_ALIGN != 0 {
+    if shard_bytes == 0 || !shard_bytes.is_multiple_of(RS_ALIGN) {
         return Err(Error::Erasure(format!(
             "shard size {shard_bytes} must be a positive multiple of {RS_ALIGN}"
         )));

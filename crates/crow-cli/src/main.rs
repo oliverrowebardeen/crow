@@ -1743,21 +1743,21 @@ fn cmd_cap(pins: &PinIndex, catalog: &CatalogIndex, arg: &str) -> DynResult<()> 
 
 fn cap_for_target(pins: &PinIndex, catalog: &CatalogIndex, arg: &str) -> DynResult<Cap> {
     let raw = arg.trim();
-    if !raw.starts_with("crow1") {
-        if let Ok(path) = CatalogPath::normalize(raw) {
-            let view = catalog.view()?;
-            if let Some(entry) = view.get(&path) {
-                return match &entry.kind {
+    if !raw.starts_with("crow1")
+        && let Ok(path) = CatalogPath::normalize(raw)
+    {
+        let view = catalog.view()?;
+        if let Some(entry) = view.get(&path) {
+            return match &entry.kind {
                     EntryKind::File { cap, .. } => Ok(cap.clone()),
                     EntryKind::Dir => Err(format!(
                         "{path} is a catalog directory; use `crow share {path}` or `crow cap-dir {path}` to create an immutable directory snapshot cap"
                     )
                     .into()),
                 };
-            }
-            if raw.starts_with('/') {
-                return Err(format!("catalog path not found: {path}").into());
-            }
+        }
+        if raw.starts_with('/') {
+            return Err(format!("catalog path not found: {path}").into());
         }
     }
 
@@ -1837,34 +1837,34 @@ fn share_target(
 ) -> DynResult<ShareReport> {
     let token_configured = TokenStore::open(home).exists();
     let raw = request.arg.trim();
-    if !raw.starts_with("crow1") {
-        if let Ok(path) = CatalogPath::normalize(raw) {
-            let view = catalog.view()?;
-            if let Some(entry) = view.get(&path) {
-                return match &entry.kind {
-                    EntryKind::File { cap, .. } => Ok(ShareReport {
-                        kind: ShareKind::File,
-                        cap: cap.clone(),
+    if !raw.starts_with("crow1")
+        && let Ok(path) = CatalogPath::normalize(raw)
+    {
+        let view = catalog.view()?;
+        if let Some(entry) = view.get(&path) {
+            return match &entry.kind {
+                EntryKind::File { cap, .. } => Ok(ShareReport {
+                    kind: ShareKind::File,
+                    cap: cap.clone(),
+                    suggested_dest: Some(path),
+                    token_configured,
+                }),
+                EntryKind::Dir => {
+                    let manifest = directory_manifest_from_catalog(&view, &path)?;
+                    let cap = crow.put_directory_manifest(&manifest, identity)?;
+                    let pin_name = request.name.or_else(|| directory_snapshot_name(&path));
+                    pins.add(cap.clone(), pin_name, None)?;
+                    Ok(ShareReport {
+                        kind: ShareKind::DirectorySnapshot,
+                        cap,
                         suggested_dest: Some(path),
                         token_configured,
-                    }),
-                    EntryKind::Dir => {
-                        let manifest = directory_manifest_from_catalog(&view, &path)?;
-                        let cap = crow.put_directory_manifest(&manifest, identity)?;
-                        let pin_name = request.name.or_else(|| directory_snapshot_name(&path));
-                        pins.add(cap.clone(), pin_name, None)?;
-                        Ok(ShareReport {
-                            kind: ShareKind::DirectorySnapshot,
-                            cap,
-                            suggested_dest: Some(path),
-                            token_configured,
-                        })
-                    }
-                };
-            }
-            if raw.starts_with('/') {
-                return Err(format!("catalog path not found: {path}").into());
-            }
+                    })
+                }
+            };
+        }
+        if raw.starts_with('/') {
+            return Err(format!("catalog path not found: {path}").into());
         }
     }
 
@@ -2247,29 +2247,29 @@ fn grep_report(
 fn grep_targets(catalog: &CatalogIndex, pins: &PinIndex, arg: &str) -> DynResult<Vec<GrepTarget>> {
     let raw = arg.trim();
     let view = catalog.view()?;
-    if !raw.starts_with("crow1") {
-        if let Ok(path) = CatalogPath::normalize(raw) {
-            if let Some(entry) = view.get(&path) {
-                return match &entry.kind {
-                    EntryKind::Dir => Ok(catalog_subtree_entries(&view, &path)
-                        .into_iter()
-                        .filter_map(|entry| match &entry.kind {
-                            EntryKind::File { cap, .. } => Some(GrepTarget {
-                                display: entry.path.to_string(),
-                                cap: cap.clone(),
-                            }),
-                            EntryKind::Dir => None,
-                        })
-                        .collect()),
-                    EntryKind::File { cap, .. } => Ok(vec![GrepTarget {
-                        display: path.to_string(),
-                        cap: cap.clone(),
-                    }]),
-                };
-            }
-            if raw.starts_with('/') {
-                return Err(format!("catalog path not found: {path}").into());
-            }
+    if !raw.starts_with("crow1")
+        && let Ok(path) = CatalogPath::normalize(raw)
+    {
+        if let Some(entry) = view.get(&path) {
+            return match &entry.kind {
+                EntryKind::Dir => Ok(catalog_subtree_entries(&view, &path)
+                    .into_iter()
+                    .filter_map(|entry| match &entry.kind {
+                        EntryKind::File { cap, .. } => Some(GrepTarget {
+                            display: entry.path.to_string(),
+                            cap: cap.clone(),
+                        }),
+                        EntryKind::Dir => None,
+                    })
+                    .collect()),
+                EntryKind::File { cap, .. } => Ok(vec![GrepTarget {
+                    display: path.to_string(),
+                    cap: cap.clone(),
+                }]),
+            };
+        }
+        if raw.starts_with('/') {
+            return Err(format!("catalog path not found: {path}").into());
         }
     }
 
@@ -2682,10 +2682,11 @@ fn restore_catalog_dir(
     let entries = catalog_subtree_entries(view, path);
     let mut restored_files = 0usize;
     fs::create_dir_all(out)?;
+    let output = cap_std::fs::Dir::open_ambient_dir(out, cap_std::ambient_authority())?;
     for entry in entries.iter().filter(|entry| entry.is_dir()) {
         let rel = relative_catalog_path(path, &entry.path)?;
         if !rel.as_os_str().is_empty() {
-            fs::create_dir_all(out.join(rel))?;
+            output.create_dir_all(rel)?;
         }
     }
 
@@ -2694,17 +2695,12 @@ fn restore_catalog_dir(
             continue;
         };
         let rel = relative_catalog_path(path, &entry.path)?;
-        let target = out.join(rel);
-        if target.exists() {
-            return Err(
-                format!("refusing to overwrite existing file: {}", target.display()).into(),
-            );
-        }
+        let target = rel;
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+            output.create_dir_all(parent)?;
         }
         let bytes = read_file_bytes_with_lazy(lazy, cap)?;
-        fs::write(&target, bytes)?;
+        write_restored_file(&output, &target, &bytes)?;
         restored_files += 1;
     }
     Ok(restored_files)
@@ -2717,35 +2713,48 @@ fn restore_directory_manifest(
 ) -> DynResult<usize> {
     let mut restored_files = 0usize;
     fs::create_dir_all(out)?;
+    let output = cap_std::fs::Dir::open_ambient_dir(out, cap_std::ambient_authority())?;
 
     for entry in manifest
         .entries
         .iter()
         .filter(|entry| matches!(entry.kind, DirectoryEntryKind::Dir))
     {
-        fs::create_dir_all(out.join(&entry.path))?;
+        output.create_dir_all(&entry.path)?;
     }
 
     for entry in &manifest.entries {
         let DirectoryEntryKind::File { cap, .. } = &entry.kind else {
             continue;
         };
-        let target = out.join(&entry.path);
-        if target.exists() {
-            return Err(
-                format!("refusing to overwrite existing file: {}", target.display()).into(),
-            );
-        }
+        let target = Path::new(&entry.path);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+            output.create_dir_all(parent)?;
         }
         let cap = Cap::decode(cap)?;
         let bytes = read_file_bytes_with_lazy(lazy, &cap)?;
-        fs::write(&target, bytes)?;
+        write_restored_file(&output, target, &bytes)?;
         restored_files += 1;
     }
 
     Ok(restored_files)
+}
+
+fn write_restored_file(output: &cap_std::fs::Dir, path: &Path, bytes: &[u8]) -> DynResult<()> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = output.open_with(path, &options).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                e.kind(),
+                format!("refusing to overwrite existing file: {}", path.display()),
+            )
+        } else {
+            e
+        }
+    })?;
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 fn cmd_pin(pins: &PinIndex, cap_str: &str, name: Option<String>) -> DynResult<()> {
@@ -2996,16 +3005,16 @@ fn resolve_copy_destination(
 }
 
 fn copy_source_name(pins: &PinIndex, source: &ResolvedFile) -> DynResult<String> {
-    if let Some(path) = &source.path {
-        if let Some(name) = path.file_name() {
-            return Ok(name.to_string());
-        }
+    if let Some(path) = &source.path
+        && let Some(name) = path.file_name()
+    {
+        return Ok(name.to_string());
     }
 
-    if let Some(pin) = pins.get(source.cap.manifest_hash.inner())? {
-        if let Some(name) = pin.name {
-            return Ok(name);
-        }
+    if let Some(pin) = pins.get(source.cap.manifest_hash.inner())?
+        && let Some(name) = pin.name
+    {
+        return Ok(name);
     }
 
     Err(
@@ -3144,17 +3153,17 @@ fn stat_lines(
 ) -> DynResult<Vec<String>> {
     let raw = arg.trim();
     let view = catalog.view()?;
-    if !raw.starts_with("crow1") {
-        if let Ok(path) = CatalogPath::normalize(raw) {
-            if let Some(entry) = view.get(&path) {
-                return match &entry.kind {
-                    EntryKind::Dir => catalog_dir_stat_lines(crow, &view, &path),
-                    EntryKind::File { cap, .. } => cap_stat_lines(crow, pins, Some(&path), cap),
-                };
-            }
-            if raw.starts_with('/') {
-                return Err(format!("catalog path not found: {path}").into());
-            }
+    if !raw.starts_with("crow1")
+        && let Ok(path) = CatalogPath::normalize(raw)
+    {
+        if let Some(entry) = view.get(&path) {
+            return match &entry.kind {
+                EntryKind::Dir => catalog_dir_stat_lines(crow, &view, &path),
+                EntryKind::File { cap, .. } => cap_stat_lines(crow, pins, Some(&path), cap),
+            };
+        }
+        if raw.starts_with('/') {
+            return Err(format!("catalog path not found: {path}").into());
         }
     }
 
@@ -4845,18 +4854,18 @@ struct ResolvedFile {
 
 fn resolve_file_ref(catalog: &CatalogIndex, pins: &PinIndex, arg: &str) -> DynResult<ResolvedFile> {
     let arg = arg.trim();
-    if !arg.starts_with("crow1") {
-        if let Ok(path) = CatalogPath::normalize(arg) {
-            let view = catalog.view()?;
-            if let Some(entry) = view.get(&path) {
-                return match &entry.kind {
-                    EntryKind::File { cap, .. } => Ok(ResolvedFile {
-                        cap: cap.clone(),
-                        path: Some(path),
-                    }),
-                    EntryKind::Dir => Err(format!("{path} is a directory").into()),
-                };
-            }
+    if !arg.starts_with("crow1")
+        && let Ok(path) = CatalogPath::normalize(arg)
+    {
+        let view = catalog.view()?;
+        if let Some(entry) = view.get(&path) {
+            return match &entry.kind {
+                EntryKind::File { cap, .. } => Ok(ResolvedFile {
+                    cap: cap.clone(),
+                    path: Some(path),
+                }),
+                EntryKind::Dir => Err(format!("{path} is a directory").into()),
+            };
         }
     }
     Ok(ResolvedFile {
@@ -5478,6 +5487,64 @@ fn format_size(bytes: usize) -> String {
 mod tests {
     use super::*;
     use crow::{ManifestHash, ManifestKey};
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_restore_cannot_escape_through_symlinks() {
+        for catalog_source in [false, true] {
+            for dangling_file in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let pins = PinIndex::open(tmp.path()).unwrap();
+                let catalog = CatalogIndex::open(tmp.path()).unwrap();
+                let crow = Crow::new(FsStore::open(tmp.path()).unwrap());
+                let identity = Identity::random();
+                let child = stored_cap(&crow, b"must stay inside");
+                catalog.mkdir("/docs/nested", true, &identity).unwrap();
+                catalog
+                    .put_file("/docs/nested/file.txt", child.clone(), None, &identity)
+                    .unwrap();
+                let manifest = DirectoryManifest::new(
+                    123,
+                    vec![
+                        DirectoryEntry::dir("nested"),
+                        DirectoryEntry::file("nested/file.txt", child, None),
+                    ],
+                )
+                .unwrap();
+                let cap = crow.put_directory_manifest(&manifest, &identity).unwrap();
+                let outside = tmp.path().join("outside");
+                let out = tmp.path().join("out");
+                fs::create_dir_all(&outside).unwrap();
+                fs::create_dir_all(&out).unwrap();
+                if dangling_file {
+                    fs::create_dir(out.join("nested")).unwrap();
+                    std::os::unix::fs::symlink(
+                        outside.join("file.txt"),
+                        out.join("nested/file.txt"),
+                    )
+                    .unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&outside, out.join("nested")).unwrap();
+                }
+                let source = if catalog_source {
+                    "/docs".to_string()
+                } else {
+                    cap.encode()
+                };
+                assert!(
+                    cmd_get_dir(
+                        test_lazy_ctx(tmp.path(), &crow, &catalog, &identity),
+                        &pins,
+                        &source,
+                        out.to_str().unwrap(),
+                        true
+                    )
+                    .is_err()
+                );
+                assert!(!outside.join("file.txt").exists());
+            }
+        }
+    }
 
     fn cap_with_hash_byte(b: u8) -> Cap {
         Cap::new_read(

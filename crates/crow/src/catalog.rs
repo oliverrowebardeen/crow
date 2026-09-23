@@ -436,6 +436,11 @@ impl CatalogIndex {
     pub fn open(home: impl AsRef<Path>) -> Result<Self> {
         let root = home.as_ref().join(CATALOG_DIR);
         fs::create_dir_all(&root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
         let device_id_path = root.join(DEVICE_ID_FILE);
         let device_id = match fs::read_to_string(&device_id_path) {
             Ok(s) => parse_device_id(&s)?,
@@ -1056,6 +1061,24 @@ mod tests {
     use crate::crypto::ManifestKey;
     use crate::hash::ManifestHash;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_metadata_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = CatalogIndex::open(tmp.path()).unwrap();
+        assert_eq!(
+            fs::metadata(index.root()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::set_permissions(index.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        let reopened = CatalogIndex::open(tmp.path()).unwrap();
+        assert_eq!(
+            fs::metadata(reopened.root()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     fn cap_with_hash_byte(b: u8) -> Cap {
         Cap::new_read(
