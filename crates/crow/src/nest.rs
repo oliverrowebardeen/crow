@@ -877,7 +877,7 @@ mod tests {
             other => panic!("expected Nest error, got {other:?}"),
         }
         // Sanity: the longer prefix disambiguates one way.
-        let full = format!("{}cd", &"ab".repeat(15));
+        let full = format!("{}cd", "ab".repeat(15));
         assert_eq!(index.resolve(&full).unwrap().name, "b");
     }
 

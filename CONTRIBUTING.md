@@ -17,7 +17,9 @@ cargo test --workspace --doc --locked
 cargo run --locked -p crow --example roundtrip
 ```
 
-Tests need temporary filesystem access and local UDP loopback sockets. They do
+Tests need temporary filesystem access and local UDP loopback sockets, including
+IPv4 multicast on loopback. Discovery tests use `Discovery::start_loopback` and
+do not depend on a physical LAN interface. They do
 not call model providers or require credentials. Keep `Cargo.lock` committed and
 use `--locked` for repeatable installation and CI.
 

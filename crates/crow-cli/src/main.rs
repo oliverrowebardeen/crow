@@ -4036,7 +4036,7 @@ fn trusted_sync_peers(
             addresses: peer.addresses.clone(),
         })
         .collect::<Vec<_>>();
-    peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    peers.sort_by_key(|a| a.node_id);
     peers
 }
 
