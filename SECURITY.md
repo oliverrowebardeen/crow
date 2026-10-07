@@ -35,11 +35,14 @@ or response-time guarantee is offered yet.
   decrypting anything still requires a read capability. A holder who already has
   hashes can download ciphertext and learn object sizes. `crow setup` prints the
   token; keep setup output out of screenshots and logs.
-- **Catalog authorization:** event signatures provide attribution, not general
-  authorization. Remote merge checks membership authority only for `MemberAdded`
-  and `MemberRevoked`. Ordinary path changes are accepted with a valid signature
-  from any key, including a non-member's. A reachable peer you sync from, including
-  an impersonated server, can feed you such changes.
+- **Catalog authorization:** every catalog change received from a peer must be
+  signed by a current member of the nest, and a whole batch is rejected, without
+  writing anything, if any event fails. Members can still make any change,
+  including removing or moving paths. A revoked member's later events are rejected
+  by their signer-supplied `created_at`, which a revoked device can backdate, so
+  revocation is not yet a security boundary. A peer you sync from, including an
+  impersonated server, can withhold events or block a sync with a bad batch, but
+  cannot inject changes without a member's key.
 - **Server identity:** clients accept self-signed certificates without pinning
   them to a known device. TLS handshake signatures are verified, and nest proofs
   are session-bound, but this does not provide mutual device authentication.

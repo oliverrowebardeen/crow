@@ -489,8 +489,9 @@ impl CatalogIndex {
     }
 
     /// Merge events from a remote peer. Signatures are required and verified;
-    /// unsigned events are rejected. Use `merge_events` for the wider API
-    /// that lets the caller declare origin explicitly.
+    /// non-membership events must be signed by a current member of the final
+    /// member set. Membership operations require `merge_events_from_peer_for_nest`.
+    /// The entire batch is validated before any events are appended.
     pub fn merge_events_from_peer(
         &self,
         events: impl IntoIterator<Item = CatalogEvent>,
@@ -526,33 +527,65 @@ impl CatalogIndex {
             .iter()
             .map(|event| event.event_id.clone())
             .collect();
-        // Member set is the only piece of catalog state needed to validate
-        // remote membership ops. Build it once up front, then keep it
-        // running with `apply_op` instead of re-materializing the whole
-        // event log per incoming event — that was O(n²) on membership-heavy
-        // syncs.
+        if origin == EventOrigin::Local {
+            let mut added = 0;
+            for event in events {
+                validate_event(&event)?;
+                event.verify()?;
+                if known.insert(event.event_id.clone()) {
+                    self.append_event(&event)?;
+                    added += 1;
+                }
+            }
+            return Ok(added);
+        }
+
+        // Pass 1: validate signatures and membership grants in incoming order.
+        // Keep the prospective member set in memory until the whole batch is
+        // authorized; an invalid later event must not leave a partial merge.
         let mut members = MemberSet::from_events(&replay_events);
-        let mut added = 0usize;
+        let mut validated = Vec::new();
         for event in events {
             validate_event(&event)?;
-            let signer = match event.verify()? {
-                Some(signer) => signer,
-                None => {
-                    if origin == EventOrigin::Remote {
-                        return Err(Error::Catalog(format!(
-                            "unsigned catalog event {} rejected from peer",
-                            event.event_id
-                        )));
-                    }
-                    NodeId::from_bytes([0u8; 32])
-                }
-            };
-            if origin == EventOrigin::Remote {
-                validate_remote_membership_event(&event, signer, nest_id, &members)?;
-            }
-            if known.insert(event.event_id.clone()) {
-                self.append_event(&event)?;
+            let signer = event.verify()?.ok_or_else(|| {
+                Error::Catalog(format!(
+                    "unsigned catalog event {} rejected from peer",
+                    event.event_id
+                ))
+            })?;
+            validate_remote_membership_event(&event, signer, nest_id, &members)?;
+            let is_new = known.insert(event.event_id.clone());
+            if is_new {
                 members.apply_op(&event.op);
+            }
+            validated.push((event, signer, is_new));
+        }
+
+        // Pass 2: authorize every new non-membership event against the final
+        // set. A founder's file operations can precede their founding
+        // MemberAdded; a revocation anywhere in this batch also takes effect.
+        // Events already in the local log were authorized when first merged,
+        // so a later revocation must not make a full-history resync fail.
+        for (event, signer, is_new) in &validated {
+            if *is_new
+                && !matches!(
+                    event.op,
+                    CatalogOp::MemberAdded { .. } | CatalogOp::MemberRevoked { .. }
+                )
+                && !members.authorizes(signer, event.created_at)
+            {
+                return Err(Error::Catalog(format!(
+                    "remote catalog event {} signer {} is not a current nest member",
+                    event.event_id,
+                    signer.short()
+                )));
+            }
+        }
+
+        let mut added = 0;
+        for (event, _, is_new) in validated {
+            if is_new {
+                self.append_event(&event)?;
                 added += 1;
             }
         }
@@ -865,6 +898,18 @@ impl MemberSet {
 
     fn members(&self) -> &[MemberRecord] {
         &self.records
+    }
+
+    /// Whether `member` may author an event created at `created_at`: they
+    /// must be in the set, and if revoked, the event must predate revocation.
+    /// `created_at` is signer-supplied, so a revoked device can backdate new
+    /// events; revocation is therefore not yet a security boundary.
+    fn authorizes(&self, member: &NodeId, created_at: u64) -> bool {
+        self.idx.get(member).is_some_and(|&slot| {
+            self.records[slot]
+                .revoked_at
+                .is_none_or(|revoked_at| created_at < revoked_at)
+        })
     }
 
     fn apply_op(&mut self, op: &CatalogOp) {
@@ -1480,25 +1525,375 @@ mod tests {
     }
 
     #[test]
-    fn merge_accepts_signed_from_peer() {
-        // Sanity: a properly-signed remote event from a peer identity is
-        // accepted by `merge_events_from_peer`.
+    fn merge_accepts_current_member_from_peer() {
         let tmp_a = TempDir::new().unwrap();
         let identity_a = fresh_identity(&tmp_a);
         let device = "ffffffffffffffffffffffffffffffff";
-        let event = signed_event(
-            &identity_a,
-            device,
-            1,
-            1,
-            CatalogOp::Mkdir {
-                path: "/peer".into(),
-            },
-        );
+        let events = vec![
+            signed_event(
+                &identity_a,
+                device,
+                1,
+                1,
+                CatalogOp::Mkdir {
+                    path: "/peer".into(),
+                },
+            ),
+            signed_event(
+                &identity_a,
+                device,
+                2,
+                2,
+                CatalogOp::PutFile {
+                    path: "/peer/file.txt".into(),
+                    cap: cap_with_hash_byte(9).encode(),
+                    name: None,
+                },
+            ),
+        ];
 
         let tmp_b = TempDir::new().unwrap();
         let catalog = CatalogIndex::open(tmp_b.path()).unwrap();
-        assert_eq!(catalog.merge_events_from_peer(vec![event]).unwrap(), 1);
+        let nest_id = NestId::random();
+        catalog
+            .ensure_founding_member(&nest_id, &identity_a)
+            .unwrap();
+        assert_eq!(catalog.merge_events_from_peer(events.clone()).unwrap(), 2);
+        assert_eq!(
+            catalog
+                .merge_events_from_peer_for_nest(&nest_id, events)
+                .unwrap(),
+            0
+        );
+        assert!(
+            catalog
+                .view()
+                .unwrap()
+                .contains(&CatalogPath::normalize("/peer/file.txt").unwrap())
+        );
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_non_member_ops_without_changing_log() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let nest_id = NestId::random();
+        catalog
+            .ensure_founding_member(&nest_id, &Identity::random())
+            .unwrap();
+        let outsider = Identity::random();
+        let before = fs::read(&catalog.events_path).unwrap();
+        for op in [
+            CatalogOp::Mkdir {
+                path: "/evil".into(),
+            },
+            CatalogOp::PutFile {
+                path: "/evil.txt".into(),
+                cap: cap_with_hash_byte(9).encode(),
+                name: None,
+            },
+            CatalogOp::Remove {
+                path: "/docs".into(),
+            },
+            CatalogOp::Move {
+                from: "/docs".into(),
+                to: "/evil".into(),
+            },
+        ] {
+            let event = signed_event(&outsider, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, 1, op);
+            let err = catalog
+                .merge_events_from_peer_for_nest(&nest_id, [event.clone()])
+                .unwrap_err();
+            assert_non_member_error(err, &event, &outsider);
+            assert_eq!(fs::read(&catalog.events_path).unwrap(), before);
+        }
+    }
+
+    fn assert_non_member_error(err: Error, event: &CatalogEvent, signer: &Identity) {
+        let Error::Catalog(message) = err else {
+            panic!("expected catalog error, got {err}");
+        };
+        assert!(message.contains(&event.event_id), "{message}");
+        assert!(message.contains(&signer.node_id().short()), "{message}");
+        assert!(message.contains("not a current nest member"), "{message}");
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_ops_in_legacy_catalog() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let identity = Identity::random();
+        catalog.mkdir("/local", false, &identity).unwrap();
+        let before = fs::read(&catalog.events_path).unwrap();
+        let event = signed_event(
+            &identity,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/remote".into(),
+            },
+        );
+        // Both remote entry points require a membership-bearing catalog.
+        for nest_id in [None, Some(NestId::random())] {
+            let err = catalog
+                .merge_events_with_origin([event.clone()], EventOrigin::Remote, nest_id.as_ref())
+                .unwrap_err();
+            assert_non_member_error(err, &event, &identity);
+            assert_eq!(fs::read(&catalog.events_path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn merge_from_peer_accepts_ops_before_member_added() {
+        for is_founder in [true, false] {
+            let tmp_source = TempDir::new().unwrap();
+            let source = CatalogIndex::open(tmp_source.path()).unwrap();
+            let owner = Identity::random();
+            let invitee = Identity::random();
+            let signer = if is_founder { &owner } else { &invitee };
+            let nest_id = NestId::random();
+            if !is_founder {
+                source.ensure_founding_member(&nest_id, &owner).unwrap();
+            }
+            source.mkdir("/docs", false, signer).unwrap();
+            source
+                .put_file("/docs/file.txt", cap_with_hash_byte(9), None, signer)
+                .unwrap();
+            source
+                .append_member_added(&nest_id, &owner, signer.node_id(), NestRole::Owner)
+                .unwrap();
+
+            let tmp_dest = TempDir::new().unwrap();
+            let catalog = CatalogIndex::open(tmp_dest.path()).unwrap();
+            let events = source.load_events().unwrap();
+            assert_eq!(
+                catalog
+                    .merge_events_from_peer_for_nest(&nest_id, events.clone())
+                    .unwrap(),
+                events.len()
+            );
+            assert_eq!(catalog.load_events().unwrap(), events);
+            assert_eq!(
+                catalog
+                    .merge_events_from_peer_for_nest(&nest_id, events)
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn merge_from_peer_syncs_invitee_ops_with_membership_proof() {
+        let tmp_owner = TempDir::new().unwrap();
+        let owner_catalog = CatalogIndex::open(tmp_owner.path()).unwrap();
+        let owner = Identity::random();
+        let nest_id = NestId::random();
+        owner_catalog
+            .ensure_founding_member(&nest_id, &owner)
+            .unwrap();
+        owner_catalog.mkdir("/owner", false, &owner).unwrap();
+
+        let tmp_invitee = TempDir::new().unwrap();
+        let invitee_catalog = CatalogIndex::open(tmp_invitee.path()).unwrap();
+        let invitee = Identity::random();
+        let mut invite = crate::Invite::new_unsigned(
+            nest_id,
+            "team".into(),
+            owner.node_id(),
+            invitee.node_id(),
+            NestRole::Owner,
+            0,
+            vec![],
+        );
+        invite.sign(&owner).unwrap();
+        // As in CLI join, only the invitee initially records its signed proof.
+        let proof = invitee_catalog
+            .append_member_added_with_signature(
+                &invitee,
+                invitee.node_id(),
+                owner.node_id(),
+                NestRole::Owner,
+                invite.created_at,
+                invite.grant_signature,
+            )
+            .unwrap();
+        invitee_catalog.mkdir("/invitee", false, &invitee).unwrap();
+
+        // The handshake imports the proof before the first catalog exchange.
+        assert_eq!(
+            owner_catalog
+                .merge_events_from_peer_for_nest(&nest_id, [proof])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            invitee_catalog
+                .merge_events_from_peer_for_nest(&nest_id, owner_catalog.load_events().unwrap())
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            owner_catalog
+                .merge_events_from_peer_for_nest(&nest_id, invitee_catalog.load_events().unwrap())
+                .unwrap(),
+            1
+        );
+        for catalog in [&owner_catalog, &invitee_catalog] {
+            let view = catalog.view().unwrap();
+            assert_eq!(view.members().len(), 2);
+            assert!(view.contains(&CatalogPath::normalize("/owner").unwrap()));
+            assert!(view.contains(&CatalogPath::normalize("/invitee").unwrap()));
+        }
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_mixed_member_batch_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let owner = Identity::random();
+        let outsider = Identity::random();
+        let nest_id = NestId::random();
+        catalog.ensure_founding_member(&nest_id, &owner).unwrap();
+        let before = fs::read(&catalog.events_path).unwrap();
+        let valid = signed_event(
+            &owner,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+            1,
+            CatalogOp::Mkdir {
+                path: "/valid".into(),
+            },
+        );
+        let invalid = signed_event(
+            &outsider,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            1,
+            2,
+            CatalogOp::PutFile {
+                path: "/invalid.txt".into(),
+                cap: cap_with_hash_byte(9).encode(),
+                name: None,
+            },
+        );
+        let err = catalog
+            .merge_events_from_peer_for_nest(&nest_id, [valid, invalid.clone()])
+            .unwrap_err();
+        assert_non_member_error(err, &invalid, &outsider);
+        assert_eq!(fs::read(&catalog.events_path).unwrap(), before);
+    }
+
+    #[test]
+    fn merge_from_peer_rejects_revoked_member_ops_atomically() {
+        let now = unix_now();
+        for revoke_in_batch in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let catalog = CatalogIndex::open(tmp.path()).unwrap();
+            let owner = Identity::random();
+            let member = Identity::random();
+            let nest_id = NestId::random();
+            catalog.ensure_founding_member(&nest_id, &owner).unwrap();
+            catalog
+                .append_member_added(&nest_id, &owner, member.node_id(), NestRole::Owner)
+                .unwrap();
+            let revocation = signed_event(
+                &owner,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+                now + 10,
+                CatalogOp::MemberRevoked {
+                    member: member.node_id(),
+                    revoked_at: now + 10,
+                },
+            );
+            if !revoke_in_batch {
+                assert_eq!(
+                    catalog
+                        .merge_events_from_peer_for_nest(&nest_id, [revocation.clone()])
+                        .unwrap(),
+                    1
+                );
+            }
+            let before = fs::read(&catalog.events_path).unwrap();
+            let event = signed_event(
+                &member,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                1,
+                now + 20,
+                CatalogOp::Mkdir {
+                    path: "/revoked".into(),
+                },
+            );
+            let mut batch = vec![event.clone()];
+            if revoke_in_batch {
+                batch.push(revocation);
+            }
+            let err = catalog
+                .merge_events_from_peer_for_nest(&nest_id, batch)
+                .unwrap_err();
+            assert_non_member_error(err, &event, &member);
+            assert_eq!(fs::read(&catalog.events_path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn merge_from_peer_keeps_pre_revocation_history_syncable() {
+        let now = unix_now();
+        let tmp = TempDir::new().unwrap();
+        let catalog = CatalogIndex::open(tmp.path()).unwrap();
+        let owner = Identity::random();
+        let member = Identity::random();
+        let nest_id = NestId::random();
+        catalog.ensure_founding_member(&nest_id, &owner).unwrap();
+        catalog
+            .append_member_added(&nest_id, &owner, member.node_id(), NestRole::Owner)
+            .unwrap();
+        let before_revocation = signed_event(
+            &member,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            1,
+            now + 5,
+            CatalogOp::Mkdir {
+                path: "/kept".into(),
+            },
+        );
+        let revocation = signed_event(
+            &owner,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+            now + 10,
+            CatalogOp::MemberRevoked {
+                member: member.node_id(),
+                revoked_at: now + 10,
+            },
+        );
+
+        // A member's work from before revocation is accepted even when it
+        // arrives in the same batch as the revocation.
+        assert_eq!(
+            catalog
+                .merge_events_from_peer_for_nest(
+                    &nest_id,
+                    [before_revocation.clone(), revocation.clone()],
+                )
+                .unwrap(),
+            2
+        );
+        // Re-syncing the full history after revocation stays a no-op instead
+        // of failing on events that were already authorized.
+        let history = catalog.load_events().unwrap();
+        assert_eq!(
+            catalog
+                .merge_events_from_peer_for_nest(&nest_id, history)
+                .unwrap(),
+            0
+        );
+        assert!(
+            catalog
+                .view()
+                .unwrap()
+                .contains(&CatalogPath::normalize("/kept").unwrap())
+        );
     }
 
     #[test]
@@ -1584,6 +1979,8 @@ mod tests {
                 .contains("invalid MemberAdded invite signature"),
             "expected bad grant rejection, got: {err}"
         );
+        assert!(catalog.load_events().unwrap().is_empty());
+        assert!(!catalog.events_path.exists());
     }
 
     #[test]

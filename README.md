@@ -19,7 +19,7 @@ Crow combines a reusable storage library, a CLI, and a QUIC transport:
 - **Encrypted storage:** AES-256-GCM, BLAKE3 content addresses, Reed–Solomon recovery.
 - **Portable references:** Bech32m read capabilities; Ed25519 signatures record creator provenance.
 - **Local catalog:** file and directory paths backed by signed events and immutable snapshots;
-  ordinary path-event signatures provide attribution, not membership authorization.
+  changes received from peers must be signed by a current nest member.
 - **Device sharing:** recipient-bound invites, per-nest membership, manual metadata or full sync.
 - **Storage management:** pins and garbage collection (with `--dry-run`).
 
@@ -94,8 +94,8 @@ requires all peers to upgrade together; there is no insecure fallback to v2.
 Self-signed server certificates are still not bound to a known device identity.
 Use only a trusted LAN. `crow serve` also accepts the legacy shared token, which
 only authorizes fetching encrypted objects by hash; the catalog is served only to
-authenticated nest members. A peer you sync from can supply ordinary catalog
-changes validly signed by any key, including a non-member's key.
+authenticated nest members. Catalog changes from peers must be signed by a
+current nest member; a peer you sync from can still withhold or delay changes.
 
 ## Develop
 
