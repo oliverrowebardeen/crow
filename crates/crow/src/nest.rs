@@ -17,7 +17,7 @@
 //!         ├── pins/           # owned by crow::pin
 //!         ├── chunks/         # owned by crow::fs_store
 //!         ├── manifests/      # owned by crow::fs_store
-//!         └── policy.json     # placeholder for Phase 5 storage policy
+//!         └── policy.json     # reserved placeholder; currently unused
 //! ```
 //!
 //! Migration (`NestIndex::ensure_default`) is idempotent and crash-safe:

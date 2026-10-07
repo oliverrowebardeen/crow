@@ -1,4 +1,4 @@
-//! End-to-end integration tests for the Phase 1 step 3 work: a daemon
+//! End-to-end integration tests for LAN discovery: a daemon
 //! advertises on mDNS, a second daemon discovers it, and the second
 //! daemon's QUIC client fetches a manifest from the first using the
 //! mDNS-discovered address.

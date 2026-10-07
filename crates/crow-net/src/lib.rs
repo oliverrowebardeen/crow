@@ -341,7 +341,7 @@ pub struct ServeConfig {
     /// Bearer token for legacy ClusterToken requests.
     pub legacy_token: ClusterToken,
     /// Nest this server is willing to authenticate clients into.
-    /// `None` keeps the server cluster-token-only (Phase 2 behaviour).
+    /// `None` keeps the server cluster-token-only (no nest-scoped requests).
     pub nest_serving: Option<NestServingConfig>,
 }
 

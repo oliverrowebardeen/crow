@@ -18,7 +18,7 @@
 //! This crate also provides signed catalog events, nests, membership, and
 //! recipient-bound invites. The `crow-net` and `crow-cli` workspace crates provide
 //! LAN discovery, manual metadata sync, and object transfer between trusted devices.
-//! Automatic replication and friend-scoped storage/sharing remain planned.
+//! Automatic replication and friend-scoped storage/sharing are not implemented.
 
 pub mod cap;
 pub mod catalog;

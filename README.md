@@ -23,7 +23,7 @@ Crow combines a reusable storage library, a CLI, and a QUIC transport:
 - **Device sharing:** recipient-bound invites, per-nest membership, manual metadata or full sync.
 - **Storage management:** pins and garbage collection (with `--dry-run`).
 
-It does not yet provide automatic background replication, a mounted filesystem,
+It does not provide automatic background replication, a mounted filesystem,
 or an internet storage service. The current CLI loads whole files into memory.
 
 ## Install
@@ -67,8 +67,8 @@ cmp "$demo_dir/input.txt" "$demo_dir/restored.txt"
 `crow cap /docs/hello.txt` prints a bearer capability: share it only
 with intended readers, and keep it out of public screenshots and logs.
 `crow setup` also prints the cluster token. It lets a holder download your encrypted
-objects by hash (not the catalog or any capability), so keep it private too.
-Keep setup output out of public screenshots and logs too.
+objects by hash (not the catalog or any capability), so keep setup output out of
+public screenshots and logs as well.
 
 For two-device setup, directory snapshots, pinning, and recovery, see the
 [CLI and library guide](docs/GUIDE.md). The
@@ -112,17 +112,12 @@ accounts or paid services. Network tests need permission to bind local UDP ports
 See [CONTRIBUTING.md](CONTRIBUTING.md) for dependency and secret scanning.
 Contributors are expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## Compatibility and roadmap
+## Compatibility
 
 Pre-1.0 file formats, CLI output, and wire protocols may change. Keep original
 files and export data before upgrading. Wire protocol v3 is incompatible with
-earlier builds; stored formats are unchanged. macOS and Linux are CI targets;
-Windows support is provisional until its filesystem behavior is verified.
-
-Next priorities are automatic replication and health reporting, authenticated
-server identities, bounded streaming for large files, and broader platform tests.
-The [detailed design and roadmap](docs/GUIDE.md#roadmap) separates shipped work
-from planned features.
+earlier builds; stored formats are unchanged. macOS and Linux are CI targets.
+Windows support is provisional: its filesystem behavior has not been verified.
 
 ## License
 
