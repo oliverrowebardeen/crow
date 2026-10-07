@@ -40,7 +40,7 @@ or response-time guarantee is offered yet.
   writing anything, if any event fails. Members can still make any change,
   including removing or moving paths. A revoked member's later events are rejected
   by their signer-supplied `created_at`, which a revoked device can backdate, so
-  revocation is not yet a security boundary. A peer you sync from, including an
+  revocation is not a security boundary. A peer you sync from, including an
   impersonated server, can withhold events or block a sync with a bad batch, but
   cannot inject changes without a member's key.
 - **Server identity:** clients accept self-signed certificates without pinning
