@@ -316,7 +316,7 @@ Serve chunks from the source device:
 
 ```sh
 crow serve
-# serving /Users/you/.crow on 0.0.0.0:7070
+# serving /home/alice/.crow on 0.0.0.0:7070
 # node 8dad17fbe7b1f81c (laptop)
 # cluster token: configured
 # mDNS service: _crow._udp.local.
@@ -536,7 +536,8 @@ Commits should be focused and reviewed through pull requests. See [CONTRIBUTING.
 
 ## Roadmap
 
-This roadmap describes where Crow is headed. Later phases are plans that may change as the project develops.
+This roadmap describes where Crow is headed. Phases 0–2 have shipped; phases 3–4 have
+partially shipped, as noted below. Later phases are plans that may change as the project develops.
 
 Crow is being built as a local-first storage protocol first. The primary product surface is a
 personal encrypted file space across your own devices; the same primitives can also support shared
@@ -564,10 +565,10 @@ shares, shard indexes, or peer addresses during normal use.
 - **Sync.** Nest convergence, not "clone everything from one peer."
 - **Health.** The user-facing answer to "can I open this now, and is it safe if a device disappears?"
 
-### Execution rules
+### Design principles
 
 - Keep the current CLI working while adding the nest layer. Do not break existing `~/.crow` stores without a migration path.
-- Use one coherent commit per step. Each CLI command or protocol change should usually be its own commit.
+- Keep changes focused. Each CLI command or protocol change should usually be its own commit.
 - Every CLI change needs help text, README updates, and tests covering success and important edge cases.
 - Preserve existing low-level commands until their replacement is shipped. Hide or document them as advanced before removing anything.
 - Do not make normal users manage shards directly. Sharding is an internal placement mechanism; the UI is safety, availability, pinning, cache, mirror, prime, and drain.
