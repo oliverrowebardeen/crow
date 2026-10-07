@@ -5,11 +5,10 @@ trusted LAN. This project has not received an independent cryptographic audit.
 
 ## Report a vulnerability privately
 
-Use [GitHub private vulnerability reporting](https://github.com/oliverrowebardeen/crow/security/advisories/new) with the affected commit/version, a minimal
-reproduction, expected and actual behavior, and potential impact. Do not include
-real private keys, capabilities, or personal files. Please avoid public issues
-for undisclosed vulnerabilities. GitHub private vulnerability reporting may also
-be used if the repository has enabled it.
+Use [GitHub private vulnerability reporting](https://github.com/oliverrowebardeen/crow/security/advisories/new)
+with the affected commit/version, a minimal reproduction, expected and actual
+behavior, and potential impact. Do not include real private keys, capabilities,
+or personal files. Please avoid public issues for undisclosed vulnerabilities.
 
 Only the current development branch is maintained; no long-term security support
 or response-time guarantee is offered yet.
