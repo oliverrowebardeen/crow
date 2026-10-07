@@ -10,7 +10,7 @@ description = "Content-addressed file storage with erasure coding and capabiliti
 [dependencies]
 blake3 = "1.5"
 aes-gcm = "0.10"
-hkdf = "0.12"
+hkdf = "0.13"
 sha2 = "0.10"
 reed-solomon-simd = "3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
