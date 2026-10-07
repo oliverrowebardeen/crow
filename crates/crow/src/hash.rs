@@ -44,7 +44,7 @@ impl FromStr for Hash {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        if s.len() != 64 {
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::Hash(format!(
                 "expected 64 hex chars, got {}",
                 s.len()
@@ -112,6 +112,11 @@ hash_newtype!(ManifestHash, "Content address of an encrypted manifest.");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_unicode_hex_is_rejected_without_panicking() {
+        assert!(format!("{}a", "€".repeat(21)).parse::<Hash>().is_err());
+    }
 
     #[test]
     fn blake3_empty_known_vector() {

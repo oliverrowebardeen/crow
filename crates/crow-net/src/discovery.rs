@@ -4,8 +4,8 @@
 //! on the same network. Peers are kept in an in-memory cache keyed by
 //! [`NodeId`]; a background task updates the cache from `mdns-sd`'s event
 //! stream. The cache is unauthenticated — anything that advertises
-//! `_crow._udp.local.` shows up — so the existing shared `ClusterToken` is
-//! still what gates real chunk fetches.
+//! `_crow._udp.local.` shows up — so nest authentication (or the legacy shared `ClusterToken`)
+//! gates actual chunk fetches.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,7 +23,7 @@ use crate::{NetError, Result};
 pub const SERVICE_TYPE: &str = "_crow._udp.local.";
 /// TXT record carrying the protocol version. Bumped when wire-incompatible
 /// changes land so old peers can be filtered out.
-pub const ADVERT_VERSION: &str = "1";
+pub const ADVERT_VERSION: &str = "3";
 
 /// Best-effort friendly-name default: the OS hostname, if available.
 pub fn default_friendly_name() -> Option<String> {
@@ -67,6 +67,24 @@ impl Discovery {
     pub fn start(advert: Option<LocalAdvert>) -> Result<Self> {
         let daemon = ServiceDaemon::new()
             .map_err(|e| NetError::Protocol(format!("mdns daemon init: {e}")))?;
+        Self::start_with_daemon(advert, daemon)
+    }
+
+    /// Discover only on IPv4 loopback, for local development and integration
+    /// tests that must not depend on a physical LAN or advertise onto one.
+    pub fn start_loopback(advert: Option<LocalAdvert>) -> Result<Self> {
+        let daemon = ServiceDaemon::new()
+            .map_err(|e| NetError::Protocol(format!("mdns daemon init: {e}")))?;
+        daemon
+            .disable_interface(mdns_sd::IfKind::All)
+            .map_err(|e| NetError::Protocol(format!("mdns interfaces: {e}")))?;
+        daemon
+            .enable_interface(mdns_sd::IfKind::LoopbackV4)
+            .map_err(|e| NetError::Protocol(format!("mdns loopback: {e}")))?;
+        Self::start_with_daemon(advert, daemon)
+    }
+
+    fn start_with_daemon(advert: Option<LocalAdvert>, daemon: ServiceDaemon) -> Result<Self> {
         let receiver = daemon
             .browse(SERVICE_TYPE)
             .map_err(|e| NetError::Protocol(format!("mdns browse: {e}")))?;
@@ -189,6 +207,9 @@ fn make_service_info(advert: &LocalAdvert) -> Result<ServiceInfo> {
 
 fn peer_from_service_info(info: &ServiceInfo) -> Option<PeerInfo> {
     let props = info.get_properties();
+    if txt_string(props, "v").as_deref() != Some(ADVERT_VERSION) {
+        return None;
+    }
     let id_str = txt_string(props, "id")?;
     let node_id = NodeId::from_str(&id_str).ok()?;
 
@@ -237,6 +258,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn discovery_rejects_incompatible_protocol_versions() {
+        let id = Identity::random();
+        for (version, expected) in [
+            (ADVERT_VERSION, true),
+            ("1", false),
+            ("2", false),
+            ("", false),
+        ] {
+            let properties = [("id", id.node_id().to_string()), ("v", version.to_string())]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect::<HashMap<_, _>>();
+            let info = ServiceInfo::new(
+                SERVICE_TYPE,
+                &id.node_id().short(),
+                "test.local.",
+                "127.0.0.1",
+                7070,
+                Some(properties),
+            )
+            .unwrap();
+            assert_eq!(peer_from_service_info(&info).is_some(), expected);
+        }
+    }
+
     /// Wait up to `total` for `pred` to return true. Polls every `step`.
     async fn wait_for<F: Fn() -> bool>(total: Duration, step: Duration, pred: F) -> bool {
         let deadline = std::time::Instant::now() + total;
@@ -255,8 +302,8 @@ mod tests {
     async fn two_daemons_discover_each_other() {
         let id_a = Identity::random();
         let id_b = Identity::random();
-        let a = Discovery::start(Some(advert_for(&id_a, 7001, "device-a"))).unwrap();
-        let b = Discovery::start(Some(advert_for(&id_b, 7002, "device-b"))).unwrap();
+        let a = Discovery::start_loopback(Some(advert_for(&id_a, 7001, "device-a"))).unwrap();
+        let b = Discovery::start_loopback(Some(advert_for(&id_b, 7002, "device-b"))).unwrap();
 
         let a_id = id_a.node_id();
         let b_id = id_b.node_id();
@@ -286,8 +333,9 @@ mod tests {
     async fn browse_only_does_not_advertise_self() {
         let id_a = Identity::random();
         let id_b = Identity::random();
-        let advertiser = Discovery::start(Some(advert_for(&id_a, 7011, "advertiser"))).unwrap();
-        let listener = Discovery::start(None).unwrap(); // no advert
+        let advertiser =
+            Discovery::start_loopback(Some(advert_for(&id_a, 7011, "advertiser"))).unwrap();
+        let listener = Discovery::start_loopback(None).unwrap(); // no advert
 
         let a_id = id_a.node_id();
         let b_id = id_b.node_id();
@@ -317,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_self_discover() {
         let id = Identity::random();
-        let d = Discovery::start(Some(advert_for(&id, 7021, "solo"))).unwrap();
+        let d = Discovery::start_loopback(Some(advert_for(&id, 7021, "solo"))).unwrap();
 
         // Wait long enough for our own advertisement to come back via the
         // browse stream — the filter must drop it.

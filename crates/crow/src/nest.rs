@@ -533,14 +533,14 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let pid = std::process::id();
-    let tmp_name = match target.file_name().and_then(|s| s.to_str()) {
-        Some(s) => format!("{s}.{pid}.tmp"),
-        None => return Err(Error::Nest("invalid target path".into())),
-    };
-    let tmp = target.with_file_name(tmp_name);
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, target)?;
+    use std::io::Write;
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::Nest("invalid target path".into()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(target).map_err(|e| Error::Io(e.error))?;
     Ok(())
 }
 
@@ -560,7 +560,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex16(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 16];
@@ -574,6 +574,11 @@ fn decode_hex16(s: &str) -> Option<[u8; 16]> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn malformed_unicode_hex_is_rejected_without_panicking() {
+        assert!(decode_hex16(&format!("{}ab", "€".repeat(10))).is_none());
+    }
 
     fn home() -> TempDir {
         TempDir::new().expect("tempdir")
@@ -872,7 +877,7 @@ mod tests {
             other => panic!("expected Nest error, got {other:?}"),
         }
         // Sanity: the longer prefix disambiguates one way.
-        let full = format!("{}cd", &"ab".repeat(15));
+        let full = format!("{}cd", "ab".repeat(15));
         assert_eq!(index.resolve(&full).unwrap().name, "b");
     }
 

@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -9,8 +10,8 @@ use crate::hash::Hash;
 
 /// On-disk [`ChunkStore`]: one file per chunk, named by its hex hash. Two
 /// directories live under `root`: `chunks/` for data shares, `manifests/`
-/// for sealed manifests. Writes go through a `<hash>.<pid>.tmp` file and
-/// are renamed into place to be atomic on a single filesystem.
+/// for sealed manifests. Writes use unique temporary files in the same
+/// directory and publish without replacing another writer's object.
 pub struct FsStore {
     root: PathBuf,
 }
@@ -37,11 +38,6 @@ impl FsStore {
     fn path(&self, ns: Namespace, hash: &Hash) -> PathBuf {
         self.ns_dir(ns).join(hash.to_string())
     }
-
-    fn tmp_path(&self, ns: Namespace, hash: &Hash) -> PathBuf {
-        self.ns_dir(ns)
-            .join(format!("{hash}.{}.tmp", std::process::id()))
-    }
 }
 
 impl ChunkStore for FsStore {
@@ -57,12 +53,14 @@ impl ChunkStore for FsStore {
             // Content-addressed: identical content already stored.
             return Ok(());
         }
-        let tmp = self.tmp_path(ns, &hash);
-        fs::write(&tmp, &bytes)?;
-        // Rename is atomic within a filesystem and idempotent under races
-        // because identical content produces identical bytes.
-        fs::rename(&tmp, &target)?;
-        Ok(())
+        let mut tmp = tempfile::NamedTempFile::new_in(self.ns_dir(ns))?;
+        tmp.write_all(&bytes)?;
+        tmp.as_file().sync_all()?;
+        match tmp.persist_noclobber(&target) {
+            Ok(_) => Ok(()),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(Error::Io(e.error)),
+        }
     }
 
     fn get(&self, ns: Namespace, hash: &Hash) -> Result<Option<Bytes>> {
@@ -96,7 +94,7 @@ impl ChunkStore for FsStore {
         for entry in entries {
             let entry = entry?;
             // Skip anything that isn't a 64-char hex hash file: in particular
-            // <hash>.<pid>.tmp partial-write siblings.
+            // temporary partial-write siblings.
             let name = match entry.file_name().into_string() {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -124,6 +122,53 @@ impl ChunkStore for FsStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn concurrent_identical_writes_are_atomic() {
+        use std::sync::{Arc, Barrier};
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(FsStore::open(tmp.path()).unwrap());
+        let barrier = Arc::new(Barrier::new(16));
+        let bytes = Bytes::from(vec![42; 1024 * 1024]);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let store = store.clone();
+                    let barrier = barrier.clone();
+                    let bytes = bytes.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.put(Namespace::Chunks, bytes)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            store.get(Namespace::Chunks, &Hash::of(&bytes)).unwrap(),
+            Some(bytes)
+        );
+        assert_eq!(fs::read_dir(tmp.path().join("chunks")).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_temporary_symlink_cannot_overwrite_another_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = FsStore::open(tmp.path()).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, b"keep").unwrap();
+        let hash = Hash::of(b"new data");
+        let old_tmp = tmp
+            .path()
+            .join("chunks")
+            .join(format!("{hash}.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&outside, old_tmp).unwrap();
+        store.put(Namespace::Chunks, b(b"new data")).unwrap();
+        assert_eq!(fs::read(outside).unwrap(), b"keep");
+    }
 
     fn b(s: &[u8]) -> Bytes {
         Bytes::copy_from_slice(s)

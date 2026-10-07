@@ -25,24 +25,22 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:7070";
 pub const TOKEN_FILE: &str = "cluster-token";
-/// Wire protocol version. Bumped to 2 in Phase 3 (added nest-scoped
-/// challenge-response variants). Servers and clients on the same version
-/// understand both legacy ClusterToken requests and the new nest-scoped
-/// flow; downgrade to v1 is not supported.
-pub const PROTOCOL_VERSION: u16 = 2;
-const ALPN: &[u8] = b"crow-1";
+/// Version 3 binds nest authentication to the QUIC TLS session.
+/// All peers must upgrade together; older handshakes are rejected.
+pub const PROTOCOL_VERSION: u16 = 3;
+const ALPN: &[u8] = b"crow-3";
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// Maximum number of in-flight `handle_stream` tasks per connection.
 /// Excess streams wait for a permit before being processed, bounding
 /// the memory and Mutex contention a single peer can induce. 128 is
 /// generous enough that the parallel-shard-fetch path never blocks
 /// itself (default 3-of-5 erasure × ≤16 stripes ≈ 80 concurrent
-/// requests) but small enough to make resource exhaustion infeasible.
+/// requests). This per-connection limit is not a global memory budget.
 const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 128;
 /// Domain tag for the nest-auth challenge signed by clients during the
 /// handshake. Bumping it invalidates every in-flight handshake — only
 /// change with a coordinated version bump.
-const NEST_AUTH_DOMAIN_TAG: &[u8] = b"crow.nest-auth.v1";
+const NEST_AUTH_DOMAIN_TAG: &[u8] = b"crow.nest-auth.v2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -106,7 +104,7 @@ impl ClusterToken {
 
     pub fn decode(s: &str) -> Result<Self> {
         let s = s.trim();
-        if s.len() != 64 {
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(NetError::Token(format!(
                 "expected 64 hex chars, got {}",
                 s.len()
@@ -228,7 +226,7 @@ pub enum Request {
         membership_proof: Option<Box<CatalogEvent>>,
     },
     /// Step 2 of the handshake. Client signs
-    /// `NEST_AUTH_DOMAIN_TAG || challenge || nest_id || signer` with
+    /// `NEST_AUTH_DOMAIN_TAG || challenge || nest_id || signer || channel_binding` with
     /// the private key matching `signer`; server verifies and looks up
     /// membership.
     NestAuthResponse {
@@ -278,7 +276,7 @@ pub enum Response {
 
     // ----- Nest-scoped responses. -----
     /// Issued in response to `NestHello`. Client must sign this challenge
-    /// concatenated with `NEST_AUTH_DOMAIN_TAG`, nest_id, and signer.
+    /// concatenated with `NEST_AUTH_DOMAIN_TAG`, nest_id, signer, and the TLS exporter.
     NestChallenge {
         challenge: [u8; 32],
     },
@@ -435,6 +433,10 @@ async fn accept_loop(endpoint: Endpoint, ctx: ServerCtx) -> Result<()> {
         let ctx = ctx.clone();
         tokio::spawn(async move {
             if let Ok(connection) = incoming.await {
+                let Ok(channel_binding) = tls_channel_binding(&connection) else {
+                    connection.close(1u32.into(), b"TLS exporter unavailable");
+                    return;
+                };
                 let conn_state = Arc::new(tokio::sync::RwLock::new(AuthStage::default()));
                 // Cap concurrent stream-handler tasks per connection so a
                 // misbehaving peer can't open unbounded streams and exhaust
@@ -453,7 +455,7 @@ async fn accept_loop(endpoint: Endpoint, ctx: ServerCtx) -> Result<()> {
                     let conn_state = conn_state.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _ = handle_stream(ctx, conn_state, send, recv).await;
+                        let _ = handle_stream(ctx, conn_state, channel_binding, send, recv).await;
                     });
                 }
             }
@@ -534,7 +536,12 @@ impl Client {
         };
 
         // Step 2: sign and submit NestAuthResponse.
-        let payload = nest_auth_signing_payload(&challenge, &nest_id, &signer);
+        let payload = nest_auth_signing_payload(
+            &challenge,
+            &nest_id,
+            &signer,
+            &tls_channel_binding(&self.connection)?,
+        );
         let sig: ed25519_dalek::Signature =
             ed25519_dalek::Signer::sign(&identity.signing, &payload);
         match self
@@ -739,11 +746,12 @@ impl Client {
 async fn handle_stream(
     ctx: ServerCtx,
     conn_state: Arc<tokio::sync::RwLock<AuthStage>>,
+    channel_binding: [u8; 32],
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
     let response = match read_frame::<Request>(&mut recv).await {
-        Ok(request) => handle_request(&ctx, &conn_state, request).await,
+        Ok(request) => handle_request(&ctx, &conn_state, &channel_binding, request).await,
         Err(e) => Response::Error {
             message: e.to_string(),
         },
@@ -756,6 +764,7 @@ async fn handle_stream(
 async fn handle_request(
     ctx: &ServerCtx,
     conn_state: &Arc<tokio::sync::RwLock<AuthStage>>,
+    channel_binding: &[u8; 32],
     request: Request,
 ) -> Response {
     if request_version(&request) != PROTOCOL_VERSION {
@@ -767,10 +776,10 @@ async fn handle_request(
     // Legacy cluster-token branch: every legacy variant carries the
     // bearer token in-frame. Reject if mismatched without consulting
     // per-connection state.
-    if let Some(token) = legacy_token(&request) {
-        if token != ctx.legacy_token {
-            return Response::Unauthorized;
-        }
+    if let Some(token) = legacy_token(&request)
+        && token != ctx.legacy_token
+    {
+        return Response::Unauthorized;
     }
 
     match request {
@@ -805,7 +814,7 @@ async fn handle_request(
             .await
         }
         Request::NestAuthResponse { signature, .. } => {
-            handle_nest_auth_response(ctx, conn_state, signature).await
+            handle_nest_auth_response(ctx, conn_state, channel_binding, signature).await
         }
         Request::NestHave {
             namespace, hash, ..
@@ -860,6 +869,7 @@ async fn handle_nest_hello(
 async fn handle_nest_auth_response(
     ctx: &ServerCtx,
     conn_state: &Arc<tokio::sync::RwLock<AuthStage>>,
+    channel_binding: &[u8; 32],
     signature: Signature,
 ) -> Response {
     let pending = {
@@ -881,7 +891,12 @@ async fn handle_nest_auth_response(
     if nest.nest_id != pending.nest_id {
         return Response::NestUnauthorised;
     }
-    let payload = nest_auth_signing_payload(&pending.challenge, &pending.nest_id, &pending.signer);
+    let payload = nest_auth_signing_payload(
+        &pending.challenge,
+        &pending.nest_id,
+        &pending.signer,
+        channel_binding,
+    );
     let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(pending.signer.as_bytes())
     else {
         return Response::NestUnauthorised;
@@ -990,12 +1005,26 @@ fn catalog_events_response(catalog: &CatalogIndex) -> Response {
 
 /// Domain-separated payload a client signs in response to a server
 /// challenge. Identical at both ends, by construction.
-fn nest_auth_signing_payload(challenge: &[u8; 32], nest_id: &NestId, signer: &NodeId) -> Vec<u8> {
-    let mut out = Vec::with_capacity(NEST_AUTH_DOMAIN_TAG.len() + 32 + 16 + 32);
+fn tls_channel_binding(connection: &quinn::Connection) -> Result<[u8; 32]> {
+    let mut binding = [0u8; 32];
+    connection
+        .export_keying_material(&mut binding, b"EXPORTER-crow-nest-auth-v2", b"")
+        .map_err(|_| NetError::Protocol("TLS exporter unavailable".into()))?;
+    Ok(binding)
+}
+
+fn nest_auth_signing_payload(
+    challenge: &[u8; 32],
+    nest_id: &NestId,
+    signer: &NodeId,
+    channel_binding: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(NEST_AUTH_DOMAIN_TAG.len() + 32 + 16 + 32 + 32);
     out.extend_from_slice(NEST_AUTH_DOMAIN_TAG);
     out.extend_from_slice(challenge);
     out.extend_from_slice(nest_id.as_bytes());
     out.extend_from_slice(signer.as_bytes());
+    out.extend_from_slice(channel_binding);
     out
 }
 
@@ -1104,31 +1133,36 @@ impl ServerCertVerifier for SkipServerVerification {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-        ]
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -1158,6 +1192,65 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn nest_signature_is_bound_to_the_tls_connection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let identity = Identity::random();
+        let nest_id = NestId::random();
+        let catalog = Arc::new(CatalogIndex::open(tmp.path()).unwrap());
+        catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        let mut config = ServeConfig::new(
+            FsStore::open(tmp.path()).unwrap(),
+            ClusterToken::random(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        config.nest_serving = Some(NestServingConfig { nest_id, catalog });
+        let server = serve_with_config(config).await.unwrap();
+        for wrong_connection in [true, false] {
+            let client = Client::connect(server.local_addr()).await.unwrap();
+            let response = client
+                .request(Request::NestHello {
+                    version: PROTOCOL_VERSION,
+                    nest_id,
+                    signer: identity.node_id(),
+                    membership_proof: None,
+                })
+                .await
+                .unwrap();
+            let Response::NestChallenge { challenge } = response else {
+                panic!("expected challenge")
+            };
+            let mut binding = tls_channel_binding(&client.connection).unwrap();
+            if wrong_connection {
+                binding[0] ^= 1;
+            }
+            let payload =
+                nest_auth_signing_payload(&challenge, &nest_id, &identity.node_id(), &binding);
+            let sig = ed25519_dalek::Signer::sign(&identity.signing, &payload);
+            let response = client
+                .request(Request::NestAuthResponse {
+                    version: PROTOCOL_VERSION,
+                    signature: Signature(sig.to_bytes()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                response,
+                if wrong_connection {
+                    Response::NestUnauthorised
+                } else {
+                    Response::NestAuthorised
+                }
+            );
+        }
+        server.handle.abort();
+    }
+
+    #[test]
+    fn malformed_unicode_hex_is_rejected_without_panicking() {
+        assert!(ClusterToken::decode(&format!("{}a", "€".repeat(21))).is_err());
+    }
 
     #[test]
     fn token_roundtrip() {
@@ -1214,6 +1307,7 @@ mod tests {
         let response = rt.block_on(handle_request(
             &ctx,
             &conn_state,
+            &[0; 32],
             Request::CatalogEvents {
                 version: PROTOCOL_VERSION,
                 token,
@@ -1242,6 +1336,7 @@ mod tests {
         let response = rt.block_on(handle_request(
             &ctx,
             &conn_state,
+            &[0; 32],
             Request::CatalogEvents {
                 version: PROTOCOL_VERSION,
                 token: ClusterToken::random(),

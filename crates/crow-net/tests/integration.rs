@@ -51,7 +51,7 @@ async fn fetch_via_mdns_discovered_address() {
         .unwrap();
     let addr_a = server_a.local_addr();
 
-    let discovery_a = Discovery::start(Some(LocalAdvert {
+    let discovery_a = Discovery::start_loopback(Some(LocalAdvert {
         node_id: id_a.node_id(),
         port: addr_a.port(),
         friendly_name: Some("daemon-a".into()),
@@ -59,7 +59,7 @@ async fn fetch_via_mdns_discovered_address() {
     .unwrap();
 
     // Daemon B browses only (no advert) and looks for A.
-    let discovery_b = Discovery::start(None).unwrap();
+    let discovery_b = Discovery::start_loopback(None).unwrap();
 
     let id_a_node = id_a.node_id();
     assert!(
@@ -86,13 +86,12 @@ async fn fetch_via_mdns_discovered_address() {
         peer.addresses,
     );
 
-    // mdns-sd's auto-addr collection gives us whatever the OS network stack
-    // serves on loopback, which on macOS is IPv6 link-local (`fe80::1`) —
-    // and Quinn (correctly) rejects link-local without a scope id. The
-    // production case is "peer advertises 192.168.1.x and we connect to
-    // 192.168.1.x:port"; on loopback we synthesise the routable equivalent
-    // using the verified discovered port.
-    let socket_addr: SocketAddr = format!("127.0.0.1:{}", addr_a.port()).parse().unwrap();
+    // Loopback discovery must supply an address that is actually usable.
+    let socket_addr: SocketAddr = *peer
+        .addresses
+        .iter()
+        .find(|address| address.ip().is_ipv4() && address.ip().is_loopback())
+        .expect("discovery should resolve the loopback address");
 
     let client = Client::connect(socket_addr).await.unwrap();
     client.hello(token).await.unwrap();
@@ -125,8 +124,8 @@ async fn snapshot_roundtrips_discovered_peers() {
         port: 7777,
         friendly_name: Some("alpha".into()),
     };
-    let disc_a = Discovery::start(Some(advert_a)).unwrap();
-    let disc_b = Discovery::start(None).unwrap();
+    let disc_a = Discovery::start_loopback(Some(advert_a)).unwrap();
+    let disc_b = Discovery::start_loopback(None).unwrap();
 
     assert!(
         wait_for(Duration::from_secs(8), Duration::from_millis(200), || {
