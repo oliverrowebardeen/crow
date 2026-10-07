@@ -515,10 +515,10 @@ enum Command {
         long_about = "Start a long-running QUIC server that serves encrypted manifests \
                       and chunks by hash to clients with the shared cluster token.\n\
                       \n\
-                      Token holders can also read the served nest's catalog, which \
-                      contains read capabilities, so share the token only with your own \
-                      devices. Nest members authenticate separately with signed \
-                      challenges. Run `crow token init` first, then copy the token to another trusted device with \
+                      Token holders can fetch encrypted manifests and chunks by hash only. \
+                      The nest catalog, which contains read capabilities, is served only \
+                      to nest members authenticated with signed challenges. \
+                      Run `crow token init` first, then copy the token to another trusted device with \
                       `crow token set <TOKEN>`."
     )]
     Serve {
@@ -3616,7 +3616,6 @@ fn cmd_serve(
     let identity = Identity::load_or_create(home)?;
     let catalog = CatalogIndex::open(nest_dir)?;
     catalog.ensure_founding_member(&nest_id, &identity)?;
-    let legacy_catalog = CatalogIndex::open(nest_dir)?;
     let node_id = identity.node_id();
     let friendly_name = resolve_serve_name(home, name_override)?;
     let root = store.root().display().to_string();
@@ -3631,7 +3630,7 @@ fn cmd_serve(
     };
 
     let rt = runtime()?;
-    rt.block_on(serve_loop(store, catalog, legacy_catalog, token, config))
+    rt.block_on(serve_loop(store, catalog, token, config))
 }
 
 struct ServeLoopConfig {
@@ -3646,13 +3645,11 @@ struct ServeLoopConfig {
 async fn serve_loop(
     store: FsStore,
     catalog: CatalogIndex,
-    legacy_catalog: CatalogIndex,
     token: ClusterToken,
     config: ServeLoopConfig,
 ) -> DynResult<()> {
     let catalog = std::sync::Arc::new(catalog);
     let mut serve_config = crow_net::ServeConfig::new(store, token, config.bind);
-    serve_config.legacy_catalog = Some(legacy_catalog);
     serve_config.nest_serving = Some(crow_net::NestServingConfig {
         nest_id: config.nest_id,
         catalog: catalog.clone(),
@@ -5812,9 +5809,8 @@ mod tests {
         let token = ClusterToken::random();
         let rt = runtime().unwrap();
         let server = rt
-            .block_on(crow_net::serve_with_catalog(
+            .block_on(crow_net::serve(
                 FsStore::open(source.path()).unwrap(),
-                CatalogIndex::open(source.path()).unwrap(),
                 token,
                 "127.0.0.1:0".parse().unwrap(),
             ))
@@ -5824,8 +5820,8 @@ mod tests {
 
         let dest_catalog = CatalogIndex::open(dest.path()).unwrap();
         let dest_crow = Crow::new(FsStore::open(dest.path()).unwrap());
-        let events = rt.block_on(client.catalog_events(token)).unwrap();
-        sync_catalog_events(&dest_catalog, events).unwrap();
+        // Capabilities are supplied locally; the token only authorizes ciphertext fetches.
+        sync_catalog_events(&dest_catalog, source_catalog.load_events().unwrap()).unwrap();
 
         let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
             rt.block_on(client.get_many(token, reqs))
@@ -5858,9 +5854,8 @@ mod tests {
         let token = ClusterToken::random();
         let rt = runtime().unwrap();
         let server = rt
-            .block_on(crow_net::serve_with_catalog(
+            .block_on(crow_net::serve(
                 FsStore::open(source.path()).unwrap(),
-                CatalogIndex::open(source.path()).unwrap(),
                 token,
                 "127.0.0.1:0".parse().unwrap(),
             ))
@@ -5870,8 +5865,8 @@ mod tests {
 
         let dest_catalog = CatalogIndex::open(dest.path()).unwrap();
         let dest_crow = Crow::new(FsStore::open(dest.path()).unwrap());
-        let events = rt.block_on(client.catalog_events(token)).unwrap();
-        sync_catalog_events(&dest_catalog, events).unwrap();
+        // Capabilities are supplied locally; the token only authorizes ciphertext fetches.
+        sync_catalog_events(&dest_catalog, source_catalog.load_events().unwrap()).unwrap();
 
         let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
             rt.block_on(client.get_many(token, reqs))

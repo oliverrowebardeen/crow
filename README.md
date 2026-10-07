@@ -66,8 +66,8 @@ cmp "$demo_dir/input.txt" "$demo_dir/restored.txt"
 `$demo_dir`. `CROW_HOME` (or the top-level `crow --home PATH <command>`) selects the store.
 `crow cap /docs/hello.txt` prints a bearer capability: share it only
 with intended readers, and keep it out of public screenshots and logs.
-`crow setup` also prints the cluster token. Treat that token as read access to the
-served nest: token holders can retrieve catalog capabilities and encrypted objects.
+`crow setup` also prints the cluster token. It lets a holder download your encrypted
+objects by hash (not the catalog or any capability), so keep it private too.
 Keep setup output out of public screenshots and logs too.
 
 For two-device setup, directory snapshots, pinning, and recovery, see the
@@ -92,10 +92,9 @@ Nest authentication signs a fresh challenge plus a TLS session binding. This
 prevents moving a valid signature onto a different connection. Protocol **v3**
 requires all peers to upgrade together; there is no insecure fallback to v2.
 Self-signed server certificates are still not bound to a known device identity.
-Use only a trusted LAN. `crow serve` always enables the legacy shared-token path
-alongside nest authentication. The token grants read access to the served nest,
-including catalog events containing read capabilities; it is not limited to
-fetching opaque ciphertext. A peer you sync from can supply ordinary catalog
+Use only a trusted LAN. `crow serve` also accepts the legacy shared token, which
+only authorizes fetching encrypted objects by hash; the catalog is served only to
+authenticated nest members. A peer you sync from can supply ordinary catalog
 changes validly signed by any key, including a non-member's key.
 
 ## Develop

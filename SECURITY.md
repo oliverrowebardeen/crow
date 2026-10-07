@@ -20,9 +20,9 @@ or response-time guarantee is offered yet.
   encrypted shares alone is insufficient to decrypt a file.
 - Signed manifests identify a creator; a signature does not establish trust.
 - Nest-scoped requests require membership and a signed fresh challenge bound to
-  the QUIC TLS session. `crow serve` also always accepts the legacy cluster token
-  for catalog and object access without membership. v3 peers reject older
-  protocol versions.
+  the QUIC TLS session. The catalog is served only to authenticated members.
+  `crow serve` also accepts the legacy cluster token, which authorizes fetching
+  encrypted objects by hash only. v3 peers reject older protocol versions.
 - Directory exports use a directory-scoped filesystem API and create-new files
   to prevent writing through escaping symlinks or overwriting existing files.
 - Unix pin/catalog directories are owner-only. New identity and pin files use
@@ -30,11 +30,11 @@ or response-time guarantee is offered yet.
 
 ## Limits and deployment boundaries
 
-- **Cluster token:** treat it as read access to the served nest. A token holder
-  can retrieve the full catalog event log, including `crow1…` read capabilities,
-  then fetch and decrypt the referenced objects. The token is per-home, so it
-  grants access to whichever nest that home serves. `crow setup` prints it;
-  keep setup output out of screenshots and logs.
+- **Cluster token:** lets a holder fetch encrypted manifests and chunks by hash
+  from whichever nest that home serves. It does not grant catalog access, and
+  decrypting anything still requires a read capability. A holder who already has
+  hashes can download ciphertext and learn object sizes. `crow setup` prints the
+  token; keep setup output out of screenshots and logs.
 - **Catalog authorization:** event signatures provide attribution, not general
   authorization. Remote merge checks membership authority only for `MemberAdded`
   and `MemberRevoked`. Ordinary path changes are accepted with a valid signature

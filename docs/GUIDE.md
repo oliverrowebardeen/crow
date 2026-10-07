@@ -122,7 +122,7 @@ Catalog folders are mutable local organization. To share a folder, freeze it int
 
 Device names are local convenience metadata. `crow serve` advertises the saved name on LAN mDNS, falling back to the OS hostname. Choose a name with `crow setup --name NAME` or override it with `crow serve --name NAME`. Caps never contain device names, IP addresses, or other locators.
 
-Nests are named file spaces on the local device. Each nest has its own catalog, pins, encrypted shares, and **member list** under `<home>/nests/<id>/`. File contents and manifests are encrypted; catalog events and pin JSON contain plaintext paths/names and read capabilities. Use `crow nest list` / `create` / `use` to switch between nests and `--nest <name>` to target a non-active nest for a single command. Use `crow nest devices` to see the trusted devices in a nest; it combines signed membership with best-effort LAN presence from `crow serve`. `crow peers` remains the lower-level discovery diagnostic. Nest-scoped sync authenticates the client with a signed challenge; the server identity is not authenticated against a known device. Use recipient-bound `crow nest invite <node-id>` / `crow nest join` for sync. `crow serve` also always enables the legacy `cluster-token` path: treat this per-home token as read access to whichever nest is served.
+Nests are named file spaces on the local device. Each nest has its own catalog, pins, encrypted shares, and **member list** under `<home>/nests/<id>/`. File contents and manifests are encrypted; catalog events and pin JSON contain plaintext paths/names and read capabilities. Use `crow nest list` / `create` / `use` to switch between nests and `--nest <name>` to target a non-active nest for a single command. Use `crow nest devices` to see the trusted devices in a nest; it combines signed membership with best-effort LAN presence from `crow serve`. `crow peers` remains the lower-level discovery diagnostic. Nest-scoped sync authenticates the client with a signed challenge; the server identity is not authenticated against a known device. Use recipient-bound `crow nest invite <node-id>` / `crow nest join` for sync. `crow serve` also accepts the legacy per-home `cluster-token`, which only authorizes fetching encrypted objects by hash.
 
 ### Walkthrough
 
@@ -267,7 +267,7 @@ NODE              NAME              ROLE    STATUS    ADDED       LAST SEEN   AD
 
 `crow nest devices` is the membership view: it tells you which device identities are trusted in the nest. Online/offline status is a convenience hint from the local `crow serve` peer snapshot, not an authorization source. Use `crow peers --long` when debugging raw LAN discovery addresses.
 
-Nests have separate on-disk catalogs, pins, and object directories. `crow sync` uses a signed challenge-response handshake for the selected nest; the server admits a current member or a device presenting a valid member grant from a current Owner. This is not an absolute network isolation boundary: the cluster token is per-home, and `crow --nest X serve` exposes X's catalog and objects to any holder of that token.
+Nests have separate on-disk catalogs, pins, and object directories. `crow sync` uses a signed challenge-response handshake for the selected nest; the server admits a current member or a device presenting a valid member grant from a current Owner. The legacy cluster token is per-home: `crow --nest X serve` lets any holder of that token fetch X's encrypted objects by hash, but not its catalog.
 
 Upgrading from a pre-Phase-2 layout migrates `<home>/{catalog, pins, chunks, manifests}` under a fresh `personal` nest the first time any nest-aware command runs. Migration is crash-recoverable and idempotent: it moves directories individually and completes a partial migration on the next run. The index is published with an atomic write; the entire migration is not one atomic operation.
 
@@ -307,7 +307,7 @@ crow get /docs/report.pdf report.pdf      # bytes were fetched by --full
 
 ### Two-device test
 
-Networking is for trusted devices you own on the same LAN. It is not friend-scoped sharing yet: every device with the shared cluster token can retrieve the served nest's catalog events, including read capabilities, and fetch the encrypted objects. Treat the token as read access to the served nest.
+Networking is for trusted devices you own on the same LAN. It is not friend-scoped sharing yet. The legacy cluster token lets a holder fetch the served nest's encrypted objects by hash; catalog events, and the read capabilities in them, are served only to authenticated nest members.
 
 For discovery-based sync and lazy fetch, first complete the invite/join setup above. Keep the laptop's `crow serve` running. On the phone, start a daemon for the joined nest too:
 
@@ -347,7 +347,7 @@ crow get /docs/report.pdf another-report.pdf
 
 For newly cataloged files without local bytes, `get`, `cat`, `grep`, and `get-dir` use the local snapshot to try visible trusted devices. If discovery is unavailable, use `crow sync --full IP:port` before reading instead.
 
-Legacy cap fetch is a separate path. On the receiving device, configure the serving laptop's cluster token (printed by its `setup`, or retrieved with `crow token show`). This grants access to the entire served nest. Then fetch by explicit address, or use a node-id prefix/name from the receiving device's snapshot:
+Legacy cap fetch is a separate path. On the receiving device, configure the serving laptop's cluster token (printed by its `setup`, or retrieved with `crow token show`). The token lets the receiver fetch encrypted objects by hash; it does not reveal the catalog or other capabilities. Then fetch by explicit address, or use a node-id prefix/name from the receiving device's snapshot:
 
 ```sh
 crow token set <laptop-64-hex-token>
@@ -362,7 +362,7 @@ crow get <pinned-hash-prefix> fetched-report.pdf
 
 ### Sharing
 
-The cap is the only secret needed to decrypt the referenced object once its encrypted manifest and enough shares are available. Fetching with `receive` or `fetch` also requires the serving device's cluster token, configured in the receiving home. That token grants read access to the whole served nest, not just the shared file. A cap is ASCII, about 117 characters, and paste-friendly. For your own devices, prefer invite/join and `crow sync` so paths move through the nest without manually copying caps. For a token-authorized file or directory handoff, use `share` and `receive`:
+The cap is the only secret needed to decrypt the referenced object once its encrypted manifest and enough shares are available. Fetching with `receive` or `fetch` also requires the serving device's cluster token, configured in the receiving home. That token lets the receiver download encrypted objects by hash but not the catalog, so without other capabilities they can decrypt only what you shared. A cap is ASCII, about 117 characters, and paste-friendly. For your own devices, prefer invite/join and `crow sync` so paths move through the nest without manually copying caps. For a token-authorized file or directory handoff, use `share` and `receive`:
 
 ```sh
 # Source device (already set up; run `crow serve` in another terminal):
@@ -402,8 +402,8 @@ If two peers have the same friendly name, `crow receive laptop ...` or `crow syn
 - **Catalog events are signed for attribution, not general authorization.** The CLI uses `merge_events_from_peer_for_nest`, which rejects unsigned or tampered events and checks authority for `MemberAdded` / `MemberRevoked`. Ordinary operations (`Mkdir`, `PutFile`, `Remove`, `Move`) are accepted when validly signed by any key, including a non-member's. A reachable peer you sync from can feed you such catalog changes. Server certificates are self-signed and unpinned, so a connection does not authenticate a known server device.
 - **Nest membership is per-device-identity-bound.** `crow nest invite <node-id>` produces a recipient-bound credential that the recipient redeems into a per-device `MemberAdded` catalog event. The first QUIC handshake can carry that signed membership proof so a newly joined device can bootstrap sync without copying the legacy cluster token. For nest-scoped requests, the daemon admits a peer iff that peer's signing key is a current member of the named nest or presents a valid grant from a current Owner.
 - Invite strings are recipient-bound but still sensitive while in transit. Once redeemed, the new device's identity is independently recorded in the catalog, so a future Phase-5 revocation will be per-device rather than per-invite.
-- `crow serve` always accepts the legacy cluster token for catalog and object access. The catalog includes read capabilities, so treat the token as read access to the served nest. `crow setup` prints it: keep setup output out of screenshots and logs. Prefer `crow nest invite` / `crow nest join` for sync without copying the token.
-- `crow sync` pulls catalog metadata and, with `--full`, encrypted objects by hash; lazy fetch retrieves missing bytes on read. These CLI paths use nest-scoped client authentication, but the serving daemon also exposes the same catalog and objects to legacy token holders.
+- `crow serve` also accepts the legacy cluster token, which authorizes only Hello/Have/Get of encrypted objects by hash. The legacy catalog request is always refused; catalog events are served only to authenticated nest members. `crow setup` prints the token: keep setup output out of screenshots and logs. Prefer `crow nest invite` / `crow nest join` for sync without copying the token.
+- `crow sync` pulls catalog metadata and, with `--full`, encrypted objects by hash; lazy fetch retrieves missing bytes on read. These CLI paths use nest-scoped client authentication; legacy token holders can fetch the same encrypted objects by hash but not the catalog.
 - Only file contents and manifests are encrypted at rest. Catalog events (`events.jsonl`) and pin JSON store plaintext paths/names and capabilities under the Crow home.
 - Device names and mDNS discovery are only convenience metadata. They are advertised only while `crow serve` runs, are not trusted for authorization, and are never embedded in caps.
 - Crow is alpha software. Keep independent backups of important data until automatic multi-device replication is shipped and battle-tested.
@@ -428,7 +428,7 @@ crow cat "$(cat note.cap)"
 ```
 ~/.crow/
 ├── identity.json  # Ed25519 and X25519 SECRET keys; new files are 0600 on Unix
-├── cluster-token  # per-home legacy token; read access to the served nest
+├── cluster-token  # per-home legacy token; fetch encrypted objects by hash
 ├── device.json    # friendly device name, written by setup/device name
 ├── nests.json     # nest index and active selection
 ├── peers.json     # discovery snapshot, written by serve
@@ -609,7 +609,7 @@ shares, shard indexes, or peer addresses during normal use.
 | `peers` | Discovered network endpoints | Keep as diagnostic; daily trusted-device view is `crow nest devices`. |
 | `device` | Local identity/name | Shipped; nest membership already references device identities. |
 | `setup` | Bootstrap wrapper | Default `personal` nest creation/migration shipped; joining another device's nest uses `nest join`. |
-| `token` | Per-home secret granting read access to the served nest | Replace with scoped authorization; currently always accepted by `serve` for catalog and object access. |
+| `token` | Per-home secret for fetching encrypted objects by hash | Replace with scoped authorization; `serve` accepts it for object access only. |
 | `fetch` | Low-level object transfer | Keep as advanced/debug. Normal use should be `sync`, lazy fetch, or native sharing. |
 | `sync [peer]` | Nest metadata convergence and optional local caching | Default is metadata-first across visible trusted devices; `sync <device>` targets one device; `--full` explicitly caches cataloged bytes locally. |
 | `nest` | Named file spaces with encrypted contents and plaintext catalog/pin metadata | `create`, `list`, `use`, `current`, `devices`, `invite`, and `join` shipped; `rename`, `status`, and `leave` planned. |
@@ -664,12 +664,12 @@ Replace shared-token trust with explicit nest membership.
 3. **Device invites — shipped.** `crow nest invite <recipient-node-id>` produces a signed `crowinvite1…` bech32m string with HRP `crowinvite`. `crow nest join <invite>` decodes, verifies the granter's invite signature, verifies the embedded member-grant signature over `(nest_id, granter, recipient, role, added_at)`, checks expiry, creates a local nest dir carrying the granter's `nest_id`, and writes a verifiable `MemberAdded` event into the catalog.
 4. **Scoped authorization — shipped.** QUIC gains a per-connection challenge-response handshake (`NestHello` → `NestChallenge` → `NestAuthResponse`). The server issues a fresh random 32-byte challenge per connection, the client signs a domain-tagged payload with its identity key, and the server admits the peer iff the signer is a current non-revoked member of the named nest or presents a valid signed `MemberAdded` proof from a current Owner. Subsequent `NestHave` / `NestGet` / `NestCatalogEvents` on the connection are gated on the per-connection auth flag. Wire protocol version is now 3; signatures include a TLS exporter binding to prevent forwarding a proof between connections. Upgrade all peers together.
 5. **Revocation — no CLI workflow.** `CatalogOp::MemberRevoked` and `MemberRecord::revoked_at` exist in the format and library; merge validates revocation authority and nest authentication checks `revoked_at`. There is no device-removal command or complete end-user revocation workflow. Copied capabilities, keys, and plaintext cannot be recalled.
-6. **Legacy access — still enabled.** The `serve` daemon always accepts legacy `ClusterToken` Hello/Have/Get/CatalogEvents requests on the same endpoint. This grants token holders read access to the served nest, including capabilities in catalog events. `crow sync` is nest-scoped only and does not fall back to the legacy cluster token.
+6. **Legacy access — narrowed.** The `serve` daemon still accepts legacy `ClusterToken` Hello/Have/Get requests for encrypted objects on the same endpoint. The legacy `CatalogEvents` request is always refused, so token holders cannot read catalog capabilities. `crow sync` is nest-scoped only and does not fall back to the legacy cluster token.
 
 Acceptance criteria: ✅ two devices can join the same nest without copying a raw shared cluster
 token (`two_devices_share_a_nest_without_cluster_token` integration test); catalog events show who
 signed them; a non-member without a valid grant is rejected by the nest-scoped handshake.
-Legacy token holders can still retrieve catalog events and objects without membership, and
+Legacy token holders can fetch encrypted objects by hash but not catalog events, and
 ordinary catalog-event signers are not required to be members.
 
 ### Phase 4 — metadata-first sync
