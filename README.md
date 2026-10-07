@@ -18,25 +18,32 @@ Crow combines a reusable storage library, a CLI, and a QUIC transport:
 
 - **Encrypted storage:** AES-256-GCM, BLAKE3 content addresses, Reed–Solomon recovery.
 - **Portable references:** Bech32m read capabilities; Ed25519 signatures record creator provenance.
-- **Local catalog:** file and directory paths backed by signed events and immutable snapshots.
+- **Local catalog:** file and directory paths backed by signed events and immutable snapshots;
+  ordinary path-event signatures provide attribution, not membership authorization.
 - **Device sharing:** recipient-bound invites, per-nest membership, manual metadata or full sync.
-- **Storage management:** pins, reconstruction checks, and garbage collection.
+- **Storage management:** pins and garbage collection (with `--dry-run`).
 
 It does not yet provide automatic background replication, a mounted filesystem,
 or an internet storage service. The current CLI loads whole files into memory.
 
 ## Install
 
-Requires **Rust 1.88+** and its platform build prerequisites (including a C compiler
-and CMake for the TLS dependency). Crow is not published to crates.io.
+Requires **Rust 1.88+** and a C compiler for the TLS dependency. Some targets also
+need tools such as NASM; the locked non-FIPS `aws-lc-rs` build does not require
+CMake. See the [aws-lc-rs build requirements](https://aws.github.io/aws-lc-rs/requirements/).
+Crow is not published to crates.io. Install directly from GitHub:
+
+```sh
+cargo install --locked --git https://github.com/oliverrowebardeen/crow --bin crow
+```
+
+Or install from a local checkout:
 
 ```sh
 git clone https://github.com/oliverrowebardeen/crow.git
 cd crow
 cargo install --locked --path crates/crow-cli
 ```
-
-The repository must be public, or your Git client must have access to it.
 
 ## A one-minute local demo
 
@@ -46,8 +53,7 @@ network server, or API key is needed after installation.
 ```sh
 demo_dir=$(mktemp -d)
 export CROW_HOME="$demo_dir/store"
-printf 'hello from Crow
-' > "$demo_dir/input.txt"
+printf 'hello from Crow\n' > "$demo_dir/input.txt"
 crow setup --name demo
 crow mkdir /docs
 crow put "$demo_dir/input.txt" /docs/hello.txt
@@ -57,8 +63,12 @@ cmp "$demo_dir/input.txt" "$demo_dir/restored.txt"
 ```
 
 `cmp` exits successfully when reconstruction matches. Your files remain in
-`$demo_dir`. `crow cap /docs/hello.txt` prints a bearer capability: share it only
+`$demo_dir`. `CROW_HOME` (or the top-level `crow --home PATH <command>`) selects the store.
+`crow cap /docs/hello.txt` prints a bearer capability: share it only
 with intended readers, and keep it out of public screenshots and logs.
+`crow setup` also prints the cluster token. Treat that token as read access to the
+served nest: token holders can retrieve catalog capabilities and encrypted objects.
+Keep setup output out of public screenshots and logs too.
 
 For two-device setup, directory snapshots, pinning, and recovery, see the
 [CLI and library guide](docs/GUIDE.md). The
@@ -82,7 +92,11 @@ Nest authentication signs a fresh challenge plus a TLS session binding. This
 prevents moving a valid signature onto a different connection. Protocol **v3**
 requires all peers to upgrade together; there is no insecure fallback to v2.
 Self-signed server certificates are still not bound to a known device identity.
-Use only a trusted LAN, especially with the legacy shared-token mode.
+Use only a trusted LAN. `crow serve` always enables the legacy shared-token path
+alongside nest authentication. The token grants read access to the served nest,
+including catalog events containing read capabilities; it is not limited to
+fetching opaque ciphertext. A peer you sync from can supply ordinary catalog
+changes validly signed by any key, including a non-member's key.
 
 ## Develop
 
@@ -102,9 +116,9 @@ Contributors are expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 ## Compatibility and roadmap
 
 Pre-1.0 file formats, CLI output, and wire protocols may change. Keep original
-files and export data before upgrading. This release changes the wire protocol,
-not the stored format. macOS and Linux are CI targets; Windows support is
-provisional until its filesystem behavior is verified.
+files and export data before upgrading. Wire protocol v3 is incompatible with
+earlier builds; stored formats are unchanged. macOS and Linux are CI targets;
+Windows support is provisional until its filesystem behavior is verified.
 
 Next priorities are automatic replication and health reporting, authenticated
 server identities, bounded streaming for large files, and broader platform tests.

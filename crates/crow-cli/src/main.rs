@@ -27,9 +27,10 @@ use serde::{Deserialize, Serialize};
 #[command(
     name = "crow",
     version,
-    about = "Decentralized, content-addressed file storage.",
-    long_about = "Decentralized, content-addressed file storage with Tahoe-LAFS-style \
-                  capabilities. Files get chunked, encrypted, erasure-coded, and stored \
+    about = "Local-first encrypted file storage with capabilities and LAN sync.",
+    long_about = "Local-first, content-addressed, erasure-coded encrypted file storage \
+                  with read capabilities inspired by Tahoe-LAFS and LAN sync between \
+                  trusted devices. Files get chunked, encrypted, erasure-coded, and stored \
                   by the BLAKE3 hash of their bytes; the pointer to a file is a small \
                   bech32m \"crow1…\" capability that bundles the manifest hash and its \
                   decryption key.\n\
@@ -514,8 +515,10 @@ enum Command {
         long_about = "Start a long-running QUIC server that serves encrypted manifests \
                       and chunks by hash to clients with the shared cluster token.\n\
                       \n\
-                      The server never sees cap keys or plaintext. Run `crow token init` \
-                      first, then copy the token to another trusted device with \
+                      Token holders can also read the served nest's catalog, which \
+                      contains read capabilities, so share the token only with your own \
+                      devices. Nest members authenticate separately with signed \
+                      challenges. Run `crow token init` first, then copy the token to another trusted device with \
                       `crow token set <TOKEN>`."
     )]
     Serve {
@@ -655,9 +658,9 @@ enum Command {
     /// Manage the shared personal-cluster token.
     #[command(subcommand)]
     Token(TokenCommand),
-    /// Manage named encrypted vaults ("nests") on this device.
+    /// Manage named storage spaces ("nests") on this device.
     #[command(
-        long_about = "A nest is a named encrypted vault with its own catalog, pins, and \
+        long_about = "A nest is a named storage space with its own catalog, pins, and \
                       encrypted shares. Every Crow command operates on one active nest at \
                       a time; use --nest to override the active selection for a single \
                       invocation.\n\
