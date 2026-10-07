@@ -97,6 +97,7 @@ cargo run --locked -p crow --example roundtrip
 Tests use temporary stores and local loopback connections. They do not need live
 accounts or paid services. Network tests need permission to bind local UDP ports.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for dependency and secret scanning.
+Contributors are expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Compatibility and roadmap
 

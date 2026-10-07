@@ -4,6 +4,8 @@ Crow is experimental storage software. Keep changes focused and include regressi
 tests for behavior changes, particularly destructive operations, authentication,
 and storage recovery.
 
+Contributors are expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Setup and checks
 
 Install Rust 1.88+ with Clippy and rustfmt, a C compiler, and CMake. Clone the
