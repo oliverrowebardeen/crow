@@ -1,4 +1,5 @@
-//! Named encrypted vaults — "nests".
+//! Named storage spaces — "nests". File contents are encrypted; catalog
+//! metadata and capabilities are stored unencrypted in the home directory.
 //!
 //! A nest is the user-facing unit of trust in Crow: a named space with its
 //! own catalog, pins, encrypted chunks/manifests, and (eventually) storage

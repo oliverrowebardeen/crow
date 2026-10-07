@@ -1,4 +1,5 @@
-//! Crow — content-addressed, erasure-coded file storage with capabilities.
+//! Crow — local-first, content-addressed, erasure-coded encrypted file storage
+//! with read capabilities inspired by Tahoe-LAFS and LAN sync between trusted devices.
 //!
 //! The crate is organised in layers, bottom-up:
 //!
@@ -9,13 +10,15 @@
 //!   HKDF-derived nonces.
 //! - [`erasure`] — Reed–Solomon stripe encode/decode.
 //! - [`manifest`] — the encrypted, content-addressed, signed file manifest.
-//! - [`cap`] — Tahoe-LAFS-style capabilities encoded with Bech32m.
+//! - [`cap`] — read capabilities inspired by Tahoe-LAFS, encoded with Bech32m.
 //! - [`identity`] — Ed25519 + X25519 keypair holder; Ed25519 signs new
 //!   manifests for provenance.
 //! - [`pipeline`] — the [`pipeline::Crow`] facade tying everything together.
 //!
-//! Networking discovery, automatic replication, replicated metadata sync, and
-//! trust-scoped sharing are out of scope for this crate version.
+//! This crate also provides signed catalog events, nests, membership, and
+//! recipient-bound invites. The `crow-net` and `crow-cli` workspace crates provide
+//! LAN discovery, manual metadata sync, and object transfer between trusted devices.
+//! Automatic replication and friend-scoped storage/sharing remain planned.
 
 pub mod cap;
 pub mod catalog;

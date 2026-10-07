@@ -27,9 +27,10 @@ use serde::{Deserialize, Serialize};
 #[command(
     name = "crow",
     version,
-    about = "Decentralized, content-addressed file storage.",
-    long_about = "Decentralized, content-addressed file storage with Tahoe-LAFS-style \
-                  capabilities. Files get chunked, encrypted, erasure-coded, and stored \
+    about = "Local-first encrypted file storage with capabilities and LAN sync.",
+    long_about = "Local-first, content-addressed, erasure-coded encrypted file storage \
+                  with read capabilities inspired by Tahoe-LAFS and LAN sync between \
+                  trusted devices. Files get chunked, encrypted, erasure-coded, and stored \
                   by the BLAKE3 hash of their bytes; the pointer to a file is a small \
                   bech32m \"crow1…\" capability that bundles the manifest hash and its \
                   decryption key.\n\
@@ -328,7 +329,7 @@ enum Command {
     PutDir {
         /// Local directory to import.
         source: String,
-        /// Optional catalog destination directory. Defaults to /<source-basename>.
+        /// Optional catalog destination directory. Defaults to `/<source-basename>`.
         dest: Option<String>,
         /// Skip confirmation.
         #[arg(short, long)]
@@ -514,8 +515,10 @@ enum Command {
         long_about = "Start a long-running QUIC server that serves encrypted manifests \
                       and chunks by hash to clients with the shared cluster token.\n\
                       \n\
-                      The server never sees cap keys or plaintext. Run `crow token init` \
-                      first, then copy the token to another trusted device with \
+                      Token holders can fetch encrypted manifests and chunks by hash only. \
+                      The nest catalog, which contains read capabilities, is served only \
+                      to nest members authenticated with signed challenges. \
+                      Run `crow token init` first, then copy the token to another trusted device with \
                       `crow token set <TOKEN>`."
     )]
     Serve {
@@ -655,9 +658,9 @@ enum Command {
     /// Manage the shared personal-cluster token.
     #[command(subcommand)]
     Token(TokenCommand),
-    /// Manage named encrypted vaults ("nests") on this device.
+    /// Manage named storage spaces ("nests") on this device.
     #[command(
-        long_about = "A nest is a named encrypted vault with its own catalog, pins, and \
+        long_about = "A nest is a named storage space with its own catalog, pins, and \
                       encrypted shares. Every Crow command operates on one active nest at \
                       a time; use --nest to override the active selection for a single \
                       invocation.\n\
@@ -3613,7 +3616,6 @@ fn cmd_serve(
     let identity = Identity::load_or_create(home)?;
     let catalog = CatalogIndex::open(nest_dir)?;
     catalog.ensure_founding_member(&nest_id, &identity)?;
-    let legacy_catalog = CatalogIndex::open(nest_dir)?;
     let node_id = identity.node_id();
     let friendly_name = resolve_serve_name(home, name_override)?;
     let root = store.root().display().to_string();
@@ -3628,7 +3630,7 @@ fn cmd_serve(
     };
 
     let rt = runtime()?;
-    rt.block_on(serve_loop(store, catalog, legacy_catalog, token, config))
+    rt.block_on(serve_loop(store, catalog, token, config))
 }
 
 struct ServeLoopConfig {
@@ -3643,13 +3645,11 @@ struct ServeLoopConfig {
 async fn serve_loop(
     store: FsStore,
     catalog: CatalogIndex,
-    legacy_catalog: CatalogIndex,
     token: ClusterToken,
     config: ServeLoopConfig,
 ) -> DynResult<()> {
     let catalog = std::sync::Arc::new(catalog);
     let mut serve_config = crow_net::ServeConfig::new(store, token, config.bind);
-    serve_config.legacy_catalog = Some(legacy_catalog);
     serve_config.nest_serving = Some(crow_net::NestServingConfig {
         nest_id: config.nest_id,
         catalog: catalog.clone(),
@@ -5809,9 +5809,8 @@ mod tests {
         let token = ClusterToken::random();
         let rt = runtime().unwrap();
         let server = rt
-            .block_on(crow_net::serve_with_catalog(
+            .block_on(crow_net::serve(
                 FsStore::open(source.path()).unwrap(),
-                CatalogIndex::open(source.path()).unwrap(),
                 token,
                 "127.0.0.1:0".parse().unwrap(),
             ))
@@ -5821,8 +5820,8 @@ mod tests {
 
         let dest_catalog = CatalogIndex::open(dest.path()).unwrap();
         let dest_crow = Crow::new(FsStore::open(dest.path()).unwrap());
-        let events = rt.block_on(client.catalog_events(token)).unwrap();
-        sync_catalog_events(&dest_catalog, events).unwrap();
+        // Capabilities are supplied locally; the token only authorizes ciphertext fetches.
+        sync_catalog_events(&dest_catalog, source_catalog.load_events().unwrap()).unwrap();
 
         let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
             rt.block_on(client.get_many(token, reqs))
@@ -5855,9 +5854,8 @@ mod tests {
         let token = ClusterToken::random();
         let rt = runtime().unwrap();
         let server = rt
-            .block_on(crow_net::serve_with_catalog(
+            .block_on(crow_net::serve(
                 FsStore::open(source.path()).unwrap(),
-                CatalogIndex::open(source.path()).unwrap(),
                 token,
                 "127.0.0.1:0".parse().unwrap(),
             ))
@@ -5867,8 +5865,8 @@ mod tests {
 
         let dest_catalog = CatalogIndex::open(dest.path()).unwrap();
         let dest_crow = Crow::new(FsStore::open(dest.path()).unwrap());
-        let events = rt.block_on(client.catalog_events(token)).unwrap();
-        sync_catalog_events(&dest_catalog, events).unwrap();
+        // Capabilities are supplied locally; the token only authorizes ciphertext fetches.
+        sync_catalog_events(&dest_catalog, source_catalog.load_events().unwrap()).unwrap();
 
         let mut fetch_remote = |reqs: &[(Namespace, Hash)]| {
             rt.block_on(client.get_many(token, reqs))

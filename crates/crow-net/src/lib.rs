@@ -211,6 +211,8 @@ pub enum Request {
         namespace: WireNamespace,
         hash: [u8; 32],
     },
+    /// Retired: servers always refuse this request with [`Response::Unauthorized`].
+    /// Kept in this position to preserve postcard wire variant indices.
     CatalogEvents {
         version: u16,
         token: ClusterToken,
@@ -247,8 +249,7 @@ pub enum Request {
         namespace: WireNamespace,
         hash: [u8; 32],
     },
-    /// Like [`Request::CatalogEvents`] but predicated on the connection's
-    /// nest-auth flag.
+    /// Fetch the catalog using the connection's authenticated nest membership.
     NestCatalogEvents {
         version: u16,
     },
@@ -323,17 +324,6 @@ pub async fn serve(store: FsStore, token: ClusterToken, bind: SocketAddr) -> Res
     serve_with_config(ServeConfig::new(store, token, bind)).await
 }
 
-pub async fn serve_with_catalog(
-    store: FsStore,
-    catalog: CatalogIndex,
-    token: ClusterToken,
-    bind: SocketAddr,
-) -> Result<Server> {
-    let mut config = ServeConfig::new(store, token, bind);
-    config.legacy_catalog = Some(catalog);
-    serve_with_config(config).await
-}
-
 /// Per-nest bundle the server needs to handle nest-scoped requests.
 /// Holds the nest's id and a handle to its catalog (so the handshake can
 /// look up the member list).
@@ -350,10 +340,6 @@ pub struct ServeConfig {
     pub bind: SocketAddr,
     /// Bearer token for legacy ClusterToken requests.
     pub legacy_token: ClusterToken,
-    /// Catalog served via the legacy `CatalogEvents` request. The
-    /// per-nest catalog used by `NestCatalogEvents` lives in
-    /// `nest_serving` and may be the same instance.
-    pub legacy_catalog: Option<CatalogIndex>,
     /// Nest this server is willing to authenticate clients into.
     /// `None` keeps the server cluster-token-only (Phase 2 behaviour).
     pub nest_serving: Option<NestServingConfig>,
@@ -365,7 +351,6 @@ impl ServeConfig {
             store,
             bind,
             legacy_token,
-            legacy_catalog: None,
             nest_serving: None,
         }
     }
@@ -377,7 +362,6 @@ pub async fn serve_with_config(config: ServeConfig) -> Result<Server> {
     let ctx = ServerCtx {
         store: Arc::new(config.store),
         legacy_token: config.legacy_token,
-        legacy_catalog: config.legacy_catalog.map(Arc::new),
         nest_serving: config.nest_serving,
     };
     let handle = tokio::spawn(accept_loop(endpoint, ctx));
@@ -389,7 +373,6 @@ pub async fn serve_with_config(config: ServeConfig) -> Result<Server> {
 struct ServerCtx {
     store: Arc<FsStore>,
     legacy_token: ClusterToken,
-    legacy_catalog: Option<Arc<CatalogIndex>>,
     nest_serving: Option<NestServingConfig>,
 }
 
@@ -719,22 +702,6 @@ impl Client {
         }
     }
 
-    pub async fn catalog_events(&self, token: ClusterToken) -> Result<Vec<CatalogEvent>> {
-        match self
-            .request(Request::CatalogEvents {
-                version: PROTOCOL_VERSION,
-                token,
-            })
-            .await?
-        {
-            Response::CatalogEvents { events } => Ok(events),
-            Response::Unauthorized => Err(NetError::Unauthorized),
-            other => Err(NetError::Protocol(format!(
-                "unexpected catalog events response: {other:?}"
-            ))),
-        }
-    }
-
     async fn request(&self, request: Request) -> Result<Response> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         write_frame(&mut send, &request).await?;
@@ -767,6 +734,9 @@ async fn handle_request(
     channel_binding: &[u8; 32],
     request: Request,
 ) -> Response {
+    if matches!(request, Request::CatalogEvents { .. }) {
+        return Response::Unauthorized;
+    }
     if request_version(&request) != PROTOCOL_VERSION {
         return Response::Error {
             message: "unsupported protocol version".into(),
@@ -792,12 +762,7 @@ async fn handle_request(
         Request::Get {
             namespace, hash, ..
         } => store_get(&ctx.store, namespace, hash),
-        Request::CatalogEvents { .. } => match &ctx.legacy_catalog {
-            Some(catalog) => catalog_events_response(catalog),
-            None => Response::Error {
-                message: "catalog sync is not available on this server".into(),
-            },
-        },
+        Request::CatalogEvents { .. } => Response::Unauthorized,
         Request::NestHello {
             nest_id,
             signer,
@@ -1194,6 +1159,142 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn token_only_client_cannot_read_nest_catalog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let identity = Identity::random();
+        let nest_id = NestId::random();
+        let catalog = Arc::new(CatalogIndex::open(tmp.path()).unwrap());
+        catalog.ensure_founding_member(&nest_id, &identity).unwrap();
+        let crow = crow::Crow::new(FsStore::open(tmp.path()).unwrap());
+        let cap = crow
+            .put_bytes_with(
+                b"private catalog content",
+                "text/plain",
+                crow::ErasureParams::default(),
+                65520,
+                &identity,
+            )
+            .unwrap();
+        catalog
+            .put_file("/private.txt", cap.clone(), None, &identity)
+            .unwrap();
+        let hash = *cap.manifest_hash.inner();
+        let encrypted_manifest = crow
+            .store()
+            .get(Namespace::Manifests, &hash)
+            .unwrap()
+            .unwrap();
+        let token = ClusterToken::random();
+        let mut config = ServeConfig::new(
+            FsStore::open(tmp.path()).unwrap(),
+            token,
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        config.nest_serving = Some(NestServingConfig {
+            nest_id,
+            catalog: catalog.clone(),
+        });
+        let server = serve_with_config(config).await.unwrap();
+        let client = Client::connect(server.local_addr()).await.unwrap();
+        client.hello(token).await.unwrap();
+        assert!(
+            client
+                .have(token, Namespace::Manifests, hash)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            client.get(token, Namespace::Manifests, hash).await.unwrap(),
+            Some(encrypted_manifest)
+        );
+        for version in [PROTOCOL_VERSION, PROTOCOL_VERSION + 1] {
+            assert_eq!(
+                client
+                    .request(Request::CatalogEvents { version, token })
+                    .await
+                    .unwrap(),
+                Response::Unauthorized
+            );
+        }
+        assert!(matches!(
+            client.nest_catalog_events().await,
+            Err(NetError::Unauthorized)
+        ));
+
+        // The catalog is populated and still available to an authenticated member.
+        let member = Client::connect_for_nest(server.local_addr(), nest_id, &identity)
+            .await
+            .unwrap();
+        assert_eq!(
+            member.nest_catalog_events().await.unwrap(),
+            catalog.load_events().unwrap()
+        );
+        server.handle.abort();
+    }
+
+    #[test]
+    fn wire_variant_indices_remain_compatible() {
+        let token = ClusterToken::random();
+        let requests = [
+            Request::Hello { version: 3, token },
+            Request::Have {
+                version: 3,
+                token,
+                namespace: WireNamespace::Chunks,
+                hash: [0; 32],
+            },
+            Request::Get {
+                version: 3,
+                token,
+                namespace: WireNamespace::Chunks,
+                hash: [0; 32],
+            },
+            Request::CatalogEvents { version: 3, token },
+            Request::NestHello {
+                version: 3,
+                nest_id: NestId::random(),
+                signer: Identity::random().node_id(),
+                membership_proof: None,
+            },
+            Request::NestAuthResponse {
+                version: 3,
+                signature: Signature([0; 64]),
+            },
+            Request::NestHave {
+                version: 3,
+                namespace: WireNamespace::Chunks,
+                hash: [0; 32],
+            },
+            Request::NestGet {
+                version: 3,
+                namespace: WireNamespace::Chunks,
+                hash: [0; 32],
+            },
+            Request::NestCatalogEvents { version: 3 },
+        ];
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(postcard::to_allocvec(request).unwrap()[0] as usize, index);
+        }
+        let responses = [
+            Response::Hello { version: 3 },
+            Response::Have { present: true },
+            Response::Bytes { bytes: Vec::new() },
+            Response::CatalogEvents { events: Vec::new() },
+            Response::Missing,
+            Response::Unauthorized,
+            Response::Error {
+                message: String::new(),
+            },
+            Response::NestChallenge { challenge: [0; 32] },
+            Response::NestAuthorised,
+            Response::NestUnauthorised,
+        ];
+        for (index, response) in responses.iter().enumerate() {
+            assert_eq!(postcard::to_allocvec(response).unwrap()[0] as usize, index);
+        }
+    }
+
+    #[tokio::test]
     async fn nest_signature_is_bound_to_the_tls_connection() {
         let tmp = tempfile::TempDir::new().unwrap();
         let identity = Identity::random();
@@ -1287,13 +1388,15 @@ mod tests {
         ServerCtx {
             store,
             legacy_token: token,
-            legacy_catalog: Some(catalog),
-            nest_serving: None,
+            nest_serving: Some(NestServingConfig {
+                nest_id: NestId::random(),
+                catalog,
+            }),
         }
     }
 
     #[test]
-    fn catalog_events_request_returns_events_for_valid_token() {
+    fn catalog_events_request_rejects_valid_token() {
         let tmp = tempfile::TempDir::new().unwrap();
         let identity = crow::Identity::load_or_create(tmp.path()).unwrap();
         let store = Arc::new(FsStore::open(tmp.path()).unwrap());
@@ -1314,13 +1417,7 @@ mod tests {
             },
         ));
 
-        match response {
-            Response::CatalogEvents { events } => {
-                assert_eq!(events.len(), 1);
-                assert!(matches!(events[0].op, crow::CatalogOp::Mkdir { .. }));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert_eq!(response, Response::Unauthorized);
     }
 
     #[test]
