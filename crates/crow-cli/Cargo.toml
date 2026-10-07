@@ -10,6 +10,7 @@ description = "Command-line frontend for crow."
 [[bin]]
 name = "crow"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 crow = { path = "../crow" }

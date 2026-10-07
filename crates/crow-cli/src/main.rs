@@ -328,7 +328,7 @@ enum Command {
     PutDir {
         /// Local directory to import.
         source: String,
-        /// Optional catalog destination directory. Defaults to /<source-basename>.
+        /// Optional catalog destination directory. Defaults to `/<source-basename>`.
         dest: Option<String>,
         /// Skip confirmation.
         #[arg(short, long)]
